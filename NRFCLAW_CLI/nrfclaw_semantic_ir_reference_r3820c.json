@@ -1,0 +1,173 @@
+{
+  "revision": "R3.8.20c2e",
+  "ir_version": 1,
+  "vm_abi": 1,
+  "rules": [
+    "Return Semantic IR only; never pseudo-code or bytecode.",
+    "Every explicit literal, interval, pin, power, threshold, condition, event and data-flow clause must appear in IR.",
+    "Use MISSING_CAPABILITY rather than omitting or approximating unsupported behavior.",
+    "program.mode is BOOT only when behavior must persist/start after reset; otherwise MANUAL.",
+    "Registers are R0..R7 represented as integers 0..7."
+  ],
+  "operations": {
+    "system.minimum_power": {},
+    "label": {
+      "name": "string 1..32"
+    },
+    "jump": {
+      "label": "string"
+    },
+    "jump_if_zero": {
+      "register": "0..7",
+      "label": "string"
+    },
+    "register.copy": {
+      "dst": "0..7",
+      "src": "0..7"
+    },
+    "register.set": {
+      "register": "0..7",
+      "value": "int32"
+    },
+    "register.add": {
+      "dst": "0..7",
+      "a": "0..7",
+      "b": "0..7"
+    },
+    "register.sub": {
+      "dst": "0..7",
+      "a": "0..7",
+      "b": "0..7"
+    },
+    "register.compare": {
+      "dst": "0..7",
+      "a": "0..7",
+      "b": "0..7",
+      "condition": "LT|GT|EQ"
+    },
+    "wait": {
+      "seconds": "1..uint32"
+    },
+    "gpio.read": {
+      "pin": "0..31",
+      "register": "0..7"
+    },
+    "gpio.write": {
+      "pin": "0..31",
+      "value": "0|1"
+    },
+    "accel.config": {
+      "mode": "OFF|MOTION|TAP|FALL|WALK|VIBRATION",
+      "odr_hz": "1|10|25|50|100|200|400",
+      "full_scale_g": "2|4|8|16",
+      "threshold_mg": "0..65535",
+      "duration_ms": "0..65535",
+      "low_power": "bool"
+    },
+    "wait.event": {
+      "event": "MOTION|TAP|FALL|WALK|VIB_AUTO.MACHINE_ON|VIB_AUTO.WARNING|VIB_AUTO.ALARM|VIB_AUTO.MACHINE_OFF"
+    },
+    "battery.read": {
+      "register": "0..7"
+    },
+    "temperature.read": {
+      "register": "0..7"
+    },
+    "hall.wait": {
+      "register": "0..7"
+    },
+    "ble.ndp": {
+      "enabled": "bool"
+    },
+    "ble.advertiser": {
+      "interval_ms": "20..10240"
+    },
+    "ble.name": {
+      "value": "UTF-8 1..24 bytes"
+    },
+    "ble.adv_start": {},
+    "ble.advertise_buffer": {},
+    "lora.config": {
+      "frequency_mhz": "100..1000",
+      "power_dbm": "-9..22",
+      "sf": "7..12",
+      "bw_khz": "1..500",
+      "cr": "1..4"
+    },
+    "lora.receive": {
+      "target": "buffer"
+    },
+    "lora.send_literal": {
+      "value": "UTF-8 1..32 bytes"
+    },
+    "lora.send_buffer": {},
+    "serial.config": {
+      "tx_pin": "0..31",
+      "rx_pin": "0..31",
+      "baud": "300..1000000",
+      "economy": "bool"
+    },
+    "serial.receive": {
+      "mode": "LINE|IDLE|LENGTH",
+      "value": "IDLE 1..60000ms; LENGTH 1..64; LINE use 0"
+    },
+    "serial.write_buffer": {},
+    "app.send_buffer": {},
+    "debug.buffer": {},
+    "buffer.prepend": {
+      "value": "UTF-8 1..48 bytes"
+    },
+    "buffer.set_literal": {
+      "value": "UTF-8 1..64 bytes"
+    },
+    "buffer.parse_int": {
+      "register": "0..7"
+    },
+    "buffer.parse_fixed": {
+      "register": "0..7",
+      "scale": "1|10|100|1000|10000|100000|1000000"
+    },
+    "buffer.format_register": {
+      "prefix": "UTF-8 <=48",
+      "register": "0..7",
+      "format": "U32|U32_02|I32|VOLTS|CELSIUS"
+    },
+    "buffer.format_fixed": {
+      "prefix": "UTF-8 <=48",
+      "register": "0..7",
+      "decimals": "0..6",
+      "suffix": "UTF-8 <=16"
+    },
+    "buffer.format_2reg": {
+      "prefix1": "UTF-8 <=32",
+      "reg1": "0..7",
+      "format1": "format",
+      "prefix2": "UTF-8 <=32",
+      "reg2": "0..7",
+      "format2": "format"
+    },
+    "vib_auto.config": {
+      "learning_s": "60..604800",
+      "initial_s": "0..604800"
+    },
+    "vib_auto.start": {},
+    "vib_auto.stop": {},
+    "tracking.config": {
+      "interval_ms": "20..65535",
+      "tx_dbm": "-40..20"
+    },
+    "tracking.rotation": {
+      "seconds": "1..uint32"
+    },
+    "tracking.start": {},
+    "tracking.stop": {},
+    "ha.event": {
+      "cap": "0..255",
+      "operation": "0..255",
+      "register": "0..7"
+    },
+    "loop": {
+      "actions": "array of operations"
+    }
+  }
+}

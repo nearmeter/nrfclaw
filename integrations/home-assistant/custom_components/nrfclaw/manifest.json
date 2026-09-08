@@ -1,0 +1,14 @@
+{
+  "domain": "nrfclaw",
+  "name": "nRFClaw",
+  "version": "0.3.0",
+  "config_flow": true,
+  "dependencies": ["bluetooth_adapters"],
+  "iot_class": "local_polling",
+  "bluetooth": [
+    {
+      "service_uuid": "4e52a800-0000-10a7-d24b-6a3244619a47",
+      "connectable": true
+    }
+  ]
+}

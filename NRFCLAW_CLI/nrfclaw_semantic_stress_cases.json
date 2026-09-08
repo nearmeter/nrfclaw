@@ -1,0 +1,22 @@
+[
+  "No boot desligue o NDP e leia a temperatura a cada 30 segundos. Se passar de 25 graus coloque o pino 15 em high e envie por LoRa em 916 MHz uma mensagem contendo ALERTA TEMP mais a temperatura atual. Quando baixar de 23 graus coloque o pino 15 em low.",
+  "No boot inicie tracking a cada 5 segundos e verifique a bateria a cada minuto. Se ficar abaixo de 2.8 V pare tracking, envie cinco alertas LoRa a cada 10 segundos e entre em sleep.",
+  "Inicie NDP com Home Assistant, aguarde motion e quando detectar movimento leia temperatura e bateria e envie um evento para o HA.",
+  "No boot habilite VIB_AUTO. Quando detectar anomalia inicie tracking a cada 2 segundos e envie uma mensagem ao Home Assistant.",
+  "Habilite o VIB_AUTO no boot e mantenha o Bluetooth NDP desligado. Quando detectar uma anomalia leia a bateria e envie por LoRa em 916 MHz SF10 e 20 dBm a mensagem VIB ALERT BAT seguida da bateria atual três vezes a cada 5 segundos.",
+  "Habilite VIB_AUTO. Quando a máquina ligar inicie tracking a cada 10 segundos; quando desligar pare tracking e volte ao monitoramento.",
+  "Enquanto a máquina estiver ligada leia a temperatura a cada 20 segundos; acima de 60 graus envie alerta LoRa a cada 30 segundos; ao desligar pare a medição periódica.",
+  "No boot monitore Hall 1 e mantenha contador persistente. A cada 100 acionamentos envie CONTADOR mais o valor por LoRa.",
+  "Configure Hall 1 e Hall 2 para direção; frente incrementa, reverso decrementa e envie o contador ao HA quando mudar.",
+  "Leia temperatura a cada 30 segundos, anuncie Temp= mais a variável a cada 2 segundos e acima de 20 graus inicie tracking.",
+  "Desabilite NDP, anuncie a bateria por BLE a cada 5 segundos, atualize a leitura a cada minuto e abaixo de 2.7 V envie alerta LoRa.",
+  "Receba LoRa em 916 MHz; se a mensagem for BAT? leia bateria e responda BAT= mais tensão, senão encaminhe para serial 57600 8N1.",
+  "Configure serial 115200 8N1, aguarde uma linha e envie seu conteúdo por LoRa em 916 MHz.",
+  "Aguarde motion; quando ocorrer leia temperatura; acima de 35 graus envie alerta LoRa, senão incremente contador persistente.",
+  "No boot VIB_AUTO: WARNING envia evento HA; ALARM envia evento HA, três alertas LoRa e tracking durante 2 minutos.",
+  "VIB_AUTO: ao ligar armazene hora de início; ao parar calcule duração e envie ao HA duração, temperatura e bateria.",
+  "Tracking a cada 5 segundos e bateria a cada minuto; abaixo de 3.0 V tracking 30 s; abaixo de 2.8 V pare tracking e use LoRa; abaixo de 2.6 V sleep.",
+  "Leia temperatura a cada minuto: abaixo de 10 graus GPIO15 low; entre 10 e 30 high; acima de 30 low, alerta HA e tracking; abaixo de 28 pare tracking.",
+  "Ao detectar anomalia grave grave ALARM=1 persistente, envie LoRa e tracking; depois de reset se ALARM=1 volte ao tracking e limpe somente com RESET_ALARM do HA.",
+  "A cada 15 minutos leia bateria, temperatura, Hall1 e estado VIB_AUTO; monte uma mensagem composta e envie por LoRa, permanecendo em baixo consumo no restante do tempo."
+]

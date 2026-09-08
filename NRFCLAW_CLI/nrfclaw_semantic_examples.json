@@ -1,0 +1,89 @@
+[
+  {
+    "text": "at boot start tracking every 2 seconds",
+    "family": "tracking",
+    "canonical": "at boot start tracking every 2 seconds"
+  },
+  {
+    "text": "at boot start tracking every 5 seconds",
+    "family": "tracking",
+    "canonical": "at boot start tracking every 5 seconds"
+  },
+  {
+    "text": "when motion is detected start tracking",
+    "family": "motion_tracking",
+    "canonical": "enable motion and when motion is detected start tracking"
+  },
+  {
+    "text": "at boot disable ndp and read temperature; if temperature is below 1 degree enable motion and when motion is detected start tracking every 2 seconds",
+    "family": "temperature_motion_tracking",
+    "canonical": "at boot disable ndp and read temperature; if temperature is below 1 degree enable motion and when motion is detected start tracking every 2 seconds"
+  },
+  {
+    "text": "read temperature every 30 seconds; if above 20 degrees set pin 15 high; when it drops set pin 15 low",
+    "family": "temperature_gpio"
+  },
+  {
+    "text": "start tracking and if battery is low stop tracking, send a lora message five times every ten seconds, then sleep",
+    "family": "tracking_battery_lora"
+  },
+  {
+    "text": "when hall detects a pulse start tracking",
+    "family": "hall_tracking"
+  },
+  {
+    "text": "send a lora message",
+    "family": "lora_message"
+  },
+  {
+    "text": "set gpio high",
+    "family": "gpio"
+  },
+  {
+    "text": "every 20 seconds send a lora message with a counter",
+    "family": "lora_periodic_counter",
+    "canonical": "every 20 seconds send a lora message with a counter"
+  },
+  {
+    "text": "at boot start the vibration detection service with learning 2 hours and initial time 100 seconds",
+    "family": "vib_auto_config_start",
+    "canonical": "at boot start vibration detection service with learning 2 hours and initial time 100 seconds"
+  },
+  {
+    "text": "when the machine has a vibration anomaly send a lora alert",
+    "family": "vib_auto_alarm_lora",
+    "canonical": "when the machine has a vibration anomaly send a lora alert"
+  },
+  {
+    "text": "send lora packet at 10:12 with the temperature with prefix T=",
+    "family": "schedule_at_temperature_lora",
+    "schedule": {
+      "mode": "AT",
+      "time": "10:12",
+      "timezone": "LOCAL"
+    },
+    "note": "AT is authenticated program metadata; action bytecode remains one-shot."
+  },
+  {
+    "text": "every 30 seconds send temperature over LoRa",
+    "family": "schedule_every_temperature_lora",
+    "schedule": {
+      "mode": "EVERY",
+      "interval_s": 30
+    },
+    "note": "Program-level periodic execution can be represented by Schedule ABI EVERY."
+  },
+  {
+    "text": "every Monday and Friday at 08:30 send battery over LoRa",
+    "family": "schedule_weekly_battery_lora",
+    "schedule": {
+      "mode": "WEEKLY",
+      "days": [
+        "MON",
+        "FRI"
+      ],
+      "time": "08:30",
+      "timezone": "LOCAL"
+    }
+  }
+]

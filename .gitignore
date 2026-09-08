@@ -1,0 +1,8 @@
+build/
+bootloader/build/
+.nrfclaw.mk
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+NRFCLAW_CLI/.venv/

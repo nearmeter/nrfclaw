@@ -1,0 +1,156 @@
+{
+  "schema_version": 2,
+  "vm_abi": 1,
+  "principle": "semantic engine emits validated IR; only deterministic assembler emits bytecode",
+  "capabilities": {
+    "control_flow": [
+      "mov",
+      "movi",
+      "add",
+      "sub",
+      "mul",
+      "div",
+      "mod",
+      "neg",
+      "cmp_eq",
+      "cmp_ne",
+      "cmp_lt",
+      "cmp_le",
+      "cmp_gt",
+      "cmp_ge",
+      "jmp",
+      "jz",
+      "jnz",
+      "wait_s",
+      "wait_event"
+    ],
+    "battery": [
+      "read_centivolts",
+      "send_battery_lora"
+    ],
+    "temperature": [
+      "ds18_read_millicelsius"
+    ],
+    "gpio": [
+      "write_immediate",
+      "write_register",
+      "read"
+    ],
+    "hall": [
+      "configure",
+      "wait_hall"
+    ],
+    "accelerometer": [
+      "read_xyz",
+      "motion_hp",
+      "configure"
+    ],
+    "vibration": [
+      "model_set",
+      "score",
+      "vib_auto_start",
+      "vib_auto_stop"
+    ],
+    "lora": [
+      "configure_frequency_power_sf_bw_cr",
+      "send_battery",
+      "send_static_bytes_max32",
+      "format_register_to_buffer",
+      "send_vm_buffer",
+      "receive_next_packet_to_buffer"
+    ],
+    "ble": [
+      "application_role",
+      "advertising_config",
+      "advertising_name",
+      "advertising_start",
+      "advertising_stop",
+      "connect",
+      "disconnect",
+      "advertising_update_from_vm_buffer"
+    ],
+    "tracking": [
+      "set_key",
+      "config",
+      "start",
+      "stop",
+      "status",
+      "rotation"
+    ],
+    "state": [
+      "ram_set",
+      "ram_get",
+      "persistent_save",
+      "persistent_load"
+    ],
+    "serial": [
+      "config_8n1",
+      "disable",
+      "write",
+      "read",
+      "write_vm_buffer"
+    ],
+    "application": [
+      "get_u32",
+      "send_u32",
+      "notify_u32",
+      "notify_string",
+      "event_send_mailbox_u32"
+    ],
+    "scheduler": [
+      "manual",
+      "boot_persistent",
+      "at_epoch_utc",
+      "every_interval_seconds_with_optional_anchor_epoch_utc",
+      "weekly_dow_mask_monday_bit0_with_utc_seconds_since_midnight"
+    ],
+    "vm_buffer": [
+      "format_u32",
+      "format_i32",
+      "format_centivolts",
+      "format_millicelsius",
+      "lora_rx_source",
+      "lora_tx_sink",
+      "serial_tx_sink",
+      "ble_advertising_sink",
+      "prepend_literal_to_existing_buffer"
+    ]
+  },
+  "known_limits": {
+    "program_bytes": 1024,
+    "lora_static_payload_bytes": 32,
+    "system_off_opcode": false,
+    "continuous_motion_duration_proof": false,
+    "qualitative_battery_low_requires_configured_threshold": true,
+    "vm_buffer_bytes": 64,
+    "app_event_mailbox_depth": 1,
+    "serial_framing": "8N1 only",
+    "lora_rx": "single packet async capture; program rearms for continuous bridge",
+    "vm_buffer_prepend_literal_bytes": 48
+  },
+  "schedule_abi": {
+    "wire_size_bytes": 12,
+    "authenticated_with_program": true,
+    "modes": {
+      "MANUAL": 0,
+      "AT": 1,
+      "EVERY": 2,
+      "WEEKLY": 3,
+      "BOOT": 4
+    },
+    "wire_fields": [
+      "mode:u8",
+      "dow_mask:u8",
+      "reserved:u16",
+      "arg0:u32",
+      "arg1:u32"
+    ],
+    "semantics": {
+      "AT": "arg0=absolute UTC epoch seconds, arg1=0",
+      "EVERY": "arg0=interval seconds, arg1=anchor UTC epoch",
+      "WEEKLY": "dow_mask Monday=bit0..Sunday=bit6; arg0=UTC seconds since midnight; arg1=0",
+      "BOOT": "autonomous execution after boot/reset",
+      "MANUAL": "no autonomous schedule"
+    }
+  }
+}

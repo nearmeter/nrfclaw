@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "nRFClaw Semantic IR v1 root contract",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "ir_version",
+    "status",
+    "language",
+    "program",
+    "unresolved_clauses",
+    "missing_capabilities",
+    "notes"
+  ],
+  "properties": {
+    "ir_version": {
+      "const": 1
+    },
+    "status": {
+      "enum": [
+        "COMPILE",
+        "MISSING_CAPABILITY",
+        "AMBIGUOUS",
+        "RESOURCE_CONFLICT"
+      ]
+    },
+    "language": {
+      "enum": [
+        "pt",
+        "en",
+        "es",
+        "other"
+      ]
+    },
+    "program": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "actions"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "BOOT",
+            "MANUAL"
+          ]
+        },
+        "actions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "op"
+            ]
+          }
+        }
+      }
+    },
+    "unresolved_clauses": {
+      "type": "array"
+    },
+    "missing_capabilities": {
+      "type": "array"
+    },
+    "notes": {
+      "type": "array"
+    }
+  }
+}

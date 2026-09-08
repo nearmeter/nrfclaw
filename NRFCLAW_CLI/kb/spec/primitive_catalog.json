@@ -1,0 +1,485 @@
+{
+  "semantic_ir_version": 1,
+  "vm_abi": 1,
+  "registers": 8,
+  "formats": [
+    "U32",
+    "U32_02",
+    "I32",
+    "VOLTS",
+    "CELSIUS"
+  ],
+  "primitives": [
+    {
+      "op": "system.minimum_power",
+      "fields": {},
+      "defaults": {},
+      "constraints": [],
+      "semantics": "No-argument primitive."
+    },
+    {
+      "op": "ble.adv_start",
+      "fields": {},
+      "defaults": {},
+      "constraints": [],
+      "semantics": "No-argument primitive."
+    },
+    {
+      "op": "ble.advertise_buffer",
+      "fields": {},
+      "defaults": {},
+      "constraints": [],
+      "semantics": "No-argument primitive."
+    },
+    {
+      "op": "lora.send_buffer",
+      "fields": {},
+      "defaults": {},
+      "constraints": [],
+      "semantics": "No-argument primitive."
+    },
+    {
+      "op": "debug.buffer",
+      "fields": {},
+      "defaults": {},
+      "constraints": [],
+      "semantics": "No-argument primitive."
+    },
+    {
+      "op": "serial.write_buffer",
+      "fields": {},
+      "defaults": {},
+      "constraints": [],
+      "semantics": "No-argument primitive."
+    },
+    {
+      "op": "app.send_buffer",
+      "fields": {},
+      "defaults": {},
+      "constraints": [],
+      "semantics": "No-argument primitive."
+    },
+    {
+      "op": "tracking.start",
+      "fields": {},
+      "defaults": {},
+      "constraints": [],
+      "semantics": "No-argument primitive."
+    },
+    {
+      "op": "tracking.stop",
+      "fields": {},
+      "defaults": {},
+      "constraints": [],
+      "semantics": "No-argument primitive."
+    },
+    {
+      "op": "vib_auto.start",
+      "fields": {},
+      "defaults": {},
+      "constraints": [],
+      "semantics": "No-argument primitive."
+    },
+    {
+      "op": "vib_auto.stop",
+      "fields": {},
+      "defaults": {},
+      "constraints": [],
+      "semantics": "No-argument primitive."
+    },
+    {
+      "op": "label",
+      "fields": {
+        "name": "string 1..32 bytes"
+      },
+      "defaults": {},
+      "constraints": [],
+      "semantics": "Defines a control-flow label."
+    },
+    {
+      "op": "jump",
+      "fields": {
+        "label": "string"
+      },
+      "defaults": {},
+      "constraints": [],
+      "semantics": "Unconditional jump to label."
+    },
+    {
+      "op": "jump_if_zero",
+      "fields": {
+        "register": "integer R0..R7",
+        "label": "string"
+      },
+      "defaults": {},
+      "constraints": [],
+      "semantics": "Jump iff referenced register equals zero."
+    },
+    {
+      "op": "register.copy",
+      "fields": {
+        "dst": "integer R0..R7",
+        "src": "integer R0..R7"
+      },
+      "defaults": {},
+      "constraints": [],
+      "semantics": "dst = src."
+    },
+    {
+      "op": "register.set",
+      "fields": {
+        "register": "integer R0..R7",
+        "value": "int32"
+      },
+      "defaults": {},
+      "constraints": [],
+      "semantics": "Load literal integer into register."
+    },
+    {
+      "op": "register.add",
+      "fields": {
+        "dst": "integer R0..R7",
+        "a": "integer R0..R7",
+        "b": "integer R0..R7"
+      },
+      "defaults": {},
+      "constraints": [],
+      "semantics": "dst = reg[a] + reg[b]. a/b are register IDs, never immediates."
+    },
+    {
+      "op": "register.sub",
+      "fields": {
+        "dst": "integer R0..R7",
+        "a": "integer R0..R7",
+        "b": "integer R0..R7"
+      },
+      "defaults": {},
+      "constraints": [],
+      "semantics": "dst = reg[a] - reg[b]. a/b are register IDs, never immediates."
+    },
+    {
+      "op": "register.compare",
+      "fields": {
+        "dst": "integer R0..R7",
+        "a": "integer R0..R7",
+        "b": "integer R0..R7",
+        "condition": "LT|GT|EQ"
+      },
+      "defaults": {},
+      "constraints": [],
+      "semantics": "Writes 1 when comparison is true, otherwise 0. NE is not supported."
+    },
+    {
+      "op": "wait",
+      "fields": {
+        "seconds": "integer 1..4294967295"
+      },
+      "defaults": {},
+      "constraints": [],
+      "semantics": "Delay for seconds."
+    },
+    {
+      "op": "gpio.read",
+      "fields": {
+        "pin": "integer 0..31",
+        "register": "integer R0..R7"
+      },
+      "defaults": {},
+      "constraints": [],
+      "semantics": "Read GPIO into register."
+    },
+    {
+      "op": "gpio.write",
+      "fields": {
+        "pin": "integer 0..31",
+        "value": "0|1"
+      },
+      "defaults": {},
+      "constraints": [],
+      "semantics": "Write digital GPIO."
+    },
+    {
+      "op": "accel.config",
+      "fields": {
+        "mode": "OFF|MOTION|TAP|FALL|WALK|VIBRATION",
+        "odr_hz": "optional integer",
+        "full_scale_g": "optional integer",
+        "threshold_mg": "optional integer",
+        "duration_ms": "optional integer",
+        "low_power": "optional boolean"
+      },
+      "defaults": {
+        "odr_hz": 10,
+        "full_scale_g": 2,
+        "threshold_mg": 120,
+        "duration_ms": 100,
+        "low_power": true
+      },
+      "constraints": [
+        "odr_hz in 1,10,25,50,100,200,400",
+        "full_scale_g in 2,4,8,16",
+        "threshold_mg 0..65535",
+        "duration_ms 0..65535"
+      ],
+      "semantics": "Configure accelerometer. Only mode is required; omitted physical parameters use deterministic ABI/runtime defaults."
+    },
+    {
+      "op": "wait.event",
+      "fields": {
+        "event": "MOTION|TAP|FALL|WALK|VIB_AUTO.MACHINE_ON|VIB_AUTO.WARNING|VIB_AUTO.ALARM|VIB_AUTO.MACHINE_OFF"
+      },
+      "defaults": {},
+      "constraints": [],
+      "semantics": "Wait for named event."
+    },
+    {
+      "op": "battery.read",
+      "fields": {
+        "register": "integer R0..R7"
+      },
+      "defaults": {},
+      "constraints": [],
+      "semantics": "Read/wait result into register."
+    },
+    {
+      "op": "temperature.read",
+      "fields": {
+        "register": "integer R0..R7"
+      },
+      "defaults": {},
+      "constraints": [],
+      "semantics": "Read/wait result into register."
+    },
+    {
+      "op": "hall.wait",
+      "fields": {
+        "register": "integer R0..R7"
+      },
+      "defaults": {},
+      "constraints": [],
+      "semantics": "Read/wait result into register."
+    },
+    {
+      "op": "ble.ndp",
+      "fields": {
+        "enabled": "boolean"
+      },
+      "defaults": {},
+      "constraints": [],
+      "semantics": "Enable/disable BLE NDP."
+    },
+    {
+      "op": "ble.advertiser",
+      "fields": {
+        "interval_ms": "optional integer 20..10240"
+      },
+      "defaults": {
+        "interval_ms": 1000
+      },
+      "constraints": [],
+      "semantics": "Configure BLE advertiser."
+    },
+    {
+      "op": "ble.name",
+      "fields": {
+        "value": "string 1..24 bytes"
+      },
+      "defaults": {},
+      "constraints": [],
+      "semantics": "Set BLE name."
+    },
+    {
+      "op": "lora.config",
+      "fields": {
+        "frequency_mhz": "optional number",
+        "power_dbm": "optional integer",
+        "sf": "optional integer",
+        "bw_khz": "optional integer",
+        "cr": "optional integer 1..4"
+      },
+      "defaults": {
+        "frequency_mhz": 915,
+        "power_dbm": 14,
+        "sf": 7,
+        "bw_khz": 125,
+        "cr": 1
+      },
+      "constraints": [
+        "CR4/5=>1",
+        "CR4/6=>2",
+        "CR4/7=>3",
+        "CR4/8=>4"
+      ],
+      "semantics": "Configure LoRa. If RF config is omitted from user intent, use persisted/current profile rather than inventing lora.config."
+    },
+    {
+      "op": "lora.receive",
+      "fields": {
+        "target": "buffer"
+      },
+      "defaults": {
+        "target": "buffer"
+      },
+      "constraints": [],
+      "semantics": "Receive packet into BUFFER."
+    },
+    {
+      "op": "lora.send_literal",
+      "fields": {
+        "value": "string 1..32 bytes"
+      },
+      "defaults": {},
+      "constraints": [],
+      "semantics": "Send exact literal by LoRa."
+    },
+    {
+      "op": "serial.config",
+      "fields": {
+        "tx_pin": "0..31",
+        "rx_pin": "0..31",
+        "baud": "300..1000000",
+        "economy": "optional boolean"
+      },
+      "defaults": {
+        "economy": false
+      },
+      "constraints": [],
+      "semantics": "Configure UART/serial."
+    },
+    {
+      "op": "serial.receive",
+      "fields": {
+        "mode": "LINE|IDLE|LENGTH",
+        "value": "required for IDLE/LENGTH"
+      },
+      "defaults": {},
+      "constraints": [],
+      "semantics": "Receive serial data into BUFFER."
+    },
+    {
+      "op": "buffer.prepend",
+      "fields": {
+        "value": "string 1..48 bytes"
+      },
+      "defaults": {},
+      "constraints": [],
+      "semantics": "Prepend literal to arbitrary current BUFFER."
+    },
+    {
+      "op": "buffer.set_literal",
+      "fields": {
+        "value": "string 1..64 bytes"
+      },
+      "defaults": {},
+      "constraints": [],
+      "semantics": "Replace BUFFER with exact literal."
+    },
+    {
+      "op": "buffer.parse_int",
+      "fields": {
+        "register": "integer R0..R7"
+      },
+      "defaults": {},
+      "constraints": [],
+      "semantics": "Parse BUFFER integer into register."
+    },
+    {
+      "op": "buffer.parse_fixed",
+      "fields": {
+        "register": "integer R0..R7",
+        "scale": "1|10|100|1000|10000|100000|1000000"
+      },
+      "defaults": {},
+      "constraints": [],
+      "semantics": "Parse decimal BUFFER into scaled integer register."
+    },
+    {
+      "op": "buffer.format_register",
+      "fields": {
+        "prefix": "string <=48 bytes",
+        "register": "integer R0..R7",
+        "format": "U32|U32_02|I32|VOLTS|CELSIUS"
+      },
+      "defaults": {},
+      "constraints": [],
+      "semantics": "Format one register into BUFFER."
+    },
+    {
+      "op": "buffer.format_fixed",
+      "fields": {
+        "prefix": "string",
+        "register": "integer R0..R7",
+        "decimals": "0..6",
+        "suffix": "string"
+      },
+      "defaults": {},
+      "constraints": [],
+      "semantics": "Format fixed-point register into BUFFER."
+    },
+    {
+      "op": "buffer.format_2reg",
+      "fields": {
+        "prefix1": "string",
+        "reg1": "integer R0..R7",
+        "format1": "format",
+        "prefix2": "string",
+        "reg2": "integer R0..R7",
+        "format2": "format"
+      },
+      "defaults": {},
+      "constraints": [],
+      "semantics": "Format two registers into one BUFFER."
+    },
+    {
+      "op": "vib_auto.config",
+      "fields": {
+        "learning_s": "integer 60..604800",
+        "initial_s": "integer 0..604800"
+      },
+      "defaults": {},
+      "constraints": [],
+      "semantics": "Both values are semantic user inputs. Never invent defaults; if requested but missing either value, return AMBIGUOUS."
+    },
+    {
+      "op": "tracking.config",
+      "fields": {
+        "interval_ms": "20..65535",
+        "tx_dbm": "optional -40..20"
+      },
+      "defaults": {
+        "tx_dbm": 4
+      },
+      "constraints": [],
+      "semantics": "Configure tracking."
+    },
+    {
+      "op": "tracking.rotation",
+      "fields": {
+        "seconds": "integer >=1"
+      },
+      "defaults": {},
+      "constraints": [],
+      "semantics": "Set tracking rotation period."
+    },
+    {
+      "op": "ha.event",
+      "fields": {
+        "cap": "0..255",
+        "operation": "0..255",
+        "register": "integer R0..R7"
+      },
+      "defaults": {},
+      "constraints": [],
+      "semantics": "Emit HA event using register value."
+    },
+    {
+      "op": "loop",
+      "fields": {
+        "actions": "non-empty/typed action array"
+      },
+      "defaults": {},
+      "constraints": [],
+      "semantics": "Structured repetition container. Lowering creates an implicit back-edge from end of body to beginning; semantic CFG must recognize this cycle."
+    }
+  ]
+}

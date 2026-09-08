@@ -1,0 +1,17 @@
+{
+  "config": {
+    "step": {
+      "confirm": {
+        "title": "Add nRFClaw",
+        "description": "The NDP access key is optional. Leave it blank for an unprotected device; enter the key only if protection was enabled through physical NUS/P0.21.",
+        "data": {
+          "access_key": "NDP access key (optional)"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "This nRFClaw device is already configured.",
+      "bluetooth_discovery_required": "Discover the device through Home Assistant Bluetooth first."
+    }
+  }
+}

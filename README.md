@@ -6,6 +6,8 @@
 
 ### AI-programmable devices that sleep almost all the time.
 
+🌐 Project: https://nrfclaw.cloud/
+
 > In *Apollo 13*, the simulator team has to fit an essential power-up sequence inside a brutally small electrical budget. nRFClaw applies the same instinct to autonomous electronics: **wake only when useful work exists, do it quickly, then go back to sleep.**
 
 **Describe the behavior. Compile it into deterministic bytecode. Send it over Bluetooth. Let a tiny battery-powered device run autonomously.**
@@ -159,7 +161,7 @@ arm-none-eabi-gcc --version
 
 ### 3. Nordic SDK subset
 
-The public repository is designed to contain only the nRF5 SDK files actually required by nRFClaw under:
+The public repository is designed to contain only the nRF5 SDK17 files actually required by nRFClaw under:
 
 ```text
 vendor/nrf5sdk/
@@ -725,8 +727,7 @@ Third-party files — particularly the curated Nordic nRF5 SDK subset in `vendor
 ---
 
 
-🌐 Project: https://nrfclaw.cloud/  
-🏢 Published by NearMeter: https://github.com/nearmeter  
+🏢 Published by NearMeter: https://github.com/nearmeter
 ✉️ Contact: nrfclaw@nearmeter.com
 
 

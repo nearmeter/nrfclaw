@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <string.h>
 #include "nrf.h"
+#include "nrf_gpio.h"
 #include "nrf_soc.h"
 #include "nrf_sdh.h"
 #include "nrf_sdh_ble.h"
@@ -17,6 +18,7 @@
 #include "nrf_sdm.h"
 #include "app_util.h"
 #include "nrfclaw_dfu_protocol.h"
+#include "board_config.h"
 
 #define APP_BLE_CONN_CFG_TAG 1
 #define DEVICE_NAME_PREFIX "nRFClaw-DFU-"
@@ -499,9 +501,55 @@ static void ble_init(void)
     err = sd_ble_gap_adv_start(m_adv_handle, APP_BLE_CONN_CFG_TAG);
     if (err != NRF_SUCCESS) boot_fail(0xBAU, err);
 }
+static bool recovery_button_pressed(void)
+{
+    /*
+     * The recovery button belongs to the selected board profile.  Do not
+     * hard-code P0.21 here: NINASENSE currently maps P_BUTTON to P0.21,
+     * while another board may map it to a different GPIO.
+     *
+     * Keep the electrical behavior identical to the application programming
+     * button: active low with an internal pull-up.  Normal boot pays only a
+     * very short settling delay; the 20 ms debounce is used only after an
+     * initial low sample.
+     */
+    nrf_gpio_cfg_input(P_BUTTON, NRF_GPIO_PIN_PULLUP);
+    nrf_delay_us(50U);
+
+    if (nrf_gpio_pin_read(P_BUTTON) != 0U) {
+        nrf_gpio_cfg_default(P_BUTTON);
+        return false;
+    }
+
+    nrf_delay_ms(20U);
+    if (nrf_gpio_pin_read(P_BUTTON) != 0U) {
+        nrf_gpio_cfg_default(P_BUTTON);
+        return false;
+    }
+
+    return true;
+}
+
 int main(void)
 {
-    uint32_t gp=NRF_POWER->GPREGRET; NRF_POWER->GPREGRET=0;
-    if(gp!=NRFCLAW_DFU_GPREGRET_MAGIC && app_vector_valid()) app_start();
-    ble_init(); while(1){process_frame();(void)sd_app_evt_wait();}
+    uint32_t gp=NRF_POWER->GPREGRET;
+    NRF_POWER->GPREGRET=0;
+
+    /*
+     * Recovery has priority over the installed application.  This makes the
+     * BLE DFU path independent of nRFClaw (or any other application): hold
+     * the board-defined programming button during reset/power-on and the
+     * bootloader keeps control.
+     *
+     * GPREGRET remains supported for the normal software-requested DFU path.
+     */
+    bool const button_recovery = recovery_button_pressed();
+    bool const software_recovery = (gp == NRFCLAW_DFU_GPREGRET_MAGIC);
+
+    if (!button_recovery && !software_recovery && app_vector_valid()) {
+        app_start();
+    }
+
+    ble_init();
+    while(1){process_frame();(void)sd_app_evt_wait();}
 }

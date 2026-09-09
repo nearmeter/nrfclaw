@@ -10,6 +10,17 @@ SIZE=$(TC)arm-none-eabi-size
 BUILD=build
 TARGET=$(BUILD)/nrfclaw_bootloader
 LINKER=nrf52832_s132_bootloader.ld
+
+# Board profile used by the bootloader for hardware-owned recovery inputs.
+# The selected boards/<board>/board_config.h supplies P_BUTTON; the bootloader
+# must never hard-code the NINASENSE P0.21 mapping.
+BOARD ?= ninasense
+BOARD_DIR ?= ../boards/$(BOARD)
+BOARD_CONFIG := $(BOARD_DIR)/board_config.h
+
+ifeq ($(wildcard $(BOARD_CONFIG)),)
+$(error Missing board profile: $(BOARD_CONFIG))
+endif
 SRC=main.c \
  $(NRF5SDK)/modules/nrfx/mdk/gcc_startup_nrf52.S \
  $(NRF5SDK)/modules/nrfx/mdk/system_nrf52.c \
@@ -28,7 +39,7 @@ SRC=main.c \
  $(NRF5SDK)/components/libraries/util/app_util_platform.c \
  $(NRF5SDK)/components/libraries/util/nrf_assert.c \
  $(NRF5SDK)/components/libraries/experimental_section_vars/nrf_section_iter.c
-INC=../include ../config \
+INC=../include ../config $(BOARD_DIR) \
  $(NRF5SDK)/modules/nrfx/mdk $(NRF5SDK)/modules/nrfx/hal $(NRF5SDK)/modules/nrfx \
  $(NRF5SDK)/modules/nrfx/templates/nRF52832 \
  $(NRF5SDK)/integration/nrfx \
@@ -61,6 +72,12 @@ OBJ=$(addprefix $(BUILD)/,$(notdir $(C_SRC:.c=.o))) $(addprefix $(BUILD)/,$(notd
 vpath %.c $(sort $(dir $(C_SRC)))
 vpath %.S $(sort $(dir $(S_SRC)))
 all: $(TARGET).hex $(TARGET).bin
+
+show-config:
+	@echo "BOARD=$(BOARD)"
+	@echo "BOARD_CONFIG=$(BOARD_CONFIG)"
+	@echo "NRF5SDK=$(NRF5SDK)"
+
 $(BUILD)/%.o: %.c
 	@mkdir -p $(BUILD); $(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 $(BUILD)/%.o: %.S
@@ -75,4 +92,4 @@ $(TARGET).bin: $(TARGET).out
 	@python3 -c 'import os,sys; n=os.path.getsize("$@"); print("bootloader bytes:",n); sys.exit(0 if n<=0x5000 else 2)'
 clean:
 	rm -rf $(BUILD)
-.PHONY: all clean
+.PHONY: all clean show-config

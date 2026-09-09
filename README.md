@@ -142,21 +142,54 @@ git clone https://github.com/nearmeter/nrfclaw.git
 cd nrfclaw
 ```
 
-### 2. Install build tools
+### 2. Install build tools and the validated ARM toolchain
 
 Ubuntu/Debian:
 
 ```bash
 sudo apt update
-sudo apt install make gcc-arm-none-eabi binutils-arm-none-eabi \
-                 python3 python3-pip python3-venv bluez
+sudo apt install make python3 python3-pip python3-venv bluez
 ```
+
+nRFClaw is currently built and validated with the **GNU Arm Embedded Toolchain
+5-2016-q3-update** (`gcc-arm-none-eabi-5_4-2016q3`). Download the appropriate
+package for your operating system from the official release page:
+
+https://launchpad.net/gcc-arm-embedded/5.0/5-2016-q3-update
+
+For Linux, the release provides:
+
+```text
+gcc-arm-none-eabi-5_4-2016q3-20160926-linux.tar.bz2
+```
+
+Extract the toolchain to a directory of your choice. For example:
+
+```bash
+sudo tar -xjf gcc-arm-none-eabi-5_4-2016q3-20160926-linux.tar.bz2 -C /usr/local
+```
+
+This example results in a compiler path similar to:
+
+```text
+/usr/local/gcc-arm-none-eabi-5_4-2016q3/bin/arm-none-eabi-gcc
+```
+
+Verify the downloaded toolchain directly:
+
+```bash
+/usr/local/gcc-arm-none-eabi-5_4-2016q3/bin/arm-none-eabi-gcc --version
+```
+
+> **Important:** do not rely on the distribution-provided `arm-none-eabi-gcc`
+> for the reference build. Newer compiler, linker and newlib versions may not
+> reproduce the validated nRFClaw/nRF5 SDK build. Pass the downloaded
+> 5-2016-q3 toolchain explicitly to `make configure`.
 
 Install Nordic/J-Link command-line tools so this also works:
 
 ```bash
 nrfjprog --version
-arm-none-eabi-gcc --version
 ```
 
 ### 3. Nordic SDK subset
@@ -169,10 +202,25 @@ vendor/nrf5sdk/
 
 This avoids requiring a full SDK download. Nordic files keep their original licenses/notices; they are not relicensed as Apache-2.0.
 
-### 4. Build firmware
+### 4. Configure and build the firmware
+
+Configure the project with the NINASENSE board, the vendored nRF5 SDK subset
+and the downloaded ARM GNU Toolchain:
 
 ```bash
-make configure BOARD=ninasense NRF5SDK=vendor/nrf5sdk
+make configure \
+    BOARD=ninasense \
+    NRF5SDK=vendor/nrf5sdk \
+    TOOLCHAIN_PATH=/usr/local/gcc-arm-none-eabi-5_4-2016q3/bin
+```
+
+`TOOLCHAIN_PATH` must point to the toolchain's `bin` directory — the directory
+that contains `arm-none-eabi-gcc`. If you extracted the toolchain somewhere
+else, replace the path above accordingly.
+
+The configuration is stored locally, so subsequent builds can use:
+
+```bash
 make clean
 make
 ```

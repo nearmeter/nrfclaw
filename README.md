@@ -75,12 +75,12 @@ VM bytecode
       │
       │ BLE/NUS programming
       ▼
-┌──────────────────────── nRF52832 ────────────────────────┐
+┌──────────────────────── nRF52832 ───────────────────────┐
 │                                                         │
 │  VM wakes → reads sensor → updates BLE / sends LoRa     │
 │     ▲                                      │            │
 │     │                                      ▼            │
-│ RTC / IRQ / event                      S L E E P         │
+│ RTC / IRQ / event                      S L E E P        │
 │     │                                      │            │
 │     └──────────────────────────────────────┘            │
 └─────────────────────────────────────────────────────────┘
@@ -151,7 +151,7 @@ sudo apt update
 sudo apt install make python3 python3-pip python3-venv bluez
 ```
 
-nRFClaw is currently built and validated with the **GNU Arm Embedded Toolchain
+nRFClaw is currently built with the **GNU Arm Embedded Toolchain
 5-2016-q3-update** (`gcc-arm-none-eabi-5_4-2016q3`). Download the appropriate
 package for your operating system from the official release page:
 
@@ -180,11 +180,6 @@ Verify the downloaded toolchain directly:
 ```bash
 /usr/local/gcc-arm-none-eabi-5_4-2016q3/bin/arm-none-eabi-gcc --version
 ```
-
-> **Important:** do not rely on the distribution-provided `arm-none-eabi-gcc`
-> for the reference build. Newer compiler, linker and newlib versions may not
-> reproduce the validated nRFClaw/nRF5 SDK build. Pass the downloaded
-> 5-2016-q3 toolchain explicitly to `make configure`.
 
 Install Nordic/J-Link command-line tools so this also works:
 
@@ -222,7 +217,7 @@ The configuration is stored locally, so subsequent builds can use:
 
 ```bash
 make clean
-make
+make -j$(nproc)
 ```
 
 Build products are written below `build/ninasense/`.

@@ -13,6 +13,7 @@
 #include "nrfclaw_ble_boot.h"
 #include "nrfclaw_ble_app.h"
 #include "nrfclaw_lora_profile_store.h"
+#include "nrfclaw_ninalink_lab.h"
 #include <string.h>
 
 #define NDP_INFO NRFCLAW_NDP_INFO
@@ -30,6 +31,19 @@
 #define NDP_LORA_DIAG_RX NRFCLAW_NDP_LORA_DIAG_RX
 #define NDP_RADIO_GET_EXT NRFCLAW_NDP_RADIO_GET_EXT
 #define NDP_RADIO_SET_EXT NRFCLAW_NDP_RADIO_SET_EXT
+#define NDP_NINALINK_LAB NRFCLAW_NDP_NINALINK_LAB
+
+typedef struct {
+    bool active;
+    uint8_t len;
+    uint8_t offset;
+    uint8_t data[48];
+    int16_t rssi_x2;
+    int16_t snr_x4;
+} nrfclaw_lora_diag_chunk_t;
+
+static nrfclaw_lora_diag_chunk_t m_lora_diag_chunk;
+
 #define NDP_HALL_CONFIG NRFCLAW_NDP_HALL_CONFIG
 #define NDP_ERROR NRFCLAW_NDP_ERROR
 #define NDP_AUTH_BEGIN NRFCLAW_NDP_AUTH_BEGIN
@@ -95,7 +109,8 @@ static bool auth_exempt_opcode(uint8_t op)
 static bool nus_owner_key_opcode(uint8_t op)
 {
     return op == NDP_KEY_GENERATE || op == NDP_KEY_GET || op == NDP_KEY_STATUS ||
-           op == NDP_BLE_BOOT_CONTROL || op == NDP_BLE_BEACON_CONTROL;
+           op == NDP_BLE_BOOT_CONTROL || op == NDP_BLE_BEACON_CONTROL ||
+           op == NDP_NINALINK_LAB;
 }
 
 bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
@@ -638,13 +653,26 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
         if(n==0U || n>48U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
         return reply(op,seq,nrfclaw_lora_send_async(p,n)?NDP_OK:NDP_BUSY,0,0,out,ol);
       case NDP_LORA_DIAG_RX:
-        /* p[0]=0 start; p[0]=1 poll/take. Body: state,len,rssi_x2:i16,snr_x4:i16,data. */
+        /*
+         * Physical NUS diagnostic.
+         * action 0: start continuous RX
+         * action 1: legacy whole-packet poll/take
+         * action 2: cancel
+         * action 3: B4.1 chunked poll/take for packets >9 bytes
+         *
+         * action 3 response body:
+         * state:u8,total_len:u8,offset:u8,rssi_x2:i16,snr_x4:i16,data[0..8]
+         * Max body = 15 bytes; plus 5-byte NDP response overhead = 20 bytes.
+         */
         if(enforce_auth) return reply(op,seq,NDP_FORBIDDEN,0,0,out,ol);
         if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+
         if(p[0]==0U) {
+            memset(&m_lora_diag_chunk,0,sizeof(m_lora_diag_chunk));
             if(nrfclaw_lora_rx_active()) return reply(op,seq,NDP_BUSY,0,0,out,ol);
             return reply(op,seq,nrfclaw_lora_diag_stream_start()?NDP_OK:NDP_BUSY,0,0,out,ol);
         }
+
         if(p[0]==1U) {
             uint8_t dl=0U; int16_t rssi=0,snr=0;
             if(nrfclaw_lora_diag_stream_take(&r[6],&dl,48U,&rssi,&snr)) {
@@ -654,10 +682,82 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
             if(nrfclaw_lora_diag_stream_active()) { r[0]=0U; return reply(op,seq,NDP_OK,r,1,out,ol); }
             r[0]=2U; return reply(op,seq,NDP_OK,r,1,out,ol);
         }
+
         if(p[0]==2U) {
+            memset(&m_lora_diag_chunk,0,sizeof(m_lora_diag_chunk));
             return reply(op,seq,nrfclaw_lora_cancel_receive()?NDP_OK:NDP_BAD_ARG,0,0,out,ol);
         }
+
+        if(p[0]==3U) {
+            if(!m_lora_diag_chunk.active) {
+                uint8_t dl=0U; int16_t rssi=0,snr=0;
+                if(nrfclaw_lora_diag_stream_take(
+                       m_lora_diag_chunk.data,&dl,sizeof(m_lora_diag_chunk.data),
+                       &rssi,&snr)) {
+                    m_lora_diag_chunk.active=true;
+                    m_lora_diag_chunk.len=dl;
+                    m_lora_diag_chunk.offset=0U;
+                    m_lora_diag_chunk.rssi_x2=rssi;
+                    m_lora_diag_chunk.snr_x4=snr;
+                } else {
+                    if(nrfclaw_lora_diag_stream_active()) {
+                        r[0]=0U;
+                        return reply(op,seq,NDP_OK,r,1,out,ol);
+                    }
+                    r[0]=2U;
+                    return reply(op,seq,NDP_OK,r,1,out,ol);
+                }
+            }
+
+            {
+                uint8_t remain=(uint8_t)(m_lora_diag_chunk.len-m_lora_diag_chunk.offset);
+                uint8_t chunk=remain>8U?8U:remain;
+                uint8_t off=m_lora_diag_chunk.offset;
+
+                r[0]=1U;
+                r[1]=m_lora_diag_chunk.len;
+                r[2]=off;
+                memcpy(&r[3],&m_lora_diag_chunk.rssi_x2,2);
+                memcpy(&r[5],&m_lora_diag_chunk.snr_x4,2);
+                memcpy(&r[7],&m_lora_diag_chunk.data[off],chunk);
+
+                m_lora_diag_chunk.offset=(uint8_t)(off+chunk);
+                if(m_lora_diag_chunk.offset>=m_lora_diag_chunk.len)
+                    m_lora_diag_chunk.active=false;
+
+                return reply(op,seq,NDP_OK,r,(uint8_t)(7U+chunk),out,ol);
+            }
+        }
+
         return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+      case NDP_NINALINK_LAB: {
+        nrfclaw_ninalink_lab_status_t ls;
+        if(enforce_auth) return reply(op,seq,NDP_FORBIDDEN,0,0,out,ol);
+        if(n==0U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+        if(p[0]==0U) {
+            if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+        } else if(p[0]==1U) {
+            if(n!=3U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            uint16_t period=(uint16_t)p[1]|((uint16_t)p[2]<<8);
+            if(!nrfclaw_ninalink_lab_start(period))
+                return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+        } else if(p[0]==2U) {
+            if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            nrfclaw_ninalink_lab_stop();
+        } else {
+            return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+        }
+        nrfclaw_ninalink_lab_get_status(&ls);
+        r[0]=ls.active?1U:0U;
+        r[1]=(uint8_t)ls.period_s;r[2]=(uint8_t)(ls.period_s>>8);
+        r[3]=(uint8_t)ls.next_sequence;r[4]=(uint8_t)(ls.next_sequence>>8);
+        r[5]=ls.last_entry_count;
+        r[6]=ls.last_frame_length;
+        r[7]=ls.last_result;
+        r[8]=(uint8_t)ls.node_id;r[9]=(uint8_t)(ls.node_id>>8);
+        r[10]=(uint8_t)(ls.node_id>>16);r[11]=(uint8_t)(ls.node_id>>24);
+        return reply(op,seq,NDP_OK,r,12,out,ol);
+      }
       case NDP_HALL_CONFIG:
         if(!access_allowed(enforce_auth, NRFCLAW_NDP_CONTROL))
             return reply(op,seq,NDP_UNAUTHORIZED,0,0,out,ol);

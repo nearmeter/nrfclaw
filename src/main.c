@@ -30,6 +30,7 @@
 #include "nrfclaw_lis2dh12.h"
 #include "nrfclaw_serial.h"
 #include "nrfclaw_ds18b20.h"
+#include "nrfclaw_ninalink_lab.h"
 
 static void lora_dio_handler(nrf_drv_gpiote_pin_t pin,
                              nrf_gpiote_polarity_t action)
@@ -223,6 +224,7 @@ int main(void)
     nrfclaw_vm_init();
     nrfclaw_scheduler_init();
     nrfclaw_native_init();
+    APP_ERROR_CHECK(nrfclaw_ninalink_lab_init() ? NRF_SUCCESS : NRF_ERROR_INTERNAL);
     nrfclaw_vib_health_init();
     nrfclaw_vib_auto_init();
     nrfclaw_factory_init();
@@ -334,6 +336,7 @@ int main(void)
 
         nrfclaw_scheduler_process();
 
+        nrfclaw_ninalink_lab_process();
         nrfclaw_lora_process();
         nrfclaw_lora_profile_process();
 

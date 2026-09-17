@@ -64,7 +64,9 @@ typedef enum {
     NRFCLAW_NDP_LORA_DIAG_RX      = 86,
     /* r3.8.18 extended persistent LoRa profile; legacy 56/57 remain frozen. */
     NRFCLAW_NDP_RADIO_GET_EXT      = 87,
-    NRFCLAW_NDP_RADIO_SET_EXT      = 88
+    NRFCLAW_NDP_RADIO_SET_EXT      = 88,
+    /* B4.1 physical-NUS-only NinaLink autonomous lab uplink. */
+    NRFCLAW_NDP_NINALINK_LAB       = 89
 } nrfclaw_ndp_opcode_t;
 
 /* Stable NDP v1 status values. */

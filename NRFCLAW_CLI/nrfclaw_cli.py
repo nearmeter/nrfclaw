@@ -388,12 +388,116 @@ NDP_LORA_DIAG_SEND       = 0x55  # r3.8.16b1l physical NUS only
 NDP_LORA_DIAG_RX         = 0x56  # r3.8.16b1l physical NUS only
 NDP_RADIO_GET_EXT         = 0x57  # r3.8.18 extended persisted radio profile
 NDP_RADIO_SET_EXT         = 0x58  # r3.8.18 extended persisted radio profile
+NDP_NINALINK_LAB          = 0x59  # B4.1 physical NUS lab uplink
 
 NDP_SENSOR_BATTERY       = 1
 NDP_SENSOR_HALL          = 2
 NDP_SENSOR_ACCEL_XYZ     = 3
 NDP_SENSOR_DS18B20       = 4
 NDP_SENSOR_ACCEL_METRICS = 5
+
+
+NINALINK_MAGIC = 0x4E
+NINALINK_VERSION = 1
+NINALINK_TYPE_NAMES = {
+    0x01: "HELLO", 0x02: "CAPS_REQUEST", 0x03: "CAPS_RESPONSE",
+    0x10: "CAP_REPORT", 0x11: "CAP_EVENT", 0x20: "ACK", 0x21: "NACK",
+}
+NINALINK_VALUE_SIZES = {0x01:1,0x02:1,0x03:1,0x04:2,0x05:2,0x06:4,0x07:4,0x08:1}
+NINALINK_CAPS = {
+    0x0001: ("battery_voltage", -3, "V"),
+    0x0002: ("battery_percent", 0, "%"),
+    0x0100: ("temperature", -2, "C"),
+    0x0101: ("humidity", -2, "%"),
+    0x0102: ("illuminance", 0, "lux"),
+    0x0103: ("pressure", 0, "Pa"),
+    0x0104: ("co2", 0, "ppm"),
+    0x0105: ("tvoc", 0, "ppb"),
+    0x0106: ("leak", 0, ""),
+    0x0200: ("motion", 0, ""),
+    0x0201: ("tap", 0, ""),
+    0x0202: ("fall", 0, ""),
+    0x0203: ("acceleration_x", 0, "mg"),
+    0x0204: ("acceleration_y", 0, "mg"),
+    0x0205: ("acceleration_z", 0, "mg"),
+    0x0206: ("vibration_rms", 0, "mg"),
+    0x0207: ("vibration_peak", 0, "mg"),
+    0x0208: ("vibration_peak_to_peak", 0, "mg"),
+    0x0209: ("vibration_frequency", -3, "Hz"),
+    0x020A: ("vibration_alarm", 0, ""),
+    0x0300: ("digital_input", 0, ""),
+    0x0301: ("hall_state", 0, ""),
+    0x0302: ("counter", 0, "count"),
+    0x0303: ("quadrature_position", 0, "count"),
+    0x0400: ("presence", 0, ""),
+    0x0401: ("tracking_active", 0, ""),
+}
+
+def ninalink_crc16(data: bytes) -> int:
+    crc = 0xFFFF
+    for octet in data:
+        crc ^= octet << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if (crc & 0x8000) else (crc << 1) & 0xFFFF
+    return crc
+
+def decode_ninalink(data: bytes) -> dict:
+    if len(data) < 15: raise ValueError("frame shorter than 15 bytes")
+    if len(data) > 64: raise ValueError("frame longer than 64 bytes")
+    if data[0] != NINALINK_MAGIC: raise ValueError(f"bad magic 0x{data[0]:02X}")
+    if data[1] != NINALINK_VERSION: raise ValueError(f"unsupported version {data[1]}")
+    payload_len = data[6]
+    if len(data) != 15 + payload_len:
+        raise ValueError(f"length mismatch physical={len(data)} payload={payload_len}")
+    got_crc = int.from_bytes(data[-2:], "little")
+    want_crc = ninalink_crc16(data[:-2])
+    if got_crc != want_crc:
+        raise ValueError(f"CRC mismatch got=0x{got_crc:04X} expected=0x{want_crc:04X}")
+    result = {
+        "flags": data[2], "type": data[3],
+        "network_id": int.from_bytes(data[4:6], "little"),
+        "node_id": int.from_bytes(data[7:11], "little"),
+        "sequence": int.from_bytes(data[11:13], "little"),
+        "payload": data[13:-2], "entries": [],
+    }
+    if result["type"] in (0x10, 0x11):
+        p = result["payload"]
+        if not p: raise ValueError("value message has empty payload")
+        count, off, entries = p[0], 1, []
+        for _ in range(count):
+            if off + 4 > len(p): raise ValueError("truncated value-entry header")
+            cap = int.from_bytes(p[off:off+2], "little")
+            ch, vt = p[off+2], p[off+3]
+            size = NINALINK_VALUE_SIZES.get(vt)
+            if size is None: raise ValueError(f"unknown value type 0x{vt:02X}")
+            if off + 4 + size > len(p): raise ValueError("truncated value")
+            rawb = p[off+4:off+4+size]
+            if vt == 0x01:
+                if rawb[0] not in (0,1): raise ValueError("invalid BOOL")
+                raw = bool(rawb[0])
+            elif vt in (0x03,0x05,0x07):
+                raw = int.from_bytes(rawb, "little", signed=True)
+            else:
+                raw = int.from_bytes(rawb, "little")
+            entries.append({"capability_id":cap,"channel":ch,"value_type":vt,"raw":raw})
+            off += 4 + size
+        if off != len(p): raise ValueError("trailing bytes after value entries")
+        result["entries"] = entries
+    return result
+
+def format_ninalink_value(entry: dict) -> str:
+    cap = entry["capability_id"]
+    name, scale, unit = NINALINK_CAPS.get(cap, (f"cap_0x{cap:04X}",0,""))
+    raw = entry["raw"]
+    if isinstance(raw, bool):
+        value_text = "true" if raw else "false"
+    elif scale == 0:
+        value_text = str(raw)
+    else:
+        value = raw * (10 ** scale)
+        value_text = f"{value:.{-scale}f}"
+    if unit: value_text += f" {unit}"
+    return f"{name}[{entry['channel']}] = {value_text} (raw={raw})"
 
 NDP_ACCESS_PUBLIC     = 0
 NDP_ACCESS_CONTROL    = 1
@@ -2666,6 +2770,208 @@ class NRFClawClient:
         elapsed = time.monotonic() - started
         print(f"LoRa TX complete: {seq - 1} packet(s) in {elapsed:.2f}s")
 
+    async def sensor_read_raw(self, sensor_id: int, retries=1, delay=0.2):
+        """Raw SENSOR_READ helper for the physical NUS NDP client."""
+        last = (None, b"")
+        for attempt in range(retries):
+            last = await self.ndp_command_raw(
+                NDP_SENSOR_READ,
+                bytes([sensor_id & 0xFF]),
+            )
+            if last[0] != 4:  # NDP_BUSY
+                return last
+            if attempt + 1 < retries:
+                await asyncio.sleep(delay)
+        return last
+
+    def _decode_ninalink_lab_status(self, p: bytes) -> dict:
+        if len(p) != 12:
+            raise RuntimeError(f"Invalid NINALINK_LAB status length: {len(p)}")
+        return {
+            "active": bool(p[0]),
+            "period_s": int.from_bytes(p[1:3], "little"),
+            "next_sequence": int.from_bytes(p[3:5], "little"),
+            "last_entry_count": p[5],
+            "last_frame_length": p[6],
+            "last_result": p[7],
+            "node_id": int.from_bytes(p[8:12], "little"),
+        }
+
+    async def ninalink_lab_status(self):
+        p = await self.ndp_command(NDP_NINALINK_LAB, b"\x00")
+        s = self._decode_ninalink_lab_status(p)
+        result_names = {0:"IDLE",1:"SENT",2:"NO_DATA",3:"RADIO_BUSY",4:"BUILD_ERROR",5:"TIMER_ERROR"}
+        print("=== NINALINK B4.1 LAB TX ===")
+        print(f"Active:          {'yes' if s['active'] else 'no'}")
+        print(f"Node ID:         0x{s['node_id']:08X}")
+        print(f"Period:          {s['period_s']} s")
+        print(f"Next sequence:   {s['next_sequence']}")
+        print(f"Last entries:    {s['last_entry_count']}")
+        print(f"Last frame len:  {s['last_frame_length']} bytes")
+        print(f"Last result:     {result_names.get(s['last_result'], s['last_result'])}")
+        return s
+
+    async def ninalink_lab_start(self, every_s: int):
+        if every_s < 2 or every_s > 300:
+            raise ValueError("--every must be 2..300 seconds")
+        st, bp = await self.sensor_read_raw(NDP_SENSOR_BATTERY, retries=5, delay=0.20)
+        if st == 0 and len(bp) >= 2:
+            cv = int.from_bytes(bp[:2], "little")
+            print(f"Primed battery:  {cv / 100.0:.2f} V")
+        else:
+            print(f"Battery prime:   {NDP_STATUS_NAMES.get(st, st)}")
+        st, tp = await self.sensor_read_raw(NDP_SENSOR_DS18B20, retries=4, delay=0.80)
+        if st == 0 and len(tp) == 4:
+            mc = int.from_bytes(tp, "little", signed=True)
+            print(f"Primed temp:     {mc / 1000.0:.3f} C")
+        elif st == 3:
+            print("Primed temp:     unavailable (DS18B20 unsupported/absent)")
+        else:
+            print(f"Temperature prime: {NDP_STATUS_NAMES.get(st, st)}")
+        p = await self.ndp_command(NDP_NINALINK_LAB, b"\x01" + struct.pack("<H", every_s))
+        s = self._decode_ninalink_lab_status(p)
+        print(f"NinaLink lab TX armed: node=0x{s['node_id']:08X}, every {s['period_s']}s; first TX after one period.")
+        print("RAM-only mode; stops on reboot or ninalink-tx-stop.")
+        return s
+
+    async def ninalink_lab_stop(self):
+        p = await self.ndp_command(NDP_NINALINK_LAB, b"\x02")
+        s = self._decode_ninalink_lab_status(p)
+        print("NinaLink lab TX stopped.")
+        return s
+
+    async def ninalink_rx(self, timeout_s: float = 45.0):
+        import time
+
+        if timeout_s <= 0:
+            raise ValueError("timeout must be > 0 seconds")
+
+        await self.lora_rx_cancel(quiet=True)
+        await asyncio.wait_for(
+            self.ndp_command(NDP_LORA_DIAG_RX, b"\x00", timeout=3.0),
+            timeout=4.0,
+        )
+
+        print(f"NinaLink RX: continuous listening ({timeout_s:g}s window)")
+        print("Chunked NDP/NUS transport: up to 8 RF bytes per BLE response.")
+        print("Press Ctrl-C to abort; otherwise exits only at timeout or NUS disconnect.")
+
+        deadline = time.monotonic() + timeout_s
+        packet_count = 0
+        assembly = bytearray()
+        expected_len = None
+        packet_rssi_x2 = 0
+        packet_snr_x4 = 0
+
+        try:
+            while True:
+                remain = deadline - time.monotonic()
+                if remain <= 0:
+                    break
+                if not self.client.is_connected:
+                    raise ConnectionError("NUS connection lost")
+
+                await asyncio.sleep(min(0.03, remain))
+                remain = deadline - time.monotonic()
+                if remain <= 0:
+                    break
+
+                poll_timeout = min(1.0, max(0.20, remain))
+                try:
+                    p = await asyncio.wait_for(
+                        self.ndp_command(
+                            NDP_LORA_DIAG_RX, b"\x03", timeout=poll_timeout
+                        ),
+                        timeout=poll_timeout + 0.25,
+                    )
+                except (asyncio.TimeoutError, TimeoutError):
+                    if not self.client.is_connected:
+                        raise ConnectionError("NUS connection lost")
+                    continue
+
+                if not p or p[0] == 0:
+                    continue
+                if p[0] == 2:
+                    raise RuntimeError("NinaLink continuous RX stopped unexpectedly")
+                if p[0] != 1 or len(p) < 7:
+                    raise RuntimeError(
+                        f"Invalid chunked NinaLink RX response: {p.hex()}"
+                    )
+
+                total_len = p[1]
+                offset = p[2]
+                rssi_x2 = int.from_bytes(p[3:5], "little", signed=True)
+                snr_x4 = int.from_bytes(p[5:7], "little", signed=True)
+                chunk = p[7:]
+
+                if total_len == 0 or total_len > 48:
+                    raise RuntimeError(
+                        f"Invalid chunked RF packet length: {total_len}"
+                    )
+
+                if offset == 0:
+                    assembly = bytearray()
+                    expected_len = total_len
+                    packet_rssi_x2 = rssi_x2
+                    packet_snr_x4 = snr_x4
+                elif expected_len is None:
+                    raise RuntimeError("Received continuation without packet start")
+
+                if total_len != expected_len:
+                    raise RuntimeError("RF packet length changed during reassembly")
+                if offset != len(assembly):
+                    raise RuntimeError(
+                        f"Chunk offset mismatch: got {offset}, expected {len(assembly)}"
+                    )
+                if len(assembly) + len(chunk) > expected_len:
+                    raise RuntimeError("Chunk exceeds announced RF packet length")
+
+                assembly.extend(chunk)
+
+                if len(assembly) != expected_len:
+                    continue
+
+                data = bytes(assembly)
+                packet_count += 1
+                elapsed = timeout_s - max(0.0, deadline - time.monotonic())
+
+                print(
+                    f"[{packet_count:04d} +{elapsed:7.2f}s] "
+                    f"RX len={len(data)} "
+                    f"RSSI={packet_rssi_x2/2:.1f} dBm "
+                    f"SNR={packet_snr_x4/4:.2f} dB"
+                )
+
+                try:
+                    nf = decode_ninalink(data)
+                    tname = NINALINK_TYPE_NAMES.get(
+                        nf["type"], f"0x{nf['type']:02X}"
+                    )
+                    print(
+                        f"NinaLink v1 {tname} "
+                        f"net=0x{nf['network_id']:04X} "
+                        f"node=0x{nf['node_id']:08X} "
+                        f"seq={nf['sequence']}"
+                    )
+                    for entry in nf["entries"]:
+                        print("  " + format_ninalink_value(entry))
+                except ValueError as exc:
+                    print(f"NinaLink INVALID: {exc}")
+                    print("HEX:   " + " ".join(f"{b:02X}" for b in data))
+
+                assembly = bytearray()
+                expected_len = None
+
+        finally:
+            if self.client.is_connected:
+                await self.lora_rx_cancel(quiet=True)
+
+        print(
+            f"NinaLink RX window complete: "
+            f"{packet_count} packet(s) in {timeout_s:g}s"
+        )
+        return packet_count
+
     async def lora_rx_cancel(self, quiet: bool = False):
         try:
             await asyncio.wait_for(
@@ -2678,7 +2984,7 @@ class NRFClawClient:
             if not quiet:
                 print(f"LoRa RX cancel warning: {exc}")
 
-    async def lora_rx(self, timeout_s: float = 30.0):
+    async def lora_rx(self, timeout_s: float = 30.0, ninalink: bool = False):
         import time
         if timeout_s <= 0:
             raise ValueError("timeout must be > 0 seconds")
@@ -2690,7 +2996,7 @@ class NRFClawClient:
             self.ndp_command(NDP_LORA_DIAG_RX, b"\x00", timeout=3.0),
             timeout=4.0,
         )
-        print(f"LoRa RX: continuous listening ({timeout_s:g}s window)")
+        print(f"{'NinaLink' if ninalink else 'LoRa'} RX: continuous listening ({timeout_s:g}s window)")
         print("Press Ctrl-C to abort; otherwise exits only at timeout or NUS disconnect.")
         deadline = time.monotonic() + timeout_s
         packet_count = 0
@@ -2742,8 +3048,19 @@ class NRFClawClient:
                 elapsed = timeout_s - max(0.0, deadline - time.monotonic())
                 print(f"[{packet_count:04d} +{elapsed:7.2f}s] RX len={n} "
                       f"RSSI={rssi_x2/2:.1f} dBm SNR={snr_x4/4:.2f} dB")
-                print("HEX:   " + " ".join(f"{b:02X}" for b in data))
-                print("ASCII: " + data.decode("utf-8", errors="replace"))
+                if ninalink:
+                    try:
+                        nf = decode_ninalink(data)
+                        tname = NINALINK_TYPE_NAMES.get(nf["type"], f"0x{nf['type']:02X}")
+                        print(f"NinaLink v1 {tname} net=0x{nf['network_id']:04X} node=0x{nf['node_id']:08X} seq={nf['sequence']}")
+                        for entry in nf["entries"]:
+                            print("  " + format_ninalink_value(entry))
+                    except ValueError as exc:
+                        print(f"NinaLink INVALID: {exc}")
+                        print("HEX:   " + " ".join(f"{b:02X}" for b in data))
+                else:
+                    print("HEX:   " + " ".join(f"{b:02X}" for b in data))
+                    print("ASCII: " + data.decode("utf-8", errors="replace"))
                 # Deliberately continue.  lora-rx is now a receive window, not
                 # a one-packet command.
         finally:
@@ -5104,6 +5421,18 @@ async def main_async(args):
         elif args.action == "lora-rx":
             await nrf.lora_rx(args.timeout)
 
+        elif args.action == "ninalink-rx":
+            await nrf.ninalink_rx(args.timeout)
+
+        elif args.action == "ninalink-tx-lab":
+            await nrf.ninalink_lab_start(args.every)
+
+        elif args.action == "ninalink-tx-status":
+            await nrf.ninalink_lab_status()
+
+        elif args.action == "ninalink-tx-stop":
+            await nrf.ninalink_lab_stop()
+
         elif args.action == "lora-rx-cancel":
             await nrf.lora_rx_cancel()
 
@@ -5575,6 +5904,12 @@ def build_parser():
     lrx = sub.add_parser("lora-rx", help="Direct LLCC68 RX diagnostic; bypass VM/compiler")
     lrx.add_argument("--timeout", type=float, default=30.0, help="receive-window duration in seconds; prints every packet until expiry")
     sub.add_parser("lora-rx-cancel", help="Cancel a stale direct LLCC68 RX diagnostic")
+    nlrx = sub.add_parser("ninalink-rx", help="B4.1 decode NinaLink CAP_REPORT frames from continuous LLCC68 RX")
+    nlrx.add_argument("--timeout", type=float, default=45.0, help="receive-window duration in seconds")
+    nltx = sub.add_parser("ninalink-tx-lab", help="B4.1 arm RAM-only autonomous NinaLink battery/temperature uplink")
+    nltx.add_argument("--every", type=int, default=15, metavar="SECONDS", help="period 2..300s; first TX after one full period")
+    sub.add_parser("ninalink-tx-status", help="Show B4.1 autonomous NinaLink lab TX status")
+    sub.add_parser("ninalink-tx-stop", help="Stop B4.1 autonomous NinaLink lab TX")
 
     ls = sub.add_parser("lora-set", help="Set the complete LLCC68 LoRa profile")
     ls.add_argument("--freq", type=int, required=True, help="RF frequency in Hz")

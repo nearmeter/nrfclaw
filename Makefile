@@ -58,6 +58,7 @@ CORE_SRC := \
   src/nrfclaw_scheduler.c \
   src/nrfclaw_native.c \
   src/nrfclaw_capability.c \
+  src/nrfclaw_ninalink.c \
   src/nrfclaw_system_power.c \
   src/nrfclaw_lis2dh12.c \
   src/nrfclaw_vib_health.c \

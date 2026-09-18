@@ -51,10 +51,12 @@ bool nrfclaw_lora_on_dio1_event(void);
 /* R3.8.16a receive path. A single packet is captured asynchronously into
  * an internal radio buffer and can then be copied into the VM scratch buffer. */
 bool nrfclaw_lora_receive_async(void);
+bool nrfclaw_lora_receive_window_async(uint32_t timeout_ms);
 bool nrfclaw_lora_cancel_receive(void);
 bool nrfclaw_lora_take_rx(uint8_t *data, uint8_t *len, uint8_t max_len);
 bool nrfclaw_lora_rx_active(void);
 bool nrfclaw_lora_rx_ready(void);
+bool nrfclaw_lora_idle(void);
 bool nrfclaw_lora_get_last_packet_status(int16_t *rssi_dbm_x2, int16_t *snr_db_x4);
 
 /* R3.8.16b1n direct diagnostic stream.  This path is intentionally separate

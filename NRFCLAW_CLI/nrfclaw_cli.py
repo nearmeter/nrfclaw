@@ -389,7 +389,8 @@ NDP_LORA_DIAG_RX         = 0x56  # r3.8.16b1l physical NUS only
 NDP_RADIO_GET_EXT         = 0x57  # r3.8.18 extended persisted radio profile
 NDP_RADIO_SET_EXT         = 0x58  # r3.8.18 extended persisted radio profile
 NDP_NINALINK_LAB          = 0x59  # B4.1 physical NUS lab uplink
-NDP_NINALINK_BRIDGE       = 0x5A  # B4.2 validated bridge RX
+NDP_NINALINK_BRIDGE       = 0x5A  # B4.2/B4.3 validated bridge RX
+NDP_NINALINK_LINK         = 0x5B  # B4.3 node ACK/downlink gate
 
 NDP_SENSOR_BATTERY       = 1
 NDP_SENSOR_HALL          = 2
@@ -2859,8 +2860,92 @@ class NRFClawClient:
         print("NinaLink lab TX stopped.")
         return s
 
+    def _decode_ninalink_link_status(self, p: bytes) -> dict:
+        if len(p) != 14:
+            raise RuntimeError(
+                f"Invalid NINALINK_LINK status length: {len(p)}"
+            )
+        return {
+            "state": p[0],
+            "result": p[1],
+            "sequence": int.from_bytes(p[2:4], "little"),
+            "tx_len": p[4],
+            "ack_len": p[5],
+            "ack_rssi_x2": int.from_bytes(p[6:8], "little", signed=True),
+            "ack_snr_x4": int.from_bytes(p[8:10], "little", signed=True),
+            "acked_count": int.from_bytes(p[10:12], "little"),
+            "timeout_count": int.from_bytes(p[12:14], "little"),
+        }
+
+    async def ninalink_link_status(self, quiet: bool = False):
+        p = await self.ndp_command(NDP_NINALINK_LINK, b"\x00")
+        s = self._decode_ninalink_link_status(p)
+        if not quiet:
+            states = {0:"IDLE",1:"WAIT_TX",2:"WAIT_ACK",3:"DONE"}
+            results = {
+                0:"NONE",1:"ACKED",2:"TIMEOUT",3:"BAD_ACK",
+                4:"TX_FAIL",5:"RX_FAIL",6:"NO_DATA",7:"BUILD_FAIL",
+            }
+            print("=== NINALINK B4.3 NODE LINK ===")
+            print(f"State:           {states.get(s['state'], s['state'])}")
+            print(f"Result:          {results.get(s['result'], s['result'])}")
+            print(f"Sequence:        {s['sequence']}")
+            print(f"TX frame:        {s['tx_len']} bytes")
+            print(f"ACK frame:       {s['ack_len']} bytes")
+            if s["ack_len"]:
+                print(f"ACK RSSI:        {s['ack_rssi_x2']/2:.1f} dBm")
+                print(f"ACK SNR:         {s['ack_snr_x4']/4:.2f} dB")
+            print(f"ACKed total:     {s['acked_count']}")
+            print(f"Timeout total:   {s['timeout_count']}")
+        return s
+
+    async def ninalink_ack_test(self, window_ms: int = 600, wait_s: float = 3.0):
+        import time
+        if window_ms < 100 or window_ms > 4000:
+            raise ValueError("--window must be 100..4000 ms")
+        if wait_s <= 0:
+            raise ValueError("--wait must be > 0 seconds")
+
+        st, bp = await self.sensor_read_raw(
+            NDP_SENSOR_BATTERY, retries=5, delay=0.20
+        )
+        if st == 0 and len(bp) >= 2:
+            cv = int.from_bytes(bp[:2], "little")
+            print(f"Primed battery:  {cv / 100.0:.2f} V")
+
+        st, tp = await self.sensor_read_raw(
+            NDP_SENSOR_DS18B20, retries=4, delay=0.80
+        )
+        if st == 0 and len(tp) == 4:
+            mc = int.from_bytes(tp, "little", signed=True)
+            print(f"Primed temp:     {mc / 1000.0:.3f} C")
+
+        p = await self.ndp_command(
+            NDP_NINALINK_LINK,
+            b"\x01" + struct.pack("<H", window_ms),
+        )
+        s = self._decode_ninalink_link_status(p)
+        print(
+            f"NinaLink ACK_REQ submitted: seq={s['sequence']} "
+            f"len={s['tx_len']} window={window_ms} ms"
+        )
+
+        deadline = time.monotonic() + wait_s
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+            s = await self.ninalink_link_status(quiet=True)
+            if s["state"] == 3:
+                break
+
+        await self.ninalink_link_status()
+        if s["state"] != 3:
+            raise RuntimeError("ACK test did not reach DONE before --wait")
+        if s["result"] != 1:
+            raise RuntimeError(f"ACK test failed with result={s['result']}")
+        return s
+
     def _decode_ninalink_bridge_status(self, p: bytes) -> dict:
-        if len(p) != 13:
+        if len(p) != 15:
             raise RuntimeError(
                 f"Invalid NINALINK_BRIDGE status length: {len(p)}"
             )
@@ -2873,6 +2958,7 @@ class NRFClawClient:
             "dropped": int.from_bytes(p[8:10], "little"),
             "radio_dropped": int.from_bytes(p[10:12], "little"),
             "last_error": p[12],
+            "ack_sent": int.from_bytes(p[13:15], "little"),
         }
 
     async def ninalink_bridge_status(self, quiet: bool = False):
@@ -2893,6 +2979,7 @@ class NRFClawClient:
             print(f"NinaLink invalid:{s['invalid']:>5}")
             print(f"Bridge dropped:  {s['dropped']}")
             print(f"Radio dropped:   {s['radio_dropped']}")
+            print(f"ACK sent:        {s['ack_sent']}")
             print(
                 f"Last error:      "
                 f"{errors.get(s['last_error'], s['last_error'])}"
@@ -5648,6 +5735,12 @@ async def main_async(args):
         elif args.action == "ninalink-bridge-stop":
             await nrf.ninalink_bridge_stop()
 
+        elif args.action == "ninalink-ack-test":
+            await nrf.ninalink_ack_test(args.window, args.wait)
+
+        elif args.action == "ninalink-link-status":
+            await nrf.ninalink_link_status()
+
         elif args.action == "lora-rx-cancel":
             await nrf.lora_rx_cancel()
 
@@ -6130,7 +6223,11 @@ def build_parser():
     sub.add_parser("ninalink-bridge-status", help="Show B4.2 NinaLink bridge counters/status")
     nbrx = sub.add_parser("ninalink-bridge-rx", help="Drain B4.2 on-device validated NinaLink frames")
     nbrx.add_argument("--timeout", type=float, default=45.0, help="validated bridge-drain window in seconds")
-    sub.add_parser("ninalink-bridge-stop", help="Stop B4.2 NinaLink bridge RX")
+    sub.add_parser("ninalink-bridge-stop", help="Stop B4.2/B4.3 NinaLink bridge RX")
+    nack = sub.add_parser("ninalink-ack-test", help="B4.3 send ACK_REQ CAP_REPORT and receive bridge ACK")
+    nack.add_argument("--window", type=int, default=600, metavar="MS", help="node ACK RX window, 100..4000 ms")
+    nack.add_argument("--wait", type=float, default=3.0, metavar="SECONDS", help="CLI wait for ACK-test completion")
+    sub.add_parser("ninalink-link-status", help="Show B4.3 node ACK/downlink state")
 
     ls = sub.add_parser("lora-set", help="Set the complete LLCC68 LoRa profile")
     ls.add_argument("--freq", type=int, required=True, help="RF frequency in Hz")

@@ -32,6 +32,7 @@
 #include "nrfclaw_ds18b20.h"
 #include "nrfclaw_ninalink_lab.h"
 #include "nrfclaw_ninalink_bridge.h"
+#include "nrfclaw_ninalink_link.h"
 
 static void lora_dio_handler(nrf_drv_gpiote_pin_t pin,
                              nrf_gpiote_polarity_t action)
@@ -338,6 +339,7 @@ int main(void)
         nrfclaw_scheduler_process();
 
         nrfclaw_ninalink_lab_process();
+        nrfclaw_ninalink_link_process();
         nrfclaw_lora_process();
         nrfclaw_ninalink_bridge_process();
         nrfclaw_lora_profile_process();

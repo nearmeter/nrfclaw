@@ -357,6 +357,30 @@ bool nrfclaw_llcc68_rl_start_rx(bool infinite)
     return cmd_write(CMD_SET_RX, timeout, sizeof(timeout));
 }
 
+bool nrfclaw_llcc68_rl_start_rx_ms(uint32_t timeout_ms)
+{
+    uint32_t ticks;
+    uint8_t timeout[3];
+
+    if (timeout_ms == 0U || timeout_ms > 262143UL)
+        return false;
+
+    if (!nrfclaw_llcc68_rl_wakeup())
+        return false;
+    if (!prepare_rx())
+        return false;
+
+    /* SX126x/LLCC68 SetRx timeout unit is 15.625 us = 64 ticks/ms. */
+    ticks = timeout_ms * 64UL;
+    if (ticks > 0xFFFFFFUL)
+        ticks = 0xFFFFFFUL;
+
+    timeout[0] = (uint8_t)(ticks >> 16);
+    timeout[1] = (uint8_t)(ticks >> 8);
+    timeout[2] = (uint8_t)ticks;
+    return cmd_write(CMD_SET_RX, timeout, sizeof(timeout));
+}
+
 bool nrfclaw_llcc68_rl_rearm_rx(void)
 {
     /* Important R3.8.17 behavior: do not rely on implicit continuous-RX state

@@ -12,7 +12,10 @@ typedef enum {
     NRFCLAW_NINALINK_BRIDGE_ERR_NONE = 0,
     NRFCLAW_NINALINK_BRIDGE_ERR_CORE = 1,
     NRFCLAW_NINALINK_BRIDGE_ERR_SEMANTIC = 2,
-    NRFCLAW_NINALINK_BRIDGE_ERR_RADIO_STOPPED = 3
+    NRFCLAW_NINALINK_BRIDGE_ERR_RADIO_STOPPED = 3,
+    NRFCLAW_NINALINK_BRIDGE_ERR_ACK_TIMER = 4,
+    NRFCLAW_NINALINK_BRIDGE_ERR_ACK_TX = 5,
+    NRFCLAW_NINALINK_BRIDGE_ERR_ACK_RESTART = 6
 } nrfclaw_ninalink_bridge_error_t;
 
 typedef struct {
@@ -24,6 +27,7 @@ typedef struct {
     uint16_t dropped;
     uint16_t radio_dropped;
     uint8_t last_error;
+    uint16_t ack_sent;
 } nrfclaw_ninalink_bridge_status_t;
 
 typedef struct {

@@ -120,6 +120,45 @@ bool nrfclaw_lora_receive_async(void)
     return true;
 }
 
+bool nrfclaw_lora_receive_window_async(uint32_t timeout_ms)
+{
+    if (timeout_ms == 0U)
+        return false;
+    if (!m_initialized)
+        nrfclaw_lora_init();
+    if (!m_initialized || m_tx_active || m_cleanup_pending || m_rx_active)
+        return false;
+
+    m_rx_ready = false;
+    m_rx_len = 0U;
+    m_rx_active = true;
+    rf_rx();
+    dio1_enable();
+
+    if (!nrfclaw_llcc68_rl_start_rx_ms(timeout_ms)) {
+        m_rx_active = false;
+        dio1_disable();
+        rf_off();
+        (void)nrfclaw_llcc68_rl_standby();
+        (void)nrfclaw_llcc68_rl_sleep();
+        return false;
+    }
+
+    SEGGER_RTT_printf(
+        0,
+        "LORA B4.3: timed RX armed %lu ms\r\n",
+        (unsigned long)timeout_ms);
+    return true;
+}
+
+bool nrfclaw_lora_idle(void)
+{
+    return m_initialized &&
+           !m_tx_active &&
+           !m_cleanup_pending &&
+           !m_rx_active;
+}
+
 bool nrfclaw_lora_cancel_receive(void)
 {
     m_diag_stream = false;

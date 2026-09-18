@@ -62,6 +62,7 @@ CORE_SRC := \
   src/nrfclaw_ninalink_msg.c \
   src/nrfclaw_ninalink_lab.c \
   src/nrfclaw_ninalink_bridge.c \
+  src/nrfclaw_ninalink_link.c \
   src/nrfclaw_system_power.c \
   src/nrfclaw_lis2dh12.c \
   src/nrfclaw_vib_health.c \

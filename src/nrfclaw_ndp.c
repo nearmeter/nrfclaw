@@ -15,6 +15,7 @@
 #include "nrfclaw_lora_profile_store.h"
 #include "nrfclaw_ninalink_lab.h"
 #include "nrfclaw_ninalink_bridge.h"
+#include "nrfclaw_ninalink_link.h"
 #include <string.h>
 
 #define NDP_INFO NRFCLAW_NDP_INFO
@@ -34,6 +35,7 @@
 #define NDP_RADIO_SET_EXT NRFCLAW_NDP_RADIO_SET_EXT
 #define NDP_NINALINK_LAB NRFCLAW_NDP_NINALINK_LAB
 #define NDP_NINALINK_BRIDGE NRFCLAW_NDP_NINALINK_BRIDGE
+#define NDP_NINALINK_LINK NRFCLAW_NDP_NINALINK_LINK
 
 typedef struct {
     bool active;
@@ -124,7 +126,8 @@ static bool nus_owner_key_opcode(uint8_t op)
 {
     return op == NDP_KEY_GENERATE || op == NDP_KEY_GET || op == NDP_KEY_STATUS ||
            op == NDP_BLE_BOOT_CONTROL || op == NDP_BLE_BEACON_CONTROL ||
-           op == NDP_NINALINK_LAB || op == NDP_NINALINK_BRIDGE;
+           op == NDP_NINALINK_LAB || op == NDP_NINALINK_BRIDGE ||
+           op == NDP_NINALINK_LINK;
 }
 
 bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
@@ -760,7 +763,8 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
             r[8]=(uint8_t)bs.dropped;r[9]=(uint8_t)(bs.dropped>>8);
             r[10]=(uint8_t)bs.radio_dropped;r[11]=(uint8_t)(bs.radio_dropped>>8);
             r[12]=bs.last_error;
-            return reply(op,seq,NDP_OK,r,13,out,ol);
+            r[13]=(uint8_t)bs.ack_sent;r[14]=(uint8_t)(bs.ack_sent>>8);
+            return reply(op,seq,NDP_OK,r,15,out,ol);
         }
 
         if(p[0]==1U) {
@@ -798,23 +802,50 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
                     m_ninalink_bridge_chunk.len-m_ninalink_bridge_chunk.offset);
                 uint8_t chunk=remain>8U?8U:remain;
                 uint8_t off=m_ninalink_bridge_chunk.offset;
-
                 r[0]=1U;
                 r[1]=m_ninalink_bridge_chunk.len;
                 r[2]=off;
                 memcpy(&r[3],&m_ninalink_bridge_chunk.rssi_x2,2);
                 memcpy(&r[5],&m_ninalink_bridge_chunk.snr_x4,2);
                 memcpy(&r[7],&m_ninalink_bridge_chunk.data[off],chunk);
-
                 m_ninalink_bridge_chunk.offset=(uint8_t)(off+chunk);
                 if(m_ninalink_bridge_chunk.offset>=m_ninalink_bridge_chunk.len)
                     m_ninalink_bridge_chunk.active=false;
-
                 return reply(op,seq,NDP_OK,r,(uint8_t)(7U+chunk),out,ol);
             }
         }
 
         return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+      }
+
+      case NDP_NINALINK_LINK: {
+        nrfclaw_ninalink_link_status_t ls;
+        if(enforce_auth) return reply(op,seq,NDP_FORBIDDEN,0,0,out,ol);
+        if(n<1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+
+        if(p[0]==0U) {
+            if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+        } else if(p[0]==1U) {
+            uint16_t window_ms;
+            if(n!=3U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            window_ms=(uint16_t)p[1]|((uint16_t)p[2]<<8);
+            if(!nrfclaw_ninalink_link_start(window_ms))
+                return reply(op,seq,NDP_BUSY,0,0,out,ol);
+        } else {
+            return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+        }
+
+        nrfclaw_ninalink_link_get_status(&ls);
+        r[0]=ls.state;
+        r[1]=ls.result;
+        r[2]=(uint8_t)ls.sequence;r[3]=(uint8_t)(ls.sequence>>8);
+        r[4]=ls.tx_len;
+        r[5]=ls.ack_len;
+        memcpy(&r[6],&ls.ack_rssi_x2,2);
+        memcpy(&r[8],&ls.ack_snr_x4,2);
+        r[10]=(uint8_t)ls.acked_count;r[11]=(uint8_t)(ls.acked_count>>8);
+        r[12]=(uint8_t)ls.timeout_count;r[13]=(uint8_t)(ls.timeout_count>>8);
+        return reply(op,seq,NDP_OK,r,14,out,ol);
       }
 
       case NDP_NINALINK_LAB: {

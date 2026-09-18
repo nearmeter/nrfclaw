@@ -68,7 +68,9 @@ typedef enum {
     /* B4.1 physical-NUS-only NinaLink autonomous lab uplink. */
     NRFCLAW_NDP_NINALINK_LAB       = 89,
     /* B4.2 physical-NUS bridge control / validated RX queue. */
-    NRFCLAW_NDP_NINALINK_BRIDGE    = 90
+    NRFCLAW_NDP_NINALINK_BRIDGE    = 90,
+    /* B4.3 node reliable uplink / ACK receive-window lab control. */
+    NRFCLAW_NDP_NINALINK_LINK      = 91
 } nrfclaw_ndp_opcode_t;
 
 /* Stable NDP v1 status values. */

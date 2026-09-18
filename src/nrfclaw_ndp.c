@@ -751,6 +751,7 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
         nrfclaw_ninalink_bridge_status_t bs;
         nrfclaw_ninalink_app_dl_status_t as;
         nrfclaw_ninalink_command_dl_status_t cs;
+        nrfclaw_ninalink_command_discovery_status_t ds;
 
         if(enforce_auth) return reply(op,seq,NDP_FORBIDDEN,0,0,out,ol);
         if(n<1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
@@ -930,6 +931,60 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
             return reply(op,seq,NDP_OK,r,(uint8_t)(2U+chunk),out,ol);
         }
 
+        if(p[0]==11U) {
+            uint32_t node;
+            uint8_t start_index;
+
+            if(n!=6U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            memcpy(&node,&p[1],4);
+            start_index=p[5];
+
+            if(!nrfclaw_ninalink_bridge_queue_command_discovery(
+                    node,start_index))
+                return reply(op,seq,NDP_BUSY,0,0,out,ol);
+
+            return reply(op,seq,NDP_OK,0,0,out,ol);
+        }
+
+        if(p[0]==12U) {
+            if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            nrfclaw_ninalink_bridge_get_command_discovery_status(&ds);
+
+            r[0]=ds.pending?1U:0U;
+            memcpy(&r[1],&ds.target_node,4);
+            r[5]=(uint8_t)ds.request_seq;
+            r[6]=(uint8_t)(ds.request_seq>>8);
+            r[7]=ds.start_index;
+            r[8]=ds.state;
+            r[9]=ds.registry_version;
+            r[10]=ds.total_count;
+            r[11]=ds.count;
+            r[12]=(uint8_t)ds.sent_count;
+            r[13]=(uint8_t)ds.completed_count;
+            r[14]=ds.timeout_count;
+            return reply(op,seq,NDP_OK,r,15,out,ol);
+        }
+
+        if(p[0]==13U) {
+            uint8_t index;
+            nrfclaw_ninalink_command_descriptor_t const *d;
+
+            if(n!=2U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            nrfclaw_ninalink_bridge_get_command_discovery_status(&ds);
+            index=p[1];
+            if(index>=ds.count)
+                return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+
+            d=&ds.descriptors[index];
+            r[0]=(uint8_t)d->command_id;
+            r[1]=(uint8_t)(d->command_id>>8);
+            r[2]=d->min_args;
+            r[3]=d->max_args;
+            r[4]=d->max_result;
+            r[5]=d->flags;
+            return reply(op,seq,NDP_OK,r,6,out,ol);
+        }
+
         return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
       }
 
@@ -937,6 +992,7 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
         nrfclaw_ninalink_link_status_t ls;
         nrfclaw_ninalink_app_status_t aps;
         nrfclaw_ninalink_command_status_t cs;
+        nrfclaw_ninalink_command_discovery_node_status_t ds;
 
         if(enforce_auth) return reply(op,seq,NDP_FORBIDDEN,0,0,out,ol);
         if(n<1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
@@ -1071,6 +1127,24 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
                 memcpy(&r[2],&cs.result_data[off],chunk);
 
             return reply(op,seq,NDP_OK,r,(uint8_t)(2U+chunk),out,ol);
+        }
+
+        if(p[0]==8U) {
+            if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            nrfclaw_ninalink_link_get_command_discovery_status(&ds);
+
+            r[0]=ds.valid?1U:0U;
+            r[1]=(uint8_t)ds.request_seq;
+            r[2]=(uint8_t)(ds.request_seq>>8);
+            r[3]=ds.start_index;
+            r[4]=ds.registry_version;
+            r[5]=ds.total_count;
+            r[6]=ds.count;
+            r[7]=(uint8_t)ds.served_count;
+            r[8]=(uint8_t)(ds.served_count>>8);
+            r[9]=(uint8_t)ds.duplicate_count;
+            r[10]=(uint8_t)(ds.duplicate_count>>8);
+            return reply(op,seq,NDP_OK,r,11,out,ol);
         }
 
         return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);

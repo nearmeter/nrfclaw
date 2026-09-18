@@ -3340,6 +3340,132 @@ class NRFClawClient:
         )
         return await self.ninalink_node_app_reliability()
 
+    async def ninalink_command_discover(self, node_id, start_index=0):
+        if not (0 <= start_index <= 0xFF):
+            raise ValueError("--start must be 0..255")
+        req = (
+            b"\x0b"
+            + struct.pack("<I", node_id)
+            + bytes([start_index])
+        )
+        await self.ndp_command(NDP_NINALINK_BRIDGE, req)
+        print(
+            f"Queued COMMAND registry discovery for node "
+            f"0x{node_id:08X}, start={start_index}."
+        )
+        return await self.ninalink_command_discovery_status()
+
+    async def ninalink_command_discovery_status(self):
+        p = await self.ndp_command(NDP_NINALINK_BRIDGE, b"\x0c")
+        if len(p) != 15:
+            raise RuntimeError(
+                f"Invalid command discovery status length: {len(p)}"
+            )
+
+        states = {0:"IDLE",1:"PENDING",2:"WAIT_RESULT",3:"DONE"}
+        s = {
+            "pending": bool(p[0]),
+            "target_node": int.from_bytes(p[1:5], "little"),
+            "request_seq": int.from_bytes(p[5:7], "little"),
+            "start_index": p[7],
+            "state": p[8],
+            "registry_version": p[9],
+            "total_count": p[10],
+            "count": p[11],
+            "sent_count": p[12],
+            "completed_count": p[13],
+            "timeout_count": p[14],
+            "descriptors": [],
+        }
+
+        names = {
+            0x0001: "ECHO_U32",
+            0x0002: "GET_NODE_INFO",
+            0x0003: "GET_TRACKING_STATE",
+        }
+
+        for index in range(s["count"]):
+            d = await self.ndp_command(
+                NDP_NINALINK_BRIDGE,
+                bytes([13, index]),
+            )
+            if len(d) != 6:
+                raise RuntimeError(
+                    f"Invalid discovery descriptor length: {len(d)}"
+                )
+            desc = {
+                "command_id": int.from_bytes(d[0:2], "little"),
+                "min_args": d[2],
+                "max_args": d[3],
+                "max_result": d[4],
+                "flags": d[5],
+            }
+            s["descriptors"].append(desc)
+
+        print("=== NINALINK B4.9 COMMAND DISCOVERY ===")
+        print(f"Pending:          {'yes' if s['pending'] else 'no'}")
+        print(f"Target node:      0x{s['target_node']:08X}")
+        print(f"Request seq:      {s['request_seq']}")
+        print(f"Start index:      {s['start_index']}")
+        print(f"State:            {states.get(s['state'], s['state'])}")
+        print(f"Registry version: {s['registry_version']}")
+        print(f"Total commands:   {s['total_count']}")
+        print(f"Returned:         {s['count']}")
+        print(f"Sent total:       {s['sent_count']}")
+        print(f"Completed total:  {s['completed_count']}")
+        print(f"Result timeouts:  {s['timeout_count']}")
+
+        for i, d in enumerate(s["descriptors"]):
+            absolute_index = s["start_index"] + i
+            name = names.get(d["command_id"], "UNKNOWN")
+            flag_text = []
+            if d["flags"] & 0x01:
+                flag_text.append("READ_ONLY")
+            extra = "|".join(flag_text) if flag_text else "-"
+            print(
+                f"  [{absolute_index:02d}] "
+                f"0x{d['command_id']:04X} {name}: "
+                f"args={d['min_args']}..{d['max_args']} "
+                f"result<={d['max_result']} flags={extra}"
+            )
+
+        next_index = s["start_index"] + s["count"]
+        if next_index < s["total_count"]:
+            print(f"More:             yes (next start={next_index})")
+        else:
+            print("More:             no")
+
+        return s
+
+    async def ninalink_node_command_discovery_status(self):
+        p = await self.ndp_command(NDP_NINALINK_LINK, b"\x08")
+        if len(p) != 11:
+            raise RuntimeError(
+                f"Invalid node discovery status length: {len(p)}"
+            )
+
+        s = {
+            "valid": bool(p[0]),
+            "request_seq": int.from_bytes(p[1:3], "little"),
+            "start_index": p[3],
+            "registry_version": p[4],
+            "total_count": p[5],
+            "count": p[6],
+            "served_count": int.from_bytes(p[7:9], "little"),
+            "duplicate_count": int.from_bytes(p[9:11], "little"),
+        }
+
+        print("=== NINALINK B4.9 NODE COMMAND DISCOVERY ===")
+        print(f"Request seen:     {'yes' if s['valid'] else 'no'}")
+        print(f"Request seq:      {s['request_seq']}")
+        print(f"Start index:      {s['start_index']}")
+        print(f"Registry version: {s['registry_version']}")
+        print(f"Total commands:   {s['total_count']}")
+        print(f"Returned:         {s['count']}")
+        print(f"Served total:     {s['served_count']}")
+        print(f"Duplicate total:  {s['duplicate_count']}")
+        return s
+
     def _decode_ninalink_bridge_status(self, p: bytes) -> dict:
         if len(p) != 15:
             raise RuntimeError(
@@ -6188,6 +6314,15 @@ async def main_async(args):
         elif args.action == "ninalink-command-tracking-state":
             await nrf.ninalink_command_tracking_state(args.node)
 
+        elif args.action == "ninalink-command-discover":
+            await nrf.ninalink_command_discover(args.node, args.start)
+
+        elif args.action == "ninalink-command-discovery-status":
+            await nrf.ninalink_command_discovery_status()
+
+        elif args.action == "ninalink-node-command-discovery-status":
+            await nrf.ninalink_node_command_discovery_status()
+
         elif args.action == "lora-rx-cancel":
             await nrf.lora_rx_cancel()
 
@@ -6705,6 +6840,11 @@ def build_parser():
     ninfo.add_argument("--node", type=lambda x: int(x, 0), required=True, help="target node id")
     ntrack = sub.add_parser("ninalink-command-tracking-state", help="B4.8 queue GET_TRACKING_STATE")
     ntrack.add_argument("--node", type=lambda x: int(x, 0), required=True, help="target node id")
+    ndisc = sub.add_parser("ninalink-command-discover", help="B4.9 discover node command registry")
+    ndisc.add_argument("--node", type=lambda x: int(x, 0), required=True, help="target node id")
+    ndisc.add_argument("--start", type=lambda x: int(x, 0), default=0, help="registry start index")
+    sub.add_parser("ninalink-command-discovery-status", help="Show B4.9 bridge discovery page")
+    sub.add_parser("ninalink-node-command-discovery-status", help="Show B4.9 node discovery counters")
 
     ls = sub.add_parser("lora-set", help="Set the complete LLCC68 LoRa profile")
     ls.add_argument("--freq", type=int, required=True, help="RF frequency in Hz")

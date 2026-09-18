@@ -10,6 +10,7 @@
 #include "nrfclaw_ninalink_msg.h"
 #include "nrfclaw_ninalink_command.h"
 #include "nrfclaw_ninalink_command_registry.h"
+#include "nrfclaw_ninalink_command_discovery.h"
 #include "nrfclaw_tracking.h"
 
 #include <string.h>
@@ -72,7 +73,16 @@ static uint8_t m_cmd_last_result_data[NRFCLAW_NINALINK_COMMAND_RESULT_MAX];
 static uint16_t m_cmd_executed_count;
 static uint16_t m_cmd_duplicate_count;
 
-/* B4.6/B4.7 deterministic result loss injection. */
+/* B4.9 COMMAND registry discovery status/replay observation. */
+static bool m_disc_last_valid;
+static uint16_t m_disc_last_sequence;
+static uint8_t m_disc_last_start;
+static uint8_t m_disc_last_total;
+static uint8_t m_disc_last_count;
+static uint16_t m_disc_served_count;
+static uint16_t m_disc_duplicate_count;
+
+/* B4.6/B4.7/B4.9 deterministic result loss injection. */
 static bool m_app_drop_next_result;
 static uint16_t m_app_result_drop_count;
 
@@ -177,6 +187,42 @@ static void build_command_result(uint16_t network_id,
     crc = crc16_ccitt_false(m_result_wire, crc_off);
     put_u16_le(&m_result_wire[crc_off], crc);
     m_result_len = (uint8_t)(crc_off + 2U);
+}
+
+static bool build_commands_response(uint16_t network_id,
+                                    uint16_t request_seq,
+                                    uint8_t start_index)
+{
+    uint8_t payload[46U];
+    uint8_t payload_len = 0U;
+    uint8_t crc_off;
+    uint16_t crc;
+
+    if (!nrfclaw_ninalink_command_discovery_build_page(
+            start_index,
+            payload,
+            sizeof(payload),
+            &payload_len))
+        return false;
+
+    crc_off = (uint8_t)(13U + payload_len);
+
+    memset(m_result_wire, 0, sizeof(m_result_wire));
+    m_result_wire[0] = 0x4EU;
+    m_result_wire[1] = 0x01U;
+    m_result_wire[2] = 0x00U;
+    m_result_wire[3] = NRFCLAW_NINALINK_MSG_COMMANDS_RESPONSE;
+    put_u16_le(&m_result_wire[4], network_id);
+    m_result_wire[6] = payload_len;
+    put_u32_le(&m_result_wire[7], NRF_FICR->DEVICEID[0]);
+    put_u16_le(&m_result_wire[11], request_seq);
+    memcpy(&m_result_wire[13], payload, payload_len);
+
+    crc = crc16_ccitt_false(m_result_wire, crc_off);
+    put_u16_le(&m_result_wire[crc_off], crc);
+    m_result_len = (uint8_t)(crc_off + 2U);
+
+    return true;
 }
 
 static void retry_timer_handler(void *context)
@@ -608,6 +654,65 @@ static bool accept_command(const uint8_t *wire, uint8_t len)
     return true;
 }
 
+static bool accept_commands_request(const uint8_t *wire, uint8_t len)
+{
+    nrfclaw_ninalink_frame_t frame;
+    uint16_t network_id;
+    uint32_t target_node;
+    uint16_t request_seq;
+    uint16_t reply_to_seq;
+    uint8_t start_index;
+
+    if (len != 18U)
+        return false;
+
+    if (nrfclaw_ninalink_decode(wire, len, &frame) != NRFCLAW_NINALINK_OK)
+        return false;
+
+    if (wire[3] != NRFCLAW_NINALINK_MSG_COMMANDS_REQUEST ||
+        wire[6] != 3U)
+        return false;
+
+    network_id = get_u16_le(&wire[4]);
+    target_node = get_u32_le(&wire[7]);
+    request_seq = get_u16_le(&wire[11]);
+    reply_to_seq = get_u16_le(&wire[13]);
+    start_index = wire[15];
+
+    if (network_id != m_pending_network_id ||
+        target_node != NRF_FICR->DEVICEID[0] ||
+        reply_to_seq != m_pending_sequence)
+        return false;
+
+    if (m_disc_last_valid && request_seq == m_disc_last_sequence) {
+        if (start_index != m_disc_last_start)
+            return false;
+        m_disc_duplicate_count++;
+    } else {
+        m_disc_last_valid = true;
+        m_disc_last_sequence = request_seq;
+        m_disc_last_start = start_index;
+        m_disc_served_count++;
+    }
+
+    if (!build_commands_response(network_id, request_seq, start_index))
+        return false;
+
+    m_disc_last_total = m_result_wire[15];
+    m_disc_last_count = m_result_wire[16];
+
+    SEGGER_RTT_printf(
+        0,
+        "NINALINK B4.9 NODE: COMMANDS_REQUEST seq=%u start=%u total=%u count=%u dup=%u\r\n",
+        (unsigned)request_seq,
+        (unsigned)start_index,
+        (unsigned)m_disc_last_total,
+        (unsigned)m_disc_last_count,
+        (unsigned)m_disc_duplicate_count);
+
+    return true;
+}
+
 void nrfclaw_ninalink_link_process(void)
 {
     if (!m_started)
@@ -680,6 +785,11 @@ void nrfclaw_ninalink_link_process(void)
             }
 
             if (accept_command(wire, len)) {
+                m_status.state = NRFCLAW_NINALINK_LINK_APP_RESULT_ARM;
+                return;
+            }
+
+            if (accept_commands_request(wire, len)) {
                 m_status.state = NRFCLAW_NINALINK_LINK_APP_RESULT_ARM;
                 return;
             }
@@ -784,6 +894,23 @@ bool nrfclaw_ninalink_link_app_result_drop_armed(void)
 uint16_t nrfclaw_ninalink_link_app_result_drop_count(void)
 {
     return m_app_result_drop_count;
+}
+
+void nrfclaw_ninalink_link_get_command_discovery_status(
+    nrfclaw_ninalink_command_discovery_node_status_t *out)
+{
+    if (!out)
+        return;
+
+    memset(out, 0, sizeof(*out));
+    out->valid = m_disc_last_valid;
+    out->request_seq = m_disc_last_sequence;
+    out->start_index = m_disc_last_start;
+    out->registry_version = NRFCLAW_NINALINK_COMMAND_REGISTRY_VERSION;
+    out->total_count = m_disc_last_total;
+    out->count = m_disc_last_count;
+    out->served_count = m_disc_served_count;
+    out->duplicate_count = m_disc_duplicate_count;
 }
 
 void nrfclaw_ninalink_link_get_command_status(

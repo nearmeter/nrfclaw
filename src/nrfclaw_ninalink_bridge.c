@@ -4,6 +4,7 @@
 #include "nrf.h"
 #include "nrfclaw_lora.h"
 #include "nrfclaw_ninalink_msg.h"
+#include "nrfclaw_ninalink_command.h"
 
 #include "SEGGER_RTT.h"
 
@@ -16,6 +17,9 @@
 
 #define APP_CAP_TRACKING_ACTIVE  0x0401U
 #define APP_TYPE_BOOL            0x01U
+
+#define COMMAND_PAYLOAD_BASE     5U
+#define COMMAND_RESULT_BASE      4U
 
 typedef struct {
     uint8_t len;
@@ -42,7 +46,8 @@ typedef enum {
 typedef enum {
     BRIDGE_TX_KIND_NONE = 0,
     BRIDGE_TX_KIND_ACK,
-    BRIDGE_TX_KIND_CAP_SET
+    BRIDGE_TX_KIND_CAP_SET,
+    BRIDGE_TX_KIND_COMMAND
 } bridge_tx_kind_t;
 
 APP_TIMER_DEF(m_bridge_tx_timer);
@@ -77,6 +82,11 @@ static uint8_t m_tx_len;
 
 static nrfclaw_ninalink_app_dl_status_t m_app;
 static uint16_t m_next_app_sequence = 1U;
+
+static nrfclaw_ninalink_command_dl_status_t m_cmd;
+static uint16_t m_next_command_sequence = 1U;
+static uint8_t m_cmd_args[NRFCLAW_NINALINK_COMMAND_DATA_MAX];
+static uint8_t m_cmd_arg_len;
 
 static uint16_t get_u16_le(const uint8_t *p)
 {
@@ -284,6 +294,37 @@ static void build_tracking_cap_set(uint16_t network_id,
     m_tx_len = BRIDGE_CAP_SET_LEN;
 }
 
+static void build_command(uint16_t network_id,
+                          uint16_t reply_to_seq)
+{
+    uint8_t payload_len;
+    uint8_t crc_off;
+    uint16_t crc;
+
+    payload_len = (uint8_t)(COMMAND_PAYLOAD_BASE + m_cmd_arg_len);
+    crc_off = (uint8_t)(13U + payload_len);
+
+    memset(m_tx_wire, 0, sizeof(m_tx_wire));
+    m_tx_wire[0] = 0x4EU;
+    m_tx_wire[1] = 0x01U;
+    m_tx_wire[2] = 0x01U; /* ACK_REQ */
+    m_tx_wire[3] = NRFCLAW_NINALINK_MSG_COMMAND;
+    put_u16_le(&m_tx_wire[4], network_id);
+    m_tx_wire[6] = payload_len;
+    put_u32_le(&m_tx_wire[7], m_cmd.target_node);
+    put_u16_le(&m_tx_wire[11], m_cmd.command_seq);
+
+    put_u16_le(&m_tx_wire[13], reply_to_seq);
+    put_u16_le(&m_tx_wire[15], m_cmd.command_id);
+    m_tx_wire[17] = m_cmd_arg_len;
+    if (m_cmd_arg_len)
+        memcpy(&m_tx_wire[18], m_cmd_args, m_cmd_arg_len);
+
+    crc = crc16_ccitt_false(m_tx_wire, crc_off);
+    put_u16_le(&m_tx_wire[crc_off], crc);
+    m_tx_len = (uint8_t)(crc_off + 2U);
+}
+
 static bool schedule_tx(bridge_tx_kind_t kind)
 {
     if (!ensure_timer()) {
@@ -316,11 +357,26 @@ static bool app_matches_node(uint32_t node_id)
     return m_app.pending && m_app.target_node == node_id;
 }
 
+static bool command_matches_node(uint32_t node_id)
+{
+    return m_cmd.pending && m_cmd.target_node == node_id;
+}
+
 static bool schedule_response_for_uplink(const uint8_t *wire)
 {
     uint16_t network_id = get_u16_le(&wire[4]);
     uint16_t uplink_seq = get_u16_le(&wire[11]);
     uint32_t node_id = get_u32_le(&wire[7]);
+
+    /*
+     * COMMAND has priority over CAP_SET if both somehow become pending.
+     * Queue APIs normally prevent that, but the priority keeps behavior
+     * deterministic if state is restored/extended later.
+     */
+    if (command_matches_node(node_id)) {
+        build_command(network_id, uplink_seq);
+        return schedule_tx(BRIDGE_TX_KIND_COMMAND);
+    }
 
     if (app_matches_node(node_id)) {
         build_tracking_cap_set(network_id, uplink_seq);
@@ -369,6 +425,61 @@ static bool accept_app_result(const uint8_t *wire, uint8_t len)
     return true;
 }
 
+static bool accept_command_result(const uint8_t *wire, uint8_t len)
+{
+    nrfclaw_ninalink_frame_t frame;
+    uint8_t payload_len;
+    uint16_t command_seq;
+    uint8_t result_len;
+
+    if (len < 19U)
+        return false;
+
+    if (nrfclaw_ninalink_decode(wire, len, &frame) != NRFCLAW_NINALINK_OK)
+        return false;
+
+    if (wire[3] != NRFCLAW_NINALINK_MSG_COMMAND_RESULT)
+        return false;
+
+    payload_len = wire[6];
+    if (payload_len < COMMAND_RESULT_BASE)
+        return false;
+
+    result_len = wire[16];
+    if ((uint8_t)(COMMAND_RESULT_BASE + result_len) != payload_len)
+        return false;
+
+    if (result_len > NRFCLAW_NINALINK_COMMAND_DATA_MAX)
+        return false;
+
+    if ((uint16_t)13U + payload_len + 2U != len)
+        return false;
+
+    command_seq = get_u16_le(&wire[13]);
+    if (command_seq != m_cmd.command_seq)
+        return false;
+
+    m_cmd.result = wire[15];
+    m_cmd.result_len = result_len;
+    memset(m_cmd.result_data, 0, sizeof(m_cmd.result_data));
+    if (result_len)
+        memcpy(m_cmd.result_data, &wire[17], result_len);
+
+    m_cmd.pending = false;
+    m_cmd.state = NRFCLAW_NINALINK_APP_DL_DONE;
+    m_cmd.completed_count++;
+
+    SEGGER_RTT_printf(
+        0,
+        "NINALINK B4.7 BRIDGE: COMMAND result seq=%u id=0x%04X status=%u len=%u\r\n",
+        (unsigned)m_cmd.command_seq,
+        (unsigned)m_cmd.command_id,
+        (unsigned)m_cmd.result,
+        (unsigned)m_cmd.result_len);
+
+    return true;
+}
+
 bool nrfclaw_ninalink_bridge_start(void)
 {
     if (m_active)
@@ -399,6 +510,11 @@ bool nrfclaw_ninalink_bridge_start(void)
     memset(&m_app, 0, sizeof(m_app));
     m_app.state = NRFCLAW_NINALINK_APP_DL_IDLE;
     m_app.result = 0xFFU;
+
+    memset(&m_cmd, 0, sizeof(m_cmd));
+    m_cmd.state = NRFCLAW_NINALINK_APP_DL_IDLE;
+    m_cmd.result = 0xFFU;
+    m_cmd_arg_len = 0U;
 
     if (!nrfclaw_lora_diag_stream_start())
         return false;
@@ -435,7 +551,7 @@ void nrfclaw_ninalink_bridge_drop_next_ack(void)
 
 bool nrfclaw_ninalink_bridge_queue_tracking(uint32_t target_node, bool active)
 {
-    if (!m_active || m_app.pending ||
+    if (!m_active || m_app.pending || m_cmd.pending ||
         m_tx_state == BRIDGE_TX_WAIT_APP_RESULT)
         return false;
 
@@ -461,6 +577,53 @@ void nrfclaw_ninalink_bridge_get_app_status(
 {
     if (out)
         *out = m_app;
+}
+
+bool nrfclaw_ninalink_bridge_queue_command(
+    uint32_t target_node,
+    uint16_t command_id,
+    const uint8_t *args,
+    uint8_t arg_len)
+{
+    if (!m_active || m_app.pending || m_cmd.pending ||
+        m_tx_state == BRIDGE_TX_WAIT_APP_RESULT)
+        return false;
+
+    if (arg_len > NRFCLAW_NINALINK_COMMAND_DATA_MAX)
+        return false;
+
+    if (arg_len && !args)
+        return false;
+
+    memset(&m_cmd, 0, sizeof(m_cmd));
+    m_cmd.pending = true;
+    m_cmd.target_node = target_node;
+    m_cmd.command_seq = m_next_command_sequence++;
+    m_cmd.command_id = command_id;
+    m_cmd.state = NRFCLAW_NINALINK_APP_DL_PENDING;
+    m_cmd.result = 0xFFU;
+
+    m_cmd_arg_len = arg_len;
+    memset(m_cmd_args, 0, sizeof(m_cmd_args));
+    if (arg_len)
+        memcpy(m_cmd_args, args, arg_len);
+
+    SEGGER_RTT_printf(
+        0,
+        "NINALINK B4.7 BRIDGE: queued COMMAND id=0x%04X target=0x%08lX seq=%u args=%u\r\n",
+        (unsigned)command_id,
+        (unsigned long)target_node,
+        (unsigned)m_cmd.command_seq,
+        (unsigned)arg_len);
+
+    return true;
+}
+
+void nrfclaw_ninalink_bridge_get_command_status(
+    nrfclaw_ninalink_command_dl_status_t *out)
+{
+    if (out)
+        *out = m_cmd;
 }
 
 void nrfclaw_ninalink_bridge_process(void)
@@ -502,13 +665,23 @@ void nrfclaw_ninalink_bridge_process(void)
             return;
         }
 
-        if (m_tx_kind == BRIDGE_TX_KIND_CAP_SET) {
-            m_app.sent_count++;
-            m_app.state = NRFCLAW_NINALINK_APP_DL_WAIT_RESULT;
+        if (m_tx_kind == BRIDGE_TX_KIND_CAP_SET ||
+            m_tx_kind == BRIDGE_TX_KIND_COMMAND) {
+            if (m_tx_kind == BRIDGE_TX_KIND_CAP_SET) {
+                m_app.sent_count++;
+                m_app.state = NRFCLAW_NINALINK_APP_DL_WAIT_RESULT;
+            } else {
+                m_cmd.sent_count++;
+                m_cmd.state = NRFCLAW_NINALINK_APP_DL_WAIT_RESULT;
+            }
 
             if (!nrfclaw_lora_receive_window_async(
                     BRIDGE_APP_RESULT_RX_MS)) {
-                m_app.state = NRFCLAW_NINALINK_APP_DL_PENDING;
+                if (m_tx_kind == BRIDGE_TX_KIND_CAP_SET)
+                    m_app.state = NRFCLAW_NINALINK_APP_DL_PENDING;
+                else
+                    m_cmd.state = NRFCLAW_NINALINK_APP_DL_PENDING;
+
                 m_tx_kind = BRIDGE_TX_KIND_NONE;
                 m_tx_state = BRIDGE_TX_IDLE;
                 (void)restart_stream();
@@ -524,12 +697,19 @@ void nrfclaw_ninalink_bridge_process(void)
         if (nrfclaw_lora_rx_ready()) {
             uint8_t result_wire[NRFCLAW_NINALINK_MAX_FRAME_SIZE];
             uint8_t result_len = 0U;
+            bool accepted = false;
 
             if (nrfclaw_lora_take_rx(
                     result_wire,
                     &result_len,
-                    sizeof(result_wire)) &&
-                accept_app_result(result_wire, result_len)) {
+                    sizeof(result_wire))) {
+                if (m_tx_kind == BRIDGE_TX_KIND_CAP_SET)
+                    accepted = accept_app_result(result_wire, result_len);
+                else if (m_tx_kind == BRIDGE_TX_KIND_COMMAND)
+                    accepted = accept_command_result(result_wire, result_len);
+            }
+
+            if (accepted) {
                 m_tx_kind = BRIDGE_TX_KIND_NONE;
                 m_tx_state = BRIDGE_TX_IDLE;
                 m_last_error = NRFCLAW_NINALINK_BRIDGE_ERR_NONE;
@@ -537,13 +717,16 @@ void nrfclaw_ninalink_bridge_process(void)
                 return;
             }
 
-            /*
-             * A non-matching packet consumed the timed RX. Keep the command
-             * pending so it can be offered again on the next node uplink.
-             */
-            if (m_app.timeout_count != 0xFFU)
-                m_app.timeout_count++;
-            m_app.state = NRFCLAW_NINALINK_APP_DL_PENDING;
+            if (m_tx_kind == BRIDGE_TX_KIND_CAP_SET) {
+                if (m_app.timeout_count != 0xFFU)
+                    m_app.timeout_count++;
+                m_app.state = NRFCLAW_NINALINK_APP_DL_PENDING;
+            } else if (m_tx_kind == BRIDGE_TX_KIND_COMMAND) {
+                if (m_cmd.timeout_count != 0xFFU)
+                    m_cmd.timeout_count++;
+                m_cmd.state = NRFCLAW_NINALINK_APP_DL_PENDING;
+            }
+
             m_tx_kind = BRIDGE_TX_KIND_NONE;
             m_tx_state = BRIDGE_TX_IDLE;
             (void)restart_stream();
@@ -551,9 +734,16 @@ void nrfclaw_ninalink_bridge_process(void)
         }
 
         if (!nrfclaw_lora_rx_active()) {
-            if (m_app.timeout_count != 0xFFU)
-                m_app.timeout_count++;
-            m_app.state = NRFCLAW_NINALINK_APP_DL_PENDING;
+            if (m_tx_kind == BRIDGE_TX_KIND_CAP_SET) {
+                if (m_app.timeout_count != 0xFFU)
+                    m_app.timeout_count++;
+                m_app.state = NRFCLAW_NINALINK_APP_DL_PENDING;
+            } else if (m_tx_kind == BRIDGE_TX_KIND_COMMAND) {
+                if (m_cmd.timeout_count != 0xFFU)
+                    m_cmd.timeout_count++;
+                m_cmd.state = NRFCLAW_NINALINK_APP_DL_PENDING;
+            }
+
             m_tx_kind = BRIDGE_TX_KIND_NONE;
             m_tx_state = BRIDGE_TX_IDLE;
             (void)restart_stream();

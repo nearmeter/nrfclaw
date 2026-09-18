@@ -750,6 +750,7 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
       case NDP_NINALINK_BRIDGE: {
         nrfclaw_ninalink_bridge_status_t bs;
         nrfclaw_ninalink_app_dl_status_t as;
+        nrfclaw_ninalink_command_dl_status_t cs;
 
         if(enforce_auth) return reply(op,seq,NDP_FORBIDDEN,0,0,out,ol);
         if(n<1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
@@ -866,12 +867,76 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
             return reply(op,seq,NDP_OK,r,15,out,ol);
         }
 
+        if(p[0]==8U) {
+            uint32_t node;
+            uint16_t command_id;
+            uint8_t arg_len;
+
+            if(n<8U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+
+            memcpy(&node,&p[1],4);
+            command_id=(uint16_t)p[5]|((uint16_t)p[6]<<8);
+            arg_len=p[7];
+
+            if(arg_len>7U || n!=(uint8_t)(8U+arg_len))
+                return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+
+            if(!nrfclaw_ninalink_bridge_queue_command(
+                    node,command_id,&p[8],arg_len))
+                return reply(op,seq,NDP_BUSY,0,0,out,ol);
+
+            return reply(op,seq,NDP_OK,0,0,out,ol);
+        }
+
+        if(p[0]==9U) {
+            if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            nrfclaw_ninalink_bridge_get_command_status(&cs);
+
+            r[0]=cs.pending?1U:0U;
+            memcpy(&r[1],&cs.target_node,4);
+            r[5]=(uint8_t)cs.command_seq;
+            r[6]=(uint8_t)(cs.command_seq>>8);
+            r[7]=(uint8_t)cs.command_id;
+            r[8]=(uint8_t)(cs.command_id>>8);
+            r[9]=cs.state;
+            r[10]=cs.result;
+            r[11]=(uint8_t)cs.sent_count;
+            r[12]=(uint8_t)cs.completed_count;
+            r[13]=cs.timeout_count;
+            r[14]=cs.result_len;
+            return reply(op,seq,NDP_OK,r,15,out,ol);
+        }
+
+        if(p[0]==10U) {
+            uint8_t off;
+            uint8_t chunk;
+            uint8_t remain;
+
+            if(n!=2U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            nrfclaw_ninalink_bridge_get_command_status(&cs);
+
+            off=p[1];
+            if(off>cs.result_len)
+                return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+
+            remain=(uint8_t)(cs.result_len-off);
+            chunk=remain>8U?8U:remain;
+
+            r[0]=cs.result_len;
+            r[1]=off;
+            if(chunk)
+                memcpy(&r[2],&cs.result_data[off],chunk);
+
+            return reply(op,seq,NDP_OK,r,(uint8_t)(2U+chunk),out,ol);
+        }
+
         return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
       }
 
       case NDP_NINALINK_LINK: {
         nrfclaw_ninalink_link_status_t ls;
         nrfclaw_ninalink_app_status_t aps;
+        nrfclaw_ninalink_command_status_t cs;
 
         if(enforce_auth) return reply(op,seq,NDP_FORBIDDEN,0,0,out,ol);
         if(n<1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
@@ -958,6 +1023,54 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
             r[1]=(uint8_t)dropped;
             r[2]=(uint8_t)(dropped>>8);
             return reply(op,seq,NDP_OK,r,3,out,ol);
+        }
+
+        if(p[0]==6U) {
+            uint8_t copy_len;
+
+            if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            nrfclaw_ninalink_link_get_command_status(&cs);
+
+            r[0]=cs.valid?1U:0U;
+            r[1]=(uint8_t)cs.sequence;
+            r[2]=(uint8_t)(cs.sequence>>8);
+            r[3]=(uint8_t)cs.command_id;
+            r[4]=(uint8_t)(cs.command_id>>8);
+            r[5]=cs.result;
+            r[6]=cs.result_len;
+            r[7]=(uint8_t)cs.executed_count;
+            r[8]=(uint8_t)(cs.executed_count>>8);
+            r[9]=(uint8_t)cs.duplicate_count;
+            r[10]=(uint8_t)(cs.duplicate_count>>8);
+
+            copy_len=cs.result_len>4U?4U:cs.result_len;
+            if(copy_len)
+                memcpy(&r[11],cs.result_data,copy_len);
+
+            return reply(op,seq,NDP_OK,r,(uint8_t)(11U+copy_len),out,ol);
+        }
+
+        if(p[0]==7U) {
+            uint8_t off;
+            uint8_t chunk;
+            uint8_t remain;
+
+            if(n!=2U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            nrfclaw_ninalink_link_get_command_status(&cs);
+
+            off=p[1];
+            if(off>cs.result_len)
+                return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+
+            remain=(uint8_t)(cs.result_len-off);
+            chunk=remain>8U?8U:remain;
+
+            r[0]=cs.result_len;
+            r[1]=off;
+            if(chunk)
+                memcpy(&r[2],&cs.result_data[off],chunk);
+
+            return reply(op,seq,NDP_OK,r,(uint8_t)(2U+chunk),out,ol);
         }
 
         return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);

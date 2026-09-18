@@ -60,6 +60,26 @@ typedef struct {
     bool tracking_active;
 } nrfclaw_ninalink_app_status_t;
 
+#define NRFCLAW_NINALINK_COMMAND_RESULT_MAX 16U
+
+typedef enum {
+    NRFCLAW_NINALINK_COMMAND_OK = 0,
+    NRFCLAW_NINALINK_COMMAND_UNSUPPORTED = 1,
+    NRFCLAW_NINALINK_COMMAND_BAD_ARGS = 2,
+    NRFCLAW_NINALINK_COMMAND_EXEC_FAILED = 3
+} nrfclaw_ninalink_command_result_t;
+
+typedef struct {
+    bool valid;
+    uint16_t sequence;
+    uint16_t command_id;
+    uint8_t result;
+    uint8_t result_len;
+    uint8_t result_data[NRFCLAW_NINALINK_COMMAND_RESULT_MAX];
+    uint16_t executed_count;
+    uint16_t duplicate_count;
+} nrfclaw_ninalink_command_status_t;
+
 bool nrfclaw_ninalink_link_start(uint16_t ack_window_ms);
 bool nrfclaw_ninalink_link_start_reliable(uint16_t ack_window_ms,
                                           uint8_t max_attempts,
@@ -67,8 +87,10 @@ bool nrfclaw_ninalink_link_start_reliable(uint16_t ack_window_ms,
 void nrfclaw_ninalink_link_process(void);
 void nrfclaw_ninalink_link_get_status(nrfclaw_ninalink_link_status_t *out);
 void nrfclaw_ninalink_link_get_app_status(nrfclaw_ninalink_app_status_t *out);
+void nrfclaw_ninalink_link_get_command_status(
+    nrfclaw_ninalink_command_status_t *out);
 
-/* B4.6 deterministic result-ACK loss injection. */
+/* B4.6/B4.7 deterministic result loss injection. */
 void nrfclaw_ninalink_link_drop_next_app_result(void);
 bool nrfclaw_ninalink_link_app_result_drop_armed(void);
 uint16_t nrfclaw_ninalink_link_app_result_drop_count(void);

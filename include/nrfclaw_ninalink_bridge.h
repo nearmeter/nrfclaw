@@ -53,6 +53,22 @@ typedef struct {
     uint8_t timeout_count;
 } nrfclaw_ninalink_app_dl_status_t;
 
+#define NRFCLAW_NINALINK_COMMAND_DATA_MAX 16U
+
+typedef struct {
+    bool pending;
+    uint32_t target_node;
+    uint16_t command_seq;
+    uint16_t command_id;
+    uint8_t state;
+    uint8_t result;
+    uint8_t result_len;
+    uint8_t result_data[NRFCLAW_NINALINK_COMMAND_DATA_MAX];
+    uint16_t sent_count;
+    uint16_t completed_count;
+    uint8_t timeout_count;
+} nrfclaw_ninalink_command_dl_status_t;
+
 typedef struct {
     uint8_t len;
     uint8_t data[NRFCLAW_NINALINK_MAX_FRAME_SIZE];
@@ -70,5 +86,13 @@ void nrfclaw_ninalink_bridge_drop_next_ack(void);
 bool nrfclaw_ninalink_bridge_queue_tracking(uint32_t target_node, bool active);
 void nrfclaw_ninalink_bridge_get_app_status(
     nrfclaw_ninalink_app_dl_status_t *out);
+
+bool nrfclaw_ninalink_bridge_queue_command(
+    uint32_t target_node,
+    uint16_t command_id,
+    const uint8_t *args,
+    uint8_t arg_len);
+void nrfclaw_ninalink_bridge_get_command_status(
+    nrfclaw_ninalink_command_dl_status_t *out);
 
 #endif

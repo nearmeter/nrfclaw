@@ -3175,6 +3175,139 @@ class NRFClawClient:
         print(f"Result drops:     {s['result_drop_count']}")
         return s
 
+    async def _ninalink_command_result_chunks(self, opcode, action, total_len):
+        data = bytearray()
+        off = 0
+        while off < total_len:
+            p = await self.ndp_command(opcode, bytes([action, off]))
+            if len(p) < 2 or p[0] != total_len or p[1] != off:
+                raise RuntimeError(f"Invalid COMMAND result chunk: {p.hex()}")
+            chunk = p[2:]
+            if not chunk:
+                raise RuntimeError("Empty COMMAND result chunk")
+            data.extend(chunk)
+            off += len(chunk)
+        return bytes(data[:total_len])
+
+    async def ninalink_command(self, node_id, command_id, data_hex=""):
+        if not (0 <= command_id <= 0xFFFF):
+            raise ValueError("--id must be 0..0xFFFF")
+        clean = data_hex.replace(" ", "").replace(":", "")
+        if len(clean) % 2:
+            raise ValueError("--data must have an even number of hex digits")
+        try:
+            data = bytes.fromhex(clean)
+        except ValueError as exc:
+            raise ValueError("--data must be hexadecimal") from exc
+        if len(data) > 7:
+            raise ValueError("B4.7 NDP gate accepts at most 7 argument bytes")
+        req = (
+            b"\x08"
+            + struct.pack("<I", node_id)
+            + struct.pack("<H", command_id)
+            + bytes([len(data)])
+            + data
+        )
+        await self.ndp_command(NDP_NINALINK_BRIDGE, req)
+        print(
+            f"Queued COMMAND id=0x{command_id:04X} "
+            f"for node 0x{node_id:08X}, args={data.hex() or '-'}."
+        )
+        return await self.ninalink_command_status()
+
+    async def ninalink_command_echo(self, node_id, token):
+        if not (0 <= token <= 0xFFFFFFFF):
+            raise ValueError("--token must be 0..0xFFFFFFFF")
+        return await self.ninalink_command(
+            node_id, 0x0001, struct.pack("<I", token).hex()
+        )
+
+    async def ninalink_command_status(self):
+        p = await self.ndp_command(NDP_NINALINK_BRIDGE, b"\x09")
+        if len(p) != 15:
+            raise RuntimeError(f"Invalid bridge COMMAND status length: {len(p)}")
+        states = {0:"IDLE",1:"PENDING",2:"WAIT_RESULT",3:"DONE"}
+        results = {0:"OK",1:"UNSUPPORTED",2:"BAD_ARGS",3:"EXEC_FAILED",255:"NONE"}
+        s = {
+            "pending": bool(p[0]),
+            "target_node": int.from_bytes(p[1:5], "little"),
+            "command_seq": int.from_bytes(p[5:7], "little"),
+            "command_id": int.from_bytes(p[7:9], "little"),
+            "state": p[9],
+            "result": p[10],
+            "sent_count": p[11],
+            "completed_count": p[12],
+            "timeout_count": p[13],
+            "result_len": p[14],
+        }
+        data = b""
+        if s["result_len"]:
+            data = await self._ninalink_command_result_chunks(
+                NDP_NINALINK_BRIDGE, 10, s["result_len"]
+            )
+        s["result_data"] = data
+        print("=== NINALINK B4.7 COMMAND DOWNLINK ===")
+        print(f"Pending:         {'yes' if s['pending'] else 'no'}")
+        print(f"Target node:     0x{s['target_node']:08X}")
+        print(f"Command seq:     {s['command_seq']}")
+        print(f"Command ID:      0x{s['command_id']:04X}")
+        print(f"State:           {states.get(s['state'], s['state'])}")
+        print(f"Result:          {results.get(s['result'], s['result'])}")
+        print(f"Sent total:      {s['sent_count']}")
+        print(f"Completed total: {s['completed_count']}")
+        print(f"Result timeouts: {s['timeout_count']}")
+        print(f"Result length:   {s['result_len']}")
+        if data:
+            print(f"Result data:     {data.hex()}")
+            if s["command_id"] == 1 and len(data) == 4:
+                print(f"ECHO token:      0x{int.from_bytes(data, 'little'):08X}")
+        return s
+
+    async def ninalink_node_command_status(self):
+        p = await self.ndp_command(NDP_NINALINK_LINK, b"\x06")
+        if len(p) < 11:
+            raise RuntimeError(f"Invalid node COMMAND status length: {len(p)}")
+        result_len = p[6]
+        data = bytes(p[11:])
+        if result_len > len(data):
+            data = await self._ninalink_command_result_chunks(
+                NDP_NINALINK_LINK, 7, result_len
+            )
+        else:
+            data = data[:result_len]
+        results = {0:"OK",1:"UNSUPPORTED",2:"BAD_ARGS",3:"EXEC_FAILED"}
+        s = {
+            "valid": bool(p[0]),
+            "sequence": int.from_bytes(p[1:3], "little"),
+            "command_id": int.from_bytes(p[3:5], "little"),
+            "result": p[5],
+            "result_len": result_len,
+            "executed_count": int.from_bytes(p[7:9], "little"),
+            "duplicate_count": int.from_bytes(p[9:11], "little"),
+            "result_data": data,
+        }
+        print("=== NINALINK B4.7 NODE COMMAND ===")
+        print(f"Command seen:    {'yes' if s['valid'] else 'no'}")
+        print(f"Command seq:     {s['sequence']}")
+        print(f"Command ID:      0x{s['command_id']:04X}")
+        print(f"Result:          {results.get(s['result'], s['result'])}")
+        print(f"Executed total:  {s['executed_count']}")
+        print(f"Duplicate total: {s['duplicate_count']}")
+        print(f"Result length:   {s['result_len']}")
+        if data:
+            print(f"Result data:     {data.hex()}")
+            if s["command_id"] == 1 and len(data) == 4:
+                print(f"ECHO token:      0x{int.from_bytes(data, 'little'):08X}")
+        return s
+
+    async def ninalink_node_drop_next_command_result(self):
+        await self.ndp_command(NDP_NINALINK_LINK, b"\x04")
+        print(
+            "Node armed: the next CAP_SET/COMMAND will execute, "
+            "but its result frame will be suppressed once."
+        )
+        return await self.ninalink_node_app_reliability()
+
     def _decode_ninalink_bridge_status(self, p: bytes) -> dict:
         if len(p) != 15:
             raise RuntimeError(
@@ -6002,6 +6135,21 @@ async def main_async(args):
         elif args.action == "ninalink-node-app-reliability":
             await nrf.ninalink_node_app_reliability()
 
+        elif args.action == "ninalink-command":
+            await nrf.ninalink_command(args.node, args.command_id, args.data)
+
+        elif args.action == "ninalink-command-echo":
+            await nrf.ninalink_command_echo(args.node, args.token)
+
+        elif args.action == "ninalink-command-status":
+            await nrf.ninalink_command_status()
+
+        elif args.action == "ninalink-node-command-status":
+            await nrf.ninalink_node_command_status()
+
+        elif args.action == "ninalink-node-drop-next-command-result":
+            await nrf.ninalink_node_drop_next_command_result()
+
         elif args.action == "lora-rx-cancel":
             await nrf.lora_rx_cancel()
 
@@ -6504,7 +6652,17 @@ def build_parser():
     sub.add_parser("ninalink-app-status", help="Show B4.5 bridge application-downlink state")
     sub.add_parser("ninalink-node-app-status", help="Show B4.5/B4.6 last CAP_SET result on the node")
     sub.add_parser("ninalink-node-drop-next-app-result", help="B4.6 lab gate: apply next CAP_SET but suppress its result ACK once")
-    sub.add_parser("ninalink-node-app-reliability", help="Show B4.6 application-result loss-injection counters")
+    sub.add_parser("ninalink-node-app-reliability", help="Show B4.6/B4.7 result loss-injection counters")
+    ncmd = sub.add_parser("ninalink-command", help="B4.7 queue a generic NinaLink COMMAND")
+    ncmd.add_argument("--node", type=lambda x: int(x, 0), required=True, help="target node id")
+    ncmd.add_argument("--id", dest="command_id", type=lambda x: int(x, 0), required=True, help="command id")
+    ncmd.add_argument("--data", default="", help="hex arguments, max 7 bytes in B4.7 NDP gate")
+    necho = sub.add_parser("ninalink-command-echo", help="B4.7 queue ECHO_U32 COMMAND")
+    necho.add_argument("--node", type=lambda x: int(x, 0), required=True, help="target node id")
+    necho.add_argument("--token", type=lambda x: int(x, 0), required=True, help="u32 echo token")
+    sub.add_parser("ninalink-command-status", help="Show B4.7 bridge COMMAND state/result")
+    sub.add_parser("ninalink-node-command-status", help="Show B4.7 last COMMAND executed by node")
+    sub.add_parser("ninalink-node-drop-next-command-result", help="B4.7 suppress next COMMAND result once")
 
     ls = sub.add_parser("lora-set", help="Set the complete LLCC68 LoRa profile")
     ls.add_argument("--freq", type=int, required=True, help="RF frequency in Hz")

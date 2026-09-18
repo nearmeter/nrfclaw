@@ -7,6 +7,7 @@
 #include "nrfclaw_ninalink.h"
 
 #define NRFCLAW_NINALINK_BRIDGE_QUEUE_DEPTH 4U
+#define NRFCLAW_NINALINK_BRIDGE_DUP_CACHE   8U
 
 typedef enum {
     NRFCLAW_NINALINK_BRIDGE_ERR_NONE = 0,
@@ -28,6 +29,9 @@ typedef struct {
     uint16_t radio_dropped;
     uint8_t last_error;
     uint16_t ack_sent;
+    uint16_t duplicates;
+    uint16_t ack_test_dropped;
+    bool drop_next_ack;
 } nrfclaw_ninalink_bridge_status_t;
 
 typedef struct {
@@ -42,5 +46,6 @@ void nrfclaw_ninalink_bridge_stop(void);
 void nrfclaw_ninalink_bridge_process(void);
 bool nrfclaw_ninalink_bridge_take(nrfclaw_ninalink_bridge_packet_t *out);
 void nrfclaw_ninalink_bridge_get_status(nrfclaw_ninalink_bridge_status_t *out);
+void nrfclaw_ninalink_bridge_drop_next_ack(void);
 
 #endif

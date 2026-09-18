@@ -2881,7 +2881,7 @@ class NRFClawClient:
         p = await self.ndp_command(NDP_NINALINK_LINK, b"\x00")
         s = self._decode_ninalink_link_status(p)
         if not quiet:
-            states = {0:"IDLE",1:"WAIT_TX",2:"WAIT_ACK",3:"DONE"}
+            states = {0:"IDLE",1:"WAIT_TX",2:"WAIT_ACK",3:"BACKOFF",4:"DONE"}
             results = {
                 0:"NONE",1:"ACKED",2:"TIMEOUT",3:"BAD_ACK",
                 4:"TX_FAIL",5:"RX_FAIL",6:"NO_DATA",7:"BUILD_FAIL",
@@ -2943,6 +2943,127 @@ class NRFClawClient:
         if s["result"] != 1:
             raise RuntimeError(f"ACK test failed with result={s['result']}")
         return s
+
+    async def ninalink_link_reliability_status(self, quiet: bool = False):
+        p = await self.ndp_command(NDP_NINALINK_LINK, b"\x02")
+        if len(p) != 10:
+            raise RuntimeError(
+                f"Invalid NINALINK_LINK reliability length: {len(p)}"
+            )
+        s = {
+            "attempts": p[0],
+            "max_attempts": p[1],
+            "retry_count": int.from_bytes(p[2:4], "little"),
+            "timeout_count": int.from_bytes(p[4:6], "little"),
+            "base_backoff_ms": int.from_bytes(p[6:8], "little"),
+            "last_backoff_ms": int.from_bytes(p[8:10], "little"),
+        }
+        if not quiet:
+            print("=== NINALINK B4.4 RELIABILITY ===")
+            print(f"Attempts:        {s['attempts']}/{s['max_attempts']}")
+            print(f"Retry total:     {s['retry_count']}")
+            print(f"Timeout total:   {s['timeout_count']}")
+            print(f"Base backoff:    {s['base_backoff_ms']} ms")
+            print(f"Last backoff:    {s['last_backoff_ms']} ms")
+        return s
+
+    async def ninalink_reliable_test(
+            self, window_ms=600, attempts=3, backoff_ms=200,
+            wait_s=6.0, expect_timeout=False):
+        import time
+
+        if window_ms < 100 or window_ms > 4000:
+            raise ValueError("--window must be 100..4000 ms")
+        if attempts < 1 or attempts > 5:
+            raise ValueError("--attempts must be 1..5")
+        if attempts > 1 and (backoff_ms < 1 or backoff_ms > 4000):
+            raise ValueError("--backoff must be 1..4000 ms")
+        if wait_s <= 0:
+            raise ValueError("--wait must be > 0 seconds")
+
+        st, bp = await self.sensor_read_raw(
+            NDP_SENSOR_BATTERY, retries=5, delay=0.20
+        )
+        if st == 0 and len(bp) >= 2:
+            cv = int.from_bytes(bp[:2], "little")
+            print(f"Primed battery:  {cv / 100.0:.2f} V")
+
+        st, tp = await self.sensor_read_raw(
+            NDP_SENSOR_DS18B20, retries=4, delay=0.80
+        )
+        if st == 0 and len(tp) == 4:
+            mc = int.from_bytes(tp, "little", signed=True)
+            print(f"Primed temp:     {mc / 1000.0:.3f} C")
+
+        payload = (
+            b"\x01"
+            + struct.pack("<H", window_ms)
+            + bytes([attempts])
+            + struct.pack("<H", backoff_ms if attempts > 1 else 0)
+        )
+
+        p = await self.ndp_command(NDP_NINALINK_LINK, payload)
+        s = self._decode_ninalink_link_status(p)
+
+        print(
+            f"Reliable NinaLink submitted: seq={s['sequence']} "
+            f"window={window_ms} ms attempts={attempts} "
+            f"backoff={backoff_ms if attempts > 1 else 0} ms"
+        )
+
+        deadline = time.monotonic() + wait_s
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+            s = await self.ninalink_link_status(quiet=True)
+            if s["state"] == 4:
+                break
+
+        await self.ninalink_link_status()
+        rs = await self.ninalink_link_reliability_status()
+
+        if s["state"] != 4:
+            raise RuntimeError("Reliable test did not reach DONE before --wait")
+
+        if expect_timeout:
+            if s["result"] != 2:
+                raise RuntimeError(
+                    f"Expected TIMEOUT, got result={s['result']}"
+                )
+            print("Expected timeout observed: PASS")
+        else:
+            if s["result"] != 1:
+                raise RuntimeError(
+                    f"Reliable test failed with result={s['result']}"
+                )
+            print("Reliable ACK observed: PASS")
+
+        return s, rs
+
+    async def ninalink_bridge_reliability(self):
+        p = await self.ndp_command(NDP_NINALINK_BRIDGE, b"\x04")
+        if len(p) != 7:
+            raise RuntimeError(
+                f"Invalid bridge reliability length: {len(p)}"
+            )
+        s = {
+            "duplicates": int.from_bytes(p[0:2], "little"),
+            "ack_sent": int.from_bytes(p[2:4], "little"),
+            "ack_test_dropped": int.from_bytes(p[4:6], "little"),
+            "drop_next_ack": bool(p[6]),
+        }
+        print("=== NINALINK B4.4 BRIDGE RELIABILITY ===")
+        print(f"Duplicates:      {s['duplicates']}")
+        print(f"ACK sent:        {s['ack_sent']}")
+        print(f"Test ACK drops:  {s['ack_test_dropped']}")
+        print(f"Drop next ACK:   {'yes' if s['drop_next_ack'] else 'no'}")
+        return s
+
+    async def ninalink_bridge_drop_next_ack(self):
+        await self.ndp_command(NDP_NINALINK_BRIDGE, b"\x05")
+        print(
+            "Bridge armed: the next unique ACK_REQ frame will be accepted "
+            "but its first ACK will be suppressed."
+        )
 
     def _decode_ninalink_bridge_status(self, p: bytes) -> dict:
         if len(p) != 15:
@@ -5741,6 +5862,21 @@ async def main_async(args):
         elif args.action == "ninalink-link-status":
             await nrf.ninalink_link_status()
 
+        elif args.action == "ninalink-reliable-test":
+            await nrf.ninalink_reliable_test(
+                args.window, args.attempts, args.backoff,
+                args.wait, args.expect_timeout
+            )
+
+        elif args.action == "ninalink-link-reliability":
+            await nrf.ninalink_link_reliability_status()
+
+        elif args.action == "ninalink-bridge-reliability":
+            await nrf.ninalink_bridge_reliability()
+
+        elif args.action == "ninalink-bridge-drop-next-ack":
+            await nrf.ninalink_bridge_drop_next_ack()
+
         elif args.action == "lora-rx-cancel":
             await nrf.lora_rx_cancel()
 
@@ -6227,7 +6363,16 @@ def build_parser():
     nack = sub.add_parser("ninalink-ack-test", help="B4.3 send ACK_REQ CAP_REPORT and receive bridge ACK")
     nack.add_argument("--window", type=int, default=600, metavar="MS", help="node ACK RX window, 100..4000 ms")
     nack.add_argument("--wait", type=float, default=3.0, metavar="SECONDS", help="CLI wait for ACK-test completion")
-    sub.add_parser("ninalink-link-status", help="Show B4.3 node ACK/downlink state")
+    sub.add_parser("ninalink-link-status", help="Show B4.3/B4.4 node link state")
+    nrel = sub.add_parser("ninalink-reliable-test", help="B4.4 reliable ACK_REQ with bounded retry/backoff")
+    nrel.add_argument("--window", type=int, default=600, metavar="MS", help="ACK RX window, 100..4000 ms")
+    nrel.add_argument("--attempts", type=int, default=3, help="maximum TX attempts, 1..5")
+    nrel.add_argument("--backoff", type=int, default=200, metavar="MS", help="base exponential retry backoff, 1..4000 ms")
+    nrel.add_argument("--wait", type=float, default=6.0, metavar="SECONDS", help="CLI wait for transaction completion")
+    nrel.add_argument("--expect-timeout", action="store_true", help="treat bounded retry exhaustion as the expected PASS")
+    sub.add_parser("ninalink-link-reliability", help="Show B4.4 node retry/backoff counters")
+    sub.add_parser("ninalink-bridge-reliability", help="Show B4.4 bridge duplicate/ACK counters")
+    sub.add_parser("ninalink-bridge-drop-next-ack", help="B4.4 lab gate: suppress exactly the next first ACK")
 
     ls = sub.add_parser("lora-set", help="Set the complete LLCC68 LoRa profile")
     ls.add_argument("--freq", type=int, required=True, help="RF frequency in Hz")

@@ -802,17 +802,35 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
                     m_ninalink_bridge_chunk.len-m_ninalink_bridge_chunk.offset);
                 uint8_t chunk=remain>8U?8U:remain;
                 uint8_t off=m_ninalink_bridge_chunk.offset;
+
                 r[0]=1U;
                 r[1]=m_ninalink_bridge_chunk.len;
                 r[2]=off;
                 memcpy(&r[3],&m_ninalink_bridge_chunk.rssi_x2,2);
                 memcpy(&r[5],&m_ninalink_bridge_chunk.snr_x4,2);
                 memcpy(&r[7],&m_ninalink_bridge_chunk.data[off],chunk);
+
                 m_ninalink_bridge_chunk.offset=(uint8_t)(off+chunk);
                 if(m_ninalink_bridge_chunk.offset>=m_ninalink_bridge_chunk.len)
                     m_ninalink_bridge_chunk.active=false;
+
                 return reply(op,seq,NDP_OK,r,(uint8_t)(7U+chunk),out,ol);
             }
+        }
+
+        if(p[0]==4U) {
+            nrfclaw_ninalink_bridge_get_status(&bs);
+            r[0]=(uint8_t)bs.duplicates;r[1]=(uint8_t)(bs.duplicates>>8);
+            r[2]=(uint8_t)bs.ack_sent;r[3]=(uint8_t)(bs.ack_sent>>8);
+            r[4]=(uint8_t)bs.ack_test_dropped;
+            r[5]=(uint8_t)(bs.ack_test_dropped>>8);
+            r[6]=bs.drop_next_ack?1U:0U;
+            return reply(op,seq,NDP_OK,r,7,out,ol);
+        }
+
+        if(p[0]==5U) {
+            nrfclaw_ninalink_bridge_drop_next_ack();
+            return reply(op,seq,NDP_OK,0,0,out,ol);
         }
 
         return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
@@ -820,32 +838,67 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
 
       case NDP_NINALINK_LINK: {
         nrfclaw_ninalink_link_status_t ls;
+
         if(enforce_auth) return reply(op,seq,NDP_FORBIDDEN,0,0,out,ol);
         if(n<1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
 
         if(p[0]==0U) {
             if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
-        } else if(p[0]==1U) {
-            uint16_t window_ms;
-            if(n!=3U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
-            window_ms=(uint16_t)p[1]|((uint16_t)p[2]<<8);
-            if(!nrfclaw_ninalink_link_start(window_ms))
-                return reply(op,seq,NDP_BUSY,0,0,out,ol);
-        } else {
-            return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+            nrfclaw_ninalink_link_get_status(&ls);
+            r[0]=ls.state;
+            r[1]=ls.result;
+            r[2]=(uint8_t)ls.sequence;r[3]=(uint8_t)(ls.sequence>>8);
+            r[4]=ls.tx_len;
+            r[5]=ls.ack_len;
+            memcpy(&r[6],&ls.ack_rssi_x2,2);
+            memcpy(&r[8],&ls.ack_snr_x4,2);
+            r[10]=(uint8_t)ls.acked_count;r[11]=(uint8_t)(ls.acked_count>>8);
+            r[12]=(uint8_t)ls.timeout_count;r[13]=(uint8_t)(ls.timeout_count>>8);
+            return reply(op,seq,NDP_OK,r,14,out,ol);
         }
 
-        nrfclaw_ninalink_link_get_status(&ls);
-        r[0]=ls.state;
-        r[1]=ls.result;
-        r[2]=(uint8_t)ls.sequence;r[3]=(uint8_t)(ls.sequence>>8);
-        r[4]=ls.tx_len;
-        r[5]=ls.ack_len;
-        memcpy(&r[6],&ls.ack_rssi_x2,2);
-        memcpy(&r[8],&ls.ack_snr_x4,2);
-        r[10]=(uint8_t)ls.acked_count;r[11]=(uint8_t)(ls.acked_count>>8);
-        r[12]=(uint8_t)ls.timeout_count;r[13]=(uint8_t)(ls.timeout_count>>8);
-        return reply(op,seq,NDP_OK,r,14,out,ol);
+        if(p[0]==1U) {
+            if(n==3U) {
+                uint16_t window_ms=(uint16_t)p[1]|((uint16_t)p[2]<<8);
+                if(!nrfclaw_ninalink_link_start(window_ms))
+                    return reply(op,seq,NDP_BUSY,0,0,out,ol);
+            } else if(n==6U) {
+                uint16_t window_ms=(uint16_t)p[1]|((uint16_t)p[2]<<8);
+                uint8_t attempts=p[3];
+                uint16_t backoff_ms=(uint16_t)p[4]|((uint16_t)p[5]<<8);
+                if(!nrfclaw_ninalink_link_start_reliable(
+                        window_ms,attempts,backoff_ms))
+                    return reply(op,seq,NDP_BUSY,0,0,out,ol);
+            } else {
+                return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            }
+
+            nrfclaw_ninalink_link_get_status(&ls);
+            r[0]=ls.state;
+            r[1]=ls.result;
+            r[2]=(uint8_t)ls.sequence;r[3]=(uint8_t)(ls.sequence>>8);
+            r[4]=ls.tx_len;
+            r[5]=ls.ack_len;
+            memcpy(&r[6],&ls.ack_rssi_x2,2);
+            memcpy(&r[8],&ls.ack_snr_x4,2);
+            r[10]=(uint8_t)ls.acked_count;r[11]=(uint8_t)(ls.acked_count>>8);
+            r[12]=(uint8_t)ls.timeout_count;r[13]=(uint8_t)(ls.timeout_count>>8);
+            return reply(op,seq,NDP_OK,r,14,out,ol);
+        }
+
+        if(p[0]==2U) {
+            if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            nrfclaw_ninalink_link_get_status(&ls);
+            r[0]=ls.attempts;
+            r[1]=ls.max_attempts;
+            r[2]=(uint8_t)ls.retry_count;r[3]=(uint8_t)(ls.retry_count>>8);
+            r[4]=(uint8_t)ls.timeout_count;r[5]=(uint8_t)(ls.timeout_count>>8);
+            r[6]=(uint8_t)ls.base_backoff_ms;r[7]=(uint8_t)(ls.base_backoff_ms>>8);
+            r[8]=(uint8_t)ls.last_backoff_ms;r[9]=(uint8_t)(ls.last_backoff_ms>>8);
+            return reply(op,seq,NDP_OK,r,10,out,ol);
+        }
+
+        return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
       }
 
       case NDP_NINALINK_LAB: {

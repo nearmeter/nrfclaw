@@ -19,6 +19,14 @@ typedef struct {
     int16_t snr_x4;
 } bridge_queue_packet_t;
 
+typedef struct {
+    bool valid;
+    uint16_t network_id;
+    uint32_t node_id;
+    uint16_t sequence;
+    uint8_t message_type;
+} bridge_dup_entry_t;
+
 typedef enum {
     BRIDGE_ACK_IDLE = 0,
     BRIDGE_ACK_DELAY,
@@ -31,18 +39,40 @@ static bool m_active;
 static bool m_timer_initialized;
 static volatile bool m_ack_due;
 static bridge_ack_state_t m_ack_state;
+
 static bridge_queue_packet_t m_queue[NRFCLAW_NINALINK_BRIDGE_QUEUE_DEPTH];
 static uint8_t m_head;
 static uint8_t m_tail;
 static uint8_t m_count;
+
+static bridge_dup_entry_t m_dup[NRFCLAW_NINALINK_BRIDGE_DUP_CACHE];
+static uint8_t m_dup_head;
+
 static uint16_t m_received;
 static uint16_t m_valid;
 static uint16_t m_invalid;
 static uint16_t m_dropped;
 static uint16_t m_radio_dropped_base;
 static uint16_t m_ack_sent;
+static uint16_t m_duplicates;
+static uint16_t m_ack_test_dropped;
+static bool m_drop_next_ack;
 static uint8_t m_last_error;
+
 static uint8_t m_ack_wire[BRIDGE_ACK_FRAME_LEN];
+
+static uint16_t get_u16_le(const uint8_t *p)
+{
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static uint32_t get_u32_le(const uint8_t *p)
+{
+    return (uint32_t)p[0] |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
 
 static void reset_queue(void)
 {
@@ -51,10 +81,50 @@ static void reset_queue(void)
     m_count = 0U;
 }
 
+static void reset_dup_cache(void)
+{
+    memset(m_dup, 0, sizeof(m_dup));
+    m_dup_head = 0U;
+}
+
+static bool is_duplicate(const uint8_t *wire)
+{
+    uint16_t network_id = get_u16_le(&wire[4]);
+    uint32_t node_id = get_u32_le(&wire[7]);
+    uint16_t sequence = get_u16_le(&wire[11]);
+    uint8_t message_type = wire[3];
+    uint8_t i;
+
+    for (i = 0U; i < NRFCLAW_NINALINK_BRIDGE_DUP_CACHE; i++) {
+        if (m_dup[i].valid &&
+            m_dup[i].network_id == network_id &&
+            m_dup[i].node_id == node_id &&
+            m_dup[i].sequence == sequence &&
+            m_dup[i].message_type == message_type)
+            return true;
+    }
+    return false;
+}
+
+static void remember_frame(const uint8_t *wire)
+{
+    bridge_dup_entry_t *e = &m_dup[m_dup_head];
+
+    e->valid = true;
+    e->network_id = get_u16_le(&wire[4]);
+    e->node_id = get_u32_le(&wire[7]);
+    e->sequence = get_u16_le(&wire[11]);
+    e->message_type = wire[3];
+
+    m_dup_head = (uint8_t)(
+        (m_dup_head + 1U) % NRFCLAW_NINALINK_BRIDGE_DUP_CACHE);
+}
+
 static uint16_t crc16_ccitt_false(const uint8_t *data, uint8_t len)
 {
     uint16_t crc = 0xFFFFU;
     uint8_t i;
+
     while (len--) {
         crc ^= (uint16_t)(*data++) << 8;
         for (i = 0U; i < 8U; i++) {
@@ -91,10 +161,13 @@ static bool ensure_timer(void)
 {
     if (m_timer_initialized)
         return true;
-    if (app_timer_create(&m_bridge_ack_timer,
-                         APP_TIMER_MODE_SINGLE_SHOT,
-                         ack_timer_handler) != NRF_SUCCESS)
+
+    if (app_timer_create(
+            &m_bridge_ack_timer,
+            APP_TIMER_MODE_SINGLE_SHOT,
+            ack_timer_handler) != NRF_SUCCESS)
         return false;
+
     m_timer_initialized = true;
     return true;
 }
@@ -102,6 +175,7 @@ static bool ensure_timer(void)
 static void build_ack(uint16_t network_id, uint16_t ack_seq)
 {
     uint16_t crc;
+
     memset(m_ack_wire, 0, sizeof(m_ack_wire));
     m_ack_wire[0] = 0x4EU;
     m_ack_wire[1] = 0x01U;
@@ -123,6 +197,7 @@ static bool validate_semantic(const nrfclaw_ninalink_frame_t *frame)
         frame->message_type == NRFCLAW_NINALINK_MSG_CAP_EVENT) {
         nrfclaw_ninalink_value_entry_t entries[12];
         uint8_t entry_count = 0U;
+
         return nrfclaw_ninalink_parse_values(
                    frame,
                    entries,
@@ -132,23 +207,27 @@ static bool validate_semantic(const nrfclaw_ninalink_frame_t *frame)
     return true;
 }
 
-static void queue_validated(const uint8_t *data,
+static bool queue_validated(const uint8_t *data,
                             uint8_t len,
                             int16_t rssi_x2,
                             int16_t snr_x4)
 {
     bridge_queue_packet_t *p;
+
     if (m_count >= NRFCLAW_NINALINK_BRIDGE_QUEUE_DEPTH) {
         m_dropped++;
-        return;
+        return false;
     }
+
     p = &m_queue[m_head];
     p->len = len;
     memcpy(p->data, data, len);
     p->rssi_x2 = rssi_x2;
     p->snr_x4 = snr_x4;
+
     m_head = (uint8_t)((m_head + 1U) % NRFCLAW_NINALINK_BRIDGE_QUEUE_DEPTH);
     m_count++;
+    return true;
 }
 
 static bool restart_stream(void)
@@ -165,30 +244,32 @@ static bool schedule_ack(const uint8_t *wire)
 {
     uint16_t network_id;
     uint16_t ack_seq;
+
     if (!ensure_timer()) {
         m_last_error = NRFCLAW_NINALINK_BRIDGE_ERR_ACK_TIMER;
         return false;
     }
-    network_id = (uint16_t)wire[4] | ((uint16_t)wire[5] << 8);
-    ack_seq = (uint16_t)wire[11] | ((uint16_t)wire[12] << 8);
+
+    network_id = get_u16_le(&wire[4]);
+    ack_seq = get_u16_le(&wire[11]);
     build_ack(network_id, ack_seq);
+
     m_radio_dropped_base = (uint16_t)(
         m_radio_dropped_base + nrfclaw_lora_diag_stream_dropped());
+
     (void)nrfclaw_lora_cancel_receive();
+
     m_ack_due = false;
-    if (app_timer_start(m_bridge_ack_timer,
-                        APP_TIMER_TICKS(BRIDGE_ACK_DELAY_MS),
-                        NULL) != NRF_SUCCESS) {
+    if (app_timer_start(
+            m_bridge_ack_timer,
+            APP_TIMER_TICKS(BRIDGE_ACK_DELAY_MS),
+            NULL) != NRF_SUCCESS) {
         m_last_error = NRFCLAW_NINALINK_BRIDGE_ERR_ACK_TIMER;
         (void)restart_stream();
         return false;
     }
+
     m_ack_state = BRIDGE_ACK_DELAY;
-    SEGGER_RTT_printf(
-        0,
-        "NINALINK B4.3 BRIDGE: ACK scheduled seq=%u delay=%u ms\r\n",
-        (unsigned)ack_seq,
-        (unsigned)BRIDGE_ACK_DELAY_MS);
     return true;
 }
 
@@ -196,24 +277,33 @@ bool nrfclaw_ninalink_bridge_start(void)
 {
     if (m_active)
         return true;
+
     if (!ensure_timer()) {
         m_last_error = NRFCLAW_NINALINK_BRIDGE_ERR_ACK_TIMER;
         return false;
     }
+
     reset_queue();
+    reset_dup_cache();
+
     m_received = 0U;
     m_valid = 0U;
     m_invalid = 0U;
     m_dropped = 0U;
     m_radio_dropped_base = 0U;
     m_ack_sent = 0U;
+    m_duplicates = 0U;
+    m_ack_test_dropped = 0U;
+    m_drop_next_ack = false;
     m_last_error = NRFCLAW_NINALINK_BRIDGE_ERR_NONE;
     m_ack_state = BRIDGE_ACK_IDLE;
     m_ack_due = false;
+
     if (!nrfclaw_lora_diag_stream_start())
         return false;
+
     m_active = true;
-    SEGGER_RTT_WriteString(0, "NINALINK B4.3 BRIDGE: RX active\r\n");
+    SEGGER_RTT_WriteString(0, "NINALINK B4.4 BRIDGE: RX active\r\n");
     return true;
 }
 
@@ -221,6 +311,7 @@ void nrfclaw_ninalink_bridge_stop(void)
 {
     if (m_timer_initialized)
         (void)app_timer_stop(m_bridge_ack_timer);
+
     if (m_active) {
         if (nrfclaw_lora_diag_stream_active()) {
             m_radio_dropped_base = (uint16_t)(
@@ -228,11 +319,16 @@ void nrfclaw_ninalink_bridge_stop(void)
         }
         (void)nrfclaw_lora_cancel_receive();
     }
+
     m_active = false;
     m_ack_state = BRIDGE_ACK_IDLE;
     m_ack_due = false;
     reset_queue();
-    SEGGER_RTT_WriteString(0, "NINALINK B4.3 BRIDGE: RX stopped\r\n");
+}
+
+void nrfclaw_ninalink_bridge_drop_next_ack(void)
+{
+    m_drop_next_ack = true;
 }
 
 void nrfclaw_ninalink_bridge_process(void)
@@ -248,13 +344,17 @@ void nrfclaw_ninalink_bridge_process(void)
     if (m_ack_state == BRIDGE_ACK_DELAY) {
         if (!m_ack_due)
             return;
+
         m_ack_due = false;
-        if (!nrfclaw_lora_send_async(m_ack_wire, (uint8_t)sizeof(m_ack_wire))) {
+        if (!nrfclaw_lora_send_async(
+                m_ack_wire,
+                (uint8_t)sizeof(m_ack_wire))) {
             m_last_error = NRFCLAW_NINALINK_BRIDGE_ERR_ACK_TX;
             m_ack_state = BRIDGE_ACK_IDLE;
             (void)restart_stream();
             return;
         }
+
         m_ack_state = BRIDGE_ACK_WAIT_TX;
         return;
     }
@@ -262,13 +362,10 @@ void nrfclaw_ninalink_bridge_process(void)
     if (m_ack_state == BRIDGE_ACK_WAIT_TX) {
         if (!nrfclaw_lora_idle())
             return;
+
         m_ack_sent++;
         m_ack_state = BRIDGE_ACK_IDLE;
         m_last_error = NRFCLAW_NINALINK_BRIDGE_ERR_NONE;
-        SEGGER_RTT_printf(
-            0,
-            "NINALINK B4.3 BRIDGE: ACK TX complete count=%u\r\n",
-            (unsigned)m_ack_sent);
         (void)restart_stream();
         return;
     }
@@ -280,39 +377,60 @@ void nrfclaw_ninalink_bridge_process(void)
     }
 
     while (nrfclaw_lora_diag_stream_take(
-               wire, &len, sizeof(wire), &rssi_x2, &snr_x4)) {
+               wire,
+               &len,
+               sizeof(wire),
+               &rssi_x2,
+               &snr_x4)) {
         nrfclaw_ninalink_frame_t frame;
         nrfclaw_ninalink_status_t st;
         bool ack_req;
 
         m_received++;
+
         st = nrfclaw_ninalink_decode(wire, len, &frame);
         if (st != NRFCLAW_NINALINK_OK) {
             m_invalid++;
             m_last_error = NRFCLAW_NINALINK_BRIDGE_ERR_CORE;
             continue;
         }
+
         if (!validate_semantic(&frame)) {
             m_invalid++;
             m_last_error = NRFCLAW_NINALINK_BRIDGE_ERR_SEMANTIC;
             continue;
         }
 
-        m_valid++;
-        m_last_error = NRFCLAW_NINALINK_BRIDGE_ERR_NONE;
-        queue_validated(wire, len, rssi_x2, snr_x4);
         ack_req = (wire[2] & 0x01U) != 0U;
 
-        SEGGER_RTT_printf(
-            0,
-            "NINALINK B4.3 BRIDGE: valid type=0x%02X node=0x%08lX seq=%u len=%u ack=%u\r\n",
-            (unsigned)frame.message_type,
-            (unsigned long)frame.node_id,
-            (unsigned)frame.sequence,
-            (unsigned)len,
-            ack_req ? 1U : 0U);
+        if (is_duplicate(wire)) {
+            m_duplicates++;
+
+            if (ack_req) {
+                (void)schedule_ack(wire);
+                break;
+            }
+            continue;
+        }
+
+        /*
+         * Do not ACK data that failed to enter the validated queue.
+         * A reliable sender can retry once queue pressure is relieved.
+         */
+        if (!queue_validated(wire, len, rssi_x2, snr_x4))
+            continue;
+
+        remember_frame(wire);
+        m_valid++;
+        m_last_error = NRFCLAW_NINALINK_BRIDGE_ERR_NONE;
 
         if (ack_req) {
+            if (m_drop_next_ack) {
+                m_drop_next_ack = false;
+                m_ack_test_dropped++;
+                continue;
+            }
+
             (void)schedule_ack(wire);
             break;
         }
@@ -322,13 +440,16 @@ void nrfclaw_ninalink_bridge_process(void)
 bool nrfclaw_ninalink_bridge_take(nrfclaw_ninalink_bridge_packet_t *out)
 {
     bridge_queue_packet_t const *p;
+
     if (!out || m_count == 0U)
         return false;
+
     p = &m_queue[m_tail];
     out->len = p->len;
     memcpy(out->data, p->data, p->len);
     out->rssi_x2 = p->rssi_x2;
     out->snr_x4 = p->snr_x4;
+
     m_tail = (uint8_t)((m_tail + 1U) % NRFCLAW_NINALINK_BRIDGE_QUEUE_DEPTH);
     m_count--;
     return true;
@@ -337,17 +458,24 @@ bool nrfclaw_ninalink_bridge_take(nrfclaw_ninalink_bridge_packet_t *out)
 void nrfclaw_ninalink_bridge_get_status(nrfclaw_ninalink_bridge_status_t *out)
 {
     uint16_t current_radio_dropped = 0U;
+
     if (!out)
         return;
+
     if (nrfclaw_lora_diag_stream_active())
         current_radio_dropped = nrfclaw_lora_diag_stream_dropped();
+
     out->active = m_active;
     out->queued = m_count;
     out->received = m_received;
     out->valid = m_valid;
     out->invalid = m_invalid;
     out->dropped = m_dropped;
-    out->radio_dropped = (uint16_t)(m_radio_dropped_base + current_radio_dropped);
+    out->radio_dropped = (uint16_t)(
+        m_radio_dropped_base + current_radio_dropped);
     out->last_error = m_last_error;
     out->ack_sent = m_ack_sent;
+    out->duplicates = m_duplicates;
+    out->ack_test_dropped = m_ack_test_dropped;
+    out->drop_next_ack = m_drop_next_ack;
 }

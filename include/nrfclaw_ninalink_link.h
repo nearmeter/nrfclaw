@@ -68,4 +68,9 @@ void nrfclaw_ninalink_link_process(void);
 void nrfclaw_ninalink_link_get_status(nrfclaw_ninalink_link_status_t *out);
 void nrfclaw_ninalink_link_get_app_status(nrfclaw_ninalink_app_status_t *out);
 
+/* B4.6 deterministic result-ACK loss injection. */
+void nrfclaw_ninalink_link_drop_next_app_result(void);
+bool nrfclaw_ninalink_link_app_result_drop_armed(void);
+uint16_t nrfclaw_ninalink_link_app_result_drop_count(void);
+
 #endif

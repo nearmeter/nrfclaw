@@ -53,6 +53,10 @@ static uint16_t m_app_applied_count;
 static uint16_t m_app_duplicate_count;
 static uint8_t m_app_result_wire[APP_ACK_FRAME_LEN];
 
+/* B4.6 deterministic result-ACK loss injection. */
+static bool m_app_drop_next_result;
+static uint16_t m_app_result_drop_count;
+
 static uint16_t get_u16_le(const uint8_t *p)
 {
     return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
@@ -532,6 +536,26 @@ void nrfclaw_ninalink_link_process(void)
         if (!nrfclaw_lora_idle())
             return;
 
+        /*
+         * B4.6 lab gate: CAP_SET has already acknowledged the triggering
+         * uplink through reply_to_seq. Suppressing the application-result
+         * ACK must therefore NOT cause the node to retry/reapply that uplink.
+         */
+        if (m_app_drop_next_result) {
+            m_app_drop_next_result = false;
+            m_app_result_drop_count++;
+            m_acked_total++;
+            set_done(NRFCLAW_NINALINK_LINK_RESULT_ACKED);
+            m_started = false;
+
+            SEGGER_RTT_printf(
+                0,
+                "NINALINK B4.6 NODE: TEST drop app result seq=%u count=%u\r\n",
+                (unsigned)m_app_last_sequence,
+                (unsigned)m_app_result_drop_count);
+            return;
+        }
+
         if (!nrfclaw_lora_send_async(
                 m_app_result_wire,
                 (uint8_t)sizeof(m_app_result_wire))) {
@@ -574,4 +598,19 @@ void nrfclaw_ninalink_link_get_app_status(nrfclaw_ninalink_app_status_t *out)
     out->applied_count = m_app_applied_count;
     out->duplicate_count = m_app_duplicate_count;
     out->tracking_active = nrfclaw_tracking_active();
+}
+
+void nrfclaw_ninalink_link_drop_next_app_result(void)
+{
+    m_app_drop_next_result = true;
+}
+
+bool nrfclaw_ninalink_link_app_result_drop_armed(void)
+{
+    return m_app_drop_next_result;
+}
+
+uint16_t nrfclaw_ninalink_link_app_result_drop_count(void)
+{
+    return m_app_result_drop_count;
 }

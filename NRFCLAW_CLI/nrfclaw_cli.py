@@ -2886,7 +2886,7 @@ class NRFClawClient:
                 0:"NONE",1:"ACKED",2:"TIMEOUT",3:"BAD_ACK",
                 4:"TX_FAIL",5:"RX_FAIL",6:"NO_DATA",7:"BUILD_FAIL",
             }
-            print("=== NINALINK B4.3 NODE LINK ===")
+            print("=== NINALINK NODE LINK ===")
             print(f"State:           {states.get(s['state'], s['state'])}")
             print(f"Result:          {results.get(s['result'], s['result'])}")
             print(f"Sequence:        {s['sequence']}")
@@ -3147,6 +3147,32 @@ class NRFClawClient:
             f"Tracking active: "
             f"{'yes' if s['tracking_active'] else 'no'}"
         )
+        return s
+
+    async def ninalink_node_drop_next_app_result(self):
+        await self.ndp_command(NDP_NINALINK_LINK, b"\x04")
+        print(
+            "Node armed: the next CAP_SET will be applied, but its "
+            "application-result ACK will be suppressed once."
+        )
+        return await self.ninalink_node_app_reliability()
+
+    async def ninalink_node_app_reliability(self):
+        p = await self.ndp_command(NDP_NINALINK_LINK, b"\x05")
+        if len(p) != 3:
+            raise RuntimeError(
+                f"Invalid node app reliability length: {len(p)}"
+            )
+        s = {
+            "drop_next_result": bool(p[0]),
+            "result_drop_count": int.from_bytes(p[1:3], "little"),
+        }
+        print("=== NINALINK B4.6 NODE APP RELIABILITY ===")
+        print(
+            f"Drop next result: "
+            f"{'yes' if s['drop_next_result'] else 'no'}"
+        )
+        print(f"Result drops:     {s['result_drop_count']}")
         return s
 
     def _decode_ninalink_bridge_status(self, p: bytes) -> dict:
@@ -5970,6 +5996,12 @@ async def main_async(args):
         elif args.action == "ninalink-node-app-status":
             await nrf.ninalink_node_app_status()
 
+        elif args.action == "ninalink-node-drop-next-app-result":
+            await nrf.ninalink_node_drop_next_app_result()
+
+        elif args.action == "ninalink-node-app-reliability":
+            await nrf.ninalink_node_app_reliability()
+
         elif args.action == "lora-rx-cancel":
             await nrf.lora_rx_cancel()
 
@@ -6470,7 +6502,9 @@ def build_parser():
     nset.add_argument("--node", type=lambda x: int(x, 0), required=True, help="target node id, e.g. 0xAD64D423")
     nset.add_argument("--value", choices=("on","off"), required=True, help="requested tracking_active value")
     sub.add_parser("ninalink-app-status", help="Show B4.5 bridge application-downlink state")
-    sub.add_parser("ninalink-node-app-status", help="Show B4.5 last CAP_SET result on the node")
+    sub.add_parser("ninalink-node-app-status", help="Show B4.5/B4.6 last CAP_SET result on the node")
+    sub.add_parser("ninalink-node-drop-next-app-result", help="B4.6 lab gate: apply next CAP_SET but suppress its result ACK once")
+    sub.add_parser("ninalink-node-app-reliability", help="Show B4.6 application-result loss-injection counters")
 
     ls = sub.add_parser("lora-set", help="Set the complete LLCC68 LoRa profile")
     ls.add_argument("--freq", type=int, required=True, help="RF frequency in Hz")

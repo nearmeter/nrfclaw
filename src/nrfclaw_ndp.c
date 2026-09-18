@@ -944,6 +944,22 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
             return reply(op,seq,NDP_OK,r,9,out,ol);
         }
 
+        if(p[0]==4U) {
+            if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            nrfclaw_ninalink_link_drop_next_app_result();
+            return reply(op,seq,NDP_OK,0,0,out,ol);
+        }
+
+        if(p[0]==5U) {
+            uint16_t dropped;
+            if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            dropped=nrfclaw_ninalink_link_app_result_drop_count();
+            r[0]=nrfclaw_ninalink_link_app_result_drop_armed()?1U:0U;
+            r[1]=(uint8_t)dropped;
+            r[2]=(uint8_t)(dropped>>8);
+            return reply(op,seq,NDP_OK,r,3,out,ol);
+        }
+
         return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
       }
 

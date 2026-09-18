@@ -58,7 +58,7 @@ static const registry_entry_t m_registry[] = {
     { NRFCLAW_SEMCAP_PULSE_FREQUENCY,     NRFCLAW_CAP_KIND_MEASUREMENT, NRFCLAW_CAP_VALUE_U32,  -3, NRFCLAW_CAP_UNIT_HERTZ,            R|P|T },
 
     { NRFCLAW_SEMCAP_PRESENCE,            NRFCLAW_CAP_KIND_STATE,       NRFCLAW_CAP_VALUE_BOOL,  0, NRFCLAW_CAP_UNIT_BOOLEAN,          R|P|E|T },
-    { NRFCLAW_SEMCAP_TRACKING_ACTIVE,     NRFCLAW_CAP_KIND_STATUS,      NRFCLAW_CAP_VALUE_BOOL,  0, NRFCLAW_CAP_UNIT_BOOLEAN,          R|P|T },
+    { NRFCLAW_SEMCAP_TRACKING_ACTIVE,     NRFCLAW_CAP_KIND_STATUS,      NRFCLAW_CAP_VALUE_BOOL,  0, NRFCLAW_CAP_UNIT_BOOLEAN, R|P|T|NRFCLAW_CAP_BEHAVIOR_WRITABLE },
 
     { NRFCLAW_SEMCAP_VOLTAGE,             NRFCLAW_CAP_KIND_MEASUREMENT, NRFCLAW_CAP_VALUE_S32,  -3, NRFCLAW_CAP_UNIT_VOLT,             R|P|T },
     { NRFCLAW_SEMCAP_CURRENT,             NRFCLAW_CAP_KIND_MEASUREMENT, NRFCLAW_CAP_VALUE_S32,  -3, NRFCLAW_CAP_UNIT_AMPERE,           R|P|T },
@@ -210,7 +210,11 @@ bool nrfclaw_capability_state(uint16_t capability_id,
                 if (capability_id == NRFCLAW_SEMCAP_ACCELERATION_X ||
                     capability_id == NRFCLAW_SEMCAP_ACCELERATION_Y ||
                     capability_id == NRFCLAW_SEMCAP_ACCELERATION_Z) {
-                    s |= NRFCLAW_CAP_STATE_ENABLED;
+                    /* PRESENT means the LIS2DH exists. READABLE means an
+                     * on-demand XYZ read is supported. ENABLED means the
+                     * LIS2DH is actually configured/running now. */
+                    if (mode != NRFCLAW_ACCEL_MODE_OFF)
+                        s |= NRFCLAW_CAP_STATE_ENABLED;
                 } else if ((capability_id == NRFCLAW_SEMCAP_MOTION &&
                             mode == NRFCLAW_ACCEL_MODE_MOTION) ||
                            (capability_id == NRFCLAW_SEMCAP_TAP &&

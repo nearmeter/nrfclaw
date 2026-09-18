@@ -6,6 +6,7 @@
 #include "nrfclaw_ninalink_msg.h"
 #include "nrfclaw_ninalink_command.h"
 #include "nrfclaw_ninalink_command_discovery.h"
+#include "nrfclaw_ninalink_capability_discovery.h"
 
 #include "SEGGER_RTT.h"
 
@@ -49,7 +50,8 @@ typedef enum {
     BRIDGE_TX_KIND_ACK,
     BRIDGE_TX_KIND_CAP_SET,
     BRIDGE_TX_KIND_COMMAND,
-    BRIDGE_TX_KIND_COMMAND_DISCOVERY
+    BRIDGE_TX_KIND_COMMAND_DISCOVERY,
+    BRIDGE_TX_KIND_CAPABILITY_DISCOVERY
 } bridge_tx_kind_t;
 
 APP_TIMER_DEF(m_bridge_tx_timer);
@@ -101,6 +103,9 @@ static uint8_t m_cmd_arg_len;
 
 static nrfclaw_ninalink_command_discovery_status_t m_disc;
 static uint16_t m_next_discovery_sequence = 1U;
+
+static nrfclaw_ninalink_capability_discovery_status_t m_capdisc;
+static uint16_t m_next_capability_discovery_sequence = 1U;
 
 static uint16_t get_u16_le(const uint8_t *p)
 {
@@ -416,6 +421,34 @@ static bool discovery_matches_node(uint32_t node_id)
     return m_disc.pending && m_disc.target_node == node_id;
 }
 
+static void build_capability_discovery_request(
+    uint16_t network_id,
+    uint16_t reply_to_seq)
+{
+    uint16_t crc;
+
+    memset(m_tx_wire, 0, sizeof(m_tx_wire));
+    m_tx_wire[0] = 0x4EU;
+    m_tx_wire[1] = 0x01U;
+    m_tx_wire[2] = 0x01U;
+    m_tx_wire[3] = NRFCLAW_NINALINK_MSG_CAPS_REQUEST;
+    put_u16_le(&m_tx_wire[4], network_id);
+    m_tx_wire[6] = 3U;
+    put_u32_le(&m_tx_wire[7], m_capdisc.target_node);
+    put_u16_le(&m_tx_wire[11], m_capdisc.request_seq);
+    put_u16_le(&m_tx_wire[13], reply_to_seq);
+    m_tx_wire[15] = m_capdisc.page_index;
+
+    crc = crc16_ccitt_false(m_tx_wire, 16U);
+    put_u16_le(&m_tx_wire[16], crc);
+    m_tx_len = 18U;
+}
+
+static bool capability_discovery_matches_node(uint32_t node_id)
+{
+    return m_capdisc.pending && m_capdisc.target_node == node_id;
+}
+
 static bool schedule_response_for_uplink(const uint8_t *wire)
 {
     uint16_t network_id = get_u16_le(&wire[4]);
@@ -437,7 +470,12 @@ static bool schedule_response_for_uplink(const uint8_t *wire)
         return schedule_tx(BRIDGE_TX_KIND_COMMAND_DISCOVERY);
     }
 
-    if (app_matches_node(node_id)) {
+        if (capability_discovery_matches_node(node_id)) {
+        build_capability_discovery_request(network_id, uplink_seq);
+        return schedule_tx(BRIDGE_TX_KIND_CAPABILITY_DISCOVERY);
+    }
+
+if (app_matches_node(node_id)) {
         build_tracking_cap_set(network_id, uplink_seq);
         return schedule_tx(BRIDGE_TX_KIND_CAP_SET);
     }
@@ -596,6 +634,77 @@ static bool accept_command_discovery_response(
     return true;
 }
 
+static bool accept_capability_discovery_response(
+    const uint8_t *wire,
+    uint8_t len)
+{
+    nrfclaw_ninalink_frame_t frame;
+    uint32_t node_id;
+    uint16_t request_seq;
+    uint8_t registry_version = 0U;
+    uint8_t page_index = 0U;
+    uint8_t count = 0U;
+    bool more = false;
+    nrfclaw_ninalink_capability_descriptor_t
+        descriptors[NRFCLAW_NINALINK_CAPABILITY_DISCOVERY_PAGE_MAX];
+
+    if (len < 19U)
+        return false;
+
+    if (nrfclaw_ninalink_decode(wire, len, &frame) != NRFCLAW_NINALINK_OK)
+        return false;
+
+    if (frame.message_type != NRFCLAW_NINALINK_MSG_CAPS_RESPONSE)
+        return false;
+
+    node_id = get_u32_le(&wire[7]);
+    request_seq = get_u16_le(&wire[11]);
+
+    if (node_id != m_capdisc.target_node ||
+        request_seq != m_capdisc.request_seq)
+        return false;
+
+    memset(descriptors, 0, sizeof(descriptors));
+
+    if (nrfclaw_ninalink_parse_caps_response(
+            &frame,
+            &registry_version,
+            &page_index,
+            descriptors,
+            NRFCLAW_NINALINK_CAPABILITY_DISCOVERY_PAGE_MAX,
+            &count,
+            &more) != NRFCLAW_NINALINK_MSG_OK)
+        return false;
+
+    if (registry_version != NRFCLAW_CAPABILITY_REGISTRY_VERSION ||
+        page_index != m_capdisc.page_index)
+        return false;
+
+    m_capdisc.registry_version = registry_version;
+    m_capdisc.count = count;
+    m_capdisc.more = more;
+    memset(m_capdisc.descriptors, 0, sizeof(m_capdisc.descriptors));
+    if (count)
+        memcpy(
+            m_capdisc.descriptors,
+            descriptors,
+            (size_t)count * sizeof(descriptors[0]));
+
+    m_capdisc.pending = false;
+    m_capdisc.state = NRFCLAW_NINALINK_APP_DL_DONE;
+    m_capdisc.completed_count++;
+
+    SEGGER_RTT_printf(
+        0,
+        "NINALINK B4.10 BRIDGE: CAPS_RESPONSE seq=%u page=%u count=%u more=%u\r\n",
+        (unsigned)m_capdisc.request_seq,
+        (unsigned)m_capdisc.page_index,
+        (unsigned)m_capdisc.count,
+        m_capdisc.more ? 1U : 0U);
+
+    return true;
+}
+
 bool nrfclaw_ninalink_bridge_start(void)
 {
     if (m_active)
@@ -636,6 +745,9 @@ bool nrfclaw_ninalink_bridge_start(void)
     memset(&m_disc, 0, sizeof(m_disc));
     m_disc.state = NRFCLAW_NINALINK_APP_DL_IDLE;
 
+    memset(&m_capdisc, 0, sizeof(m_capdisc));
+    m_capdisc.state = NRFCLAW_NINALINK_APP_DL_IDLE;
+
     if (!nrfclaw_lora_diag_stream_start())
         return false;
 
@@ -673,6 +785,7 @@ void nrfclaw_ninalink_bridge_drop_next_ack(void)
 bool nrfclaw_ninalink_bridge_queue_tracking(uint32_t target_node, bool active)
 {
     if (!m_active || m_app.pending || m_cmd.pending || m_disc.pending ||
+        m_capdisc.pending ||
         m_tx_state == BRIDGE_TX_WAIT_APP_RESULT)
         return false;
 
@@ -707,6 +820,7 @@ bool nrfclaw_ninalink_bridge_queue_command(
     uint8_t arg_len)
 {
     if (!m_active || m_app.pending || m_cmd.pending || m_disc.pending ||
+        m_capdisc.pending ||
         m_tx_state == BRIDGE_TX_WAIT_APP_RESULT)
         return false;
 
@@ -752,6 +866,7 @@ bool nrfclaw_ninalink_bridge_queue_command_discovery(
     uint8_t start_index)
 {
     if (!m_active || m_app.pending || m_cmd.pending || m_disc.pending ||
+        m_capdisc.pending ||
         m_tx_state == BRIDGE_TX_WAIT_APP_RESULT)
         return false;
 
@@ -777,6 +892,39 @@ void nrfclaw_ninalink_bridge_get_command_discovery_status(
 {
     if (out)
         *out = m_disc;
+}
+
+bool nrfclaw_ninalink_bridge_queue_capability_discovery(
+    uint32_t target_node,
+    uint8_t page_index)
+{
+    if (!m_active || m_app.pending || m_cmd.pending || m_disc.pending ||
+        m_capdisc.pending ||
+        m_tx_state == BRIDGE_TX_WAIT_APP_RESULT)
+        return false;
+
+    memset(&m_capdisc, 0, sizeof(m_capdisc));
+    m_capdisc.pending = true;
+    m_capdisc.target_node = target_node;
+    m_capdisc.request_seq = m_next_capability_discovery_sequence++;
+    m_capdisc.page_index = page_index;
+    m_capdisc.state = NRFCLAW_NINALINK_APP_DL_PENDING;
+
+    SEGGER_RTT_printf(
+        0,
+        "NINALINK B4.10 BRIDGE: queued capability discovery target=0x%08lX seq=%u page=%u\r\n",
+        (unsigned long)target_node,
+        (unsigned)m_capdisc.request_seq,
+        (unsigned)page_index);
+
+    return true;
+}
+
+void nrfclaw_ninalink_bridge_get_capability_discovery_status(
+    nrfclaw_ninalink_capability_discovery_status_t *out)
+{
+    if (out)
+        *out = m_capdisc;
 }
 
 void nrfclaw_ninalink_bridge_process(void)
@@ -843,16 +991,20 @@ void nrfclaw_ninalink_bridge_process(void)
 
         if (m_tx_kind == BRIDGE_TX_KIND_CAP_SET ||
             m_tx_kind == BRIDGE_TX_KIND_COMMAND ||
-            m_tx_kind == BRIDGE_TX_KIND_COMMAND_DISCOVERY) {
+            m_tx_kind == BRIDGE_TX_KIND_COMMAND_DISCOVERY ||
+            m_tx_kind == BRIDGE_TX_KIND_CAPABILITY_DISCOVERY) {
             if (m_tx_kind == BRIDGE_TX_KIND_CAP_SET) {
                 m_app.sent_count++;
                 m_app.state = NRFCLAW_NINALINK_APP_DL_WAIT_RESULT;
             } else if (m_tx_kind == BRIDGE_TX_KIND_COMMAND) {
                 m_cmd.sent_count++;
                 m_cmd.state = NRFCLAW_NINALINK_APP_DL_WAIT_RESULT;
-            } else {
+            } else if (m_tx_kind == BRIDGE_TX_KIND_COMMAND_DISCOVERY) {
                 m_disc.sent_count++;
                 m_disc.state = NRFCLAW_NINALINK_APP_DL_WAIT_RESULT;
+            } else {
+                m_capdisc.sent_count++;
+                m_capdisc.state = NRFCLAW_NINALINK_APP_DL_WAIT_RESULT;
             }
 
             if (!nrfclaw_lora_receive_window_async(
@@ -861,8 +1013,10 @@ void nrfclaw_ninalink_bridge_process(void)
                     m_app.state = NRFCLAW_NINALINK_APP_DL_PENDING;
                 else if (m_tx_kind == BRIDGE_TX_KIND_COMMAND)
                     m_cmd.state = NRFCLAW_NINALINK_APP_DL_PENDING;
-                else
+                else if (m_tx_kind == BRIDGE_TX_KIND_COMMAND_DISCOVERY)
                     m_disc.state = NRFCLAW_NINALINK_APP_DL_PENDING;
+                else
+                    m_capdisc.state = NRFCLAW_NINALINK_APP_DL_PENDING;
 
                 m_tx_kind = BRIDGE_TX_KIND_NONE;
                 m_tx_state = BRIDGE_TX_IDLE;
@@ -892,6 +1046,9 @@ void nrfclaw_ninalink_bridge_process(void)
                 else if (m_tx_kind == BRIDGE_TX_KIND_COMMAND_DISCOVERY)
                     accepted = accept_command_discovery_response(
                         result_wire, result_len);
+                else if (m_tx_kind == BRIDGE_TX_KIND_CAPABILITY_DISCOVERY)
+                    accepted = accept_capability_discovery_response(
+                        result_wire, result_len);
             }
 
             if (accepted) {
@@ -914,6 +1071,10 @@ void nrfclaw_ninalink_bridge_process(void)
                 if (m_disc.timeout_count != 0xFFU)
                     m_disc.timeout_count++;
                 m_disc.state = NRFCLAW_NINALINK_APP_DL_PENDING;
+            } else if (m_tx_kind == BRIDGE_TX_KIND_CAPABILITY_DISCOVERY) {
+                if (m_capdisc.timeout_count != 0xFFU)
+                    m_capdisc.timeout_count++;
+                m_capdisc.state = NRFCLAW_NINALINK_APP_DL_PENDING;
             }
 
             m_tx_kind = BRIDGE_TX_KIND_NONE;
@@ -935,6 +1096,10 @@ void nrfclaw_ninalink_bridge_process(void)
                 if (m_disc.timeout_count != 0xFFU)
                     m_disc.timeout_count++;
                 m_disc.state = NRFCLAW_NINALINK_APP_DL_PENDING;
+            } else if (m_tx_kind == BRIDGE_TX_KIND_CAPABILITY_DISCOVERY) {
+                if (m_capdisc.timeout_count != 0xFFU)
+                    m_capdisc.timeout_count++;
+                m_capdisc.state = NRFCLAW_NINALINK_APP_DL_PENDING;
             }
 
             m_tx_kind = BRIDGE_TX_KIND_NONE;

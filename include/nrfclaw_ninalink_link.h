@@ -91,6 +91,17 @@ typedef struct {
     uint16_t duplicate_count;
 } nrfclaw_ninalink_command_discovery_node_status_t;
 
+typedef struct {
+    bool valid;
+    uint16_t request_seq;
+    uint8_t page_index;
+    uint8_t registry_version;
+    uint8_t count;
+    bool more;
+    uint16_t served_count;
+    uint16_t duplicate_count;
+} nrfclaw_ninalink_capability_discovery_node_status_t;
+
 bool nrfclaw_ninalink_link_start(uint16_t ack_window_ms);
 bool nrfclaw_ninalink_link_start_reliable(uint16_t ack_window_ms,
                                           uint8_t max_attempts,
@@ -102,8 +113,10 @@ void nrfclaw_ninalink_link_get_command_status(
     nrfclaw_ninalink_command_status_t *out);
 void nrfclaw_ninalink_link_get_command_discovery_status(
     nrfclaw_ninalink_command_discovery_node_status_t *out);
+void nrfclaw_ninalink_link_get_capability_discovery_status(
+    nrfclaw_ninalink_capability_discovery_node_status_t *out);
 
-/* B4.6/B4.7/B4.9 deterministic result loss injection. */
+/* B4.6/B4.7/B4.9/B4.10 deterministic result loss injection. */
 void nrfclaw_ninalink_link_drop_next_app_result(void);
 bool nrfclaw_ninalink_link_app_result_drop_armed(void);
 uint16_t nrfclaw_ninalink_link_app_result_drop_count(void);

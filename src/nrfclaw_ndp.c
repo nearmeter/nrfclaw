@@ -16,6 +16,7 @@
 #include "nrfclaw_ninalink_lab.h"
 #include "nrfclaw_ninalink_bridge.h"
 #include "nrfclaw_ninalink_link.h"
+#include "nrfclaw_ninalink_capability_discovery.h"
 #include <string.h>
 
 #define NDP_INFO NRFCLAW_NDP_INFO
@@ -752,6 +753,7 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
         nrfclaw_ninalink_app_dl_status_t as;
         nrfclaw_ninalink_command_dl_status_t cs;
         nrfclaw_ninalink_command_discovery_status_t ds;
+        nrfclaw_ninalink_capability_discovery_status_t cds;
 
         if(enforce_auth) return reply(op,seq,NDP_FORBIDDEN,0,0,out,ol);
         if(n<1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
@@ -985,6 +987,57 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
             return reply(op,seq,NDP_OK,r,6,out,ol);
         }
 
+        if(p[0]==14U) {
+            uint32_t node;
+            uint8_t page_index;
+            if(n!=6U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            memcpy(&node,&p[1],4);
+            page_index=p[5];
+            if(!nrfclaw_ninalink_bridge_queue_capability_discovery(
+                    node,page_index))
+                return reply(op,seq,NDP_BUSY,0,0,out,ol);
+            return reply(op,seq,NDP_OK,0,0,out,ol);
+        }
+
+        if(p[0]==15U) {
+            if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            nrfclaw_ninalink_bridge_get_capability_discovery_status(&cds);
+            r[0]=cds.pending?1U:0U;
+            memcpy(&r[1],&cds.target_node,4);
+            r[5]=(uint8_t)cds.request_seq;
+            r[6]=(uint8_t)(cds.request_seq>>8);
+            r[7]=cds.page_index;
+            r[8]=cds.state;
+            r[9]=cds.registry_version;
+            r[10]=cds.count;
+            r[11]=cds.more?1U:0U;
+            r[12]=(uint8_t)cds.sent_count;
+            r[13]=(uint8_t)cds.completed_count;
+            r[14]=cds.timeout_count;
+            return reply(op,seq,NDP_OK,r,15,out,ol);
+        }
+
+        if(p[0]==16U) {
+            uint8_t index;
+            nrfclaw_ninalink_capability_descriptor_t const *d;
+            if(n!=2U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            nrfclaw_ninalink_bridge_get_capability_discovery_status(&cds);
+            index=p[1];
+            if(index>=cds.count)
+                return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+            d=&cds.descriptors[index];
+            r[0]=(uint8_t)d->desc.capability_id;
+            r[1]=(uint8_t)(d->desc.capability_id>>8);
+            r[2]=d->desc.channel;
+            r[3]=d->desc.kind;
+            r[4]=d->desc.value_type;
+            r[5]=(uint8_t)d->desc.scale10;
+            r[6]=d->desc.unit;
+            r[7]=d->desc.behavior_flags;
+            r[8]=d->runtime_state_flags;
+            return reply(op,seq,NDP_OK,r,9,out,ol);
+        }
+
         return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
       }
 
@@ -993,6 +1046,7 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
         nrfclaw_ninalink_app_status_t aps;
         nrfclaw_ninalink_command_status_t cs;
         nrfclaw_ninalink_command_discovery_node_status_t ds;
+        nrfclaw_ninalink_capability_discovery_node_status_t cds;
 
         if(enforce_auth) return reply(op,seq,NDP_FORBIDDEN,0,0,out,ol);
         if(n<1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
@@ -1145,6 +1199,67 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
             r[9]=(uint8_t)ds.duplicate_count;
             r[10]=(uint8_t)(ds.duplicate_count>>8);
             return reply(op,seq,NDP_OK,r,11,out,ol);
+        }
+
+        if(p[0]==9U) {
+            if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            nrfclaw_ninalink_link_get_capability_discovery_status(&cds);
+            r[0]=cds.valid?1U:0U;
+            r[1]=(uint8_t)cds.request_seq;
+            r[2]=(uint8_t)(cds.request_seq>>8);
+            r[3]=cds.page_index;
+            r[4]=cds.registry_version;
+            r[5]=cds.count;
+            r[6]=cds.more?1U:0U;
+            r[7]=(uint8_t)cds.served_count;
+            r[8]=(uint8_t)(cds.served_count>>8);
+            r[9]=(uint8_t)cds.duplicate_count;
+            r[10]=(uint8_t)(cds.duplicate_count>>8);
+            return reply(op,seq,NDP_OK,r,11,out,ol);
+        }
+
+        if(p[0]==10U) {
+            nrfclaw_ninalink_capability_discovery_page_t page;
+
+            if(n!=2U)
+                return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+
+            if(!nrfclaw_ninalink_capability_discovery_build_page(
+                    p[1],&page))
+                return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+
+            r[0]=NRFCLAW_CAPABILITY_REGISTRY_VERSION;
+            r[1]=page.page_index;
+            r[2]=page.count;
+            r[3]=page.more?1U:0U;
+            return reply(op,seq,NDP_OK,r,4,out,ol);
+        }
+
+        if(p[0]==11U) {
+            nrfclaw_ninalink_capability_discovery_page_t page;
+            nrfclaw_ninalink_capability_descriptor_t const *d;
+
+            if(n!=3U)
+                return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+
+            if(!nrfclaw_ninalink_capability_discovery_build_page(
+                    p[1],&page))
+                return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+
+            if(p[2]>=page.count)
+                return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+
+            d=&page.descriptors[p[2]];
+            r[0]=(uint8_t)d->desc.capability_id;
+            r[1]=(uint8_t)(d->desc.capability_id>>8);
+            r[2]=d->desc.channel;
+            r[3]=d->desc.kind;
+            r[4]=d->desc.value_type;
+            r[5]=(uint8_t)d->desc.scale10;
+            r[6]=d->desc.unit;
+            r[7]=d->desc.behavior_flags;
+            r[8]=d->runtime_state_flags;
+            return reply(op,seq,NDP_OK,r,9,out,ol);
         }
 
         return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);

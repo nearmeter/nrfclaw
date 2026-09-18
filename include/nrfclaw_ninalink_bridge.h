@@ -6,6 +6,7 @@
 
 #include "nrfclaw_ninalink.h"
 #include "nrfclaw_ninalink_command_discovery.h"
+#include "nrfclaw_ninalink_capability_discovery.h"
 
 #define NRFCLAW_NINALINK_BRIDGE_QUEUE_DEPTH 4U
 #define NRFCLAW_NINALINK_BRIDGE_DUP_CACHE   8U
@@ -87,6 +88,22 @@ typedef struct {
 } nrfclaw_ninalink_command_discovery_status_t;
 
 typedef struct {
+    bool pending;
+    uint32_t target_node;
+    uint16_t request_seq;
+    uint8_t page_index;
+    uint8_t state;
+    uint8_t registry_version;
+    uint8_t count;
+    bool more;
+    nrfclaw_ninalink_capability_descriptor_t
+        descriptors[NRFCLAW_NINALINK_CAPABILITY_DISCOVERY_PAGE_MAX];
+    uint16_t sent_count;
+    uint16_t completed_count;
+    uint8_t timeout_count;
+} nrfclaw_ninalink_capability_discovery_status_t;
+
+typedef struct {
     uint8_t len;
     uint8_t data[NRFCLAW_NINALINK_MAX_FRAME_SIZE];
     int16_t rssi_x2;
@@ -117,5 +134,11 @@ bool nrfclaw_ninalink_bridge_queue_command_discovery(
     uint8_t start_index);
 void nrfclaw_ninalink_bridge_get_command_discovery_status(
     nrfclaw_ninalink_command_discovery_status_t *out);
+
+bool nrfclaw_ninalink_bridge_queue_capability_discovery(
+    uint32_t target_node,
+    uint8_t page_index);
+void nrfclaw_ninalink_bridge_get_capability_discovery_status(
+    nrfclaw_ninalink_capability_discovery_status_t *out);
 
 #endif

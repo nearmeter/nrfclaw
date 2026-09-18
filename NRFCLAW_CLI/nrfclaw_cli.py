@@ -3144,7 +3144,7 @@ class NRFClawClient:
         print(f"Applied total:   {s['applied_count']}")
         print(f"Duplicate total: {s['duplicate_count']}")
         print(
-            f"Tracking active: "
+            f"Tracking active (pre-NUS if latched): "
             f"{'yes' if s['tracking_active'] else 'no'}"
         )
         return s
@@ -3354,6 +3354,221 @@ class NRFClawClient:
             f"0x{node_id:08X}, start={start_index}."
         )
         return await self.ninalink_command_discovery_status()
+
+    async def ninalink_capability_discover(self, node_id, page=0):
+        if not (0 <= page <= 0xFF):
+            raise ValueError("--page must be 0..255")
+        req = b"\x0e" + struct.pack("<I", node_id) + bytes([page])
+        await self.ndp_command(NDP_NINALINK_BRIDGE, req)
+        print(
+            f"Queued capability discovery for node "
+            f"0x{node_id:08X}, page={page}."
+        )
+        return await self.ninalink_capability_discovery_status()
+
+    def _capability_name(self, cap_id):
+        names = {
+            0x0001:"BATTERY_VOLTAGE", 0x0002:"BATTERY_PERCENT",
+            0x0003:"SUPPLY_VOLTAGE", 0x0100:"TEMPERATURE",
+            0x0101:"HUMIDITY", 0x0102:"ILLUMINANCE",
+            0x0103:"PRESSURE", 0x0104:"CO2", 0x0105:"TVOC",
+            0x0106:"LEAK", 0x0200:"MOTION", 0x0201:"TAP",
+            0x0202:"FALL", 0x0203:"ACCELERATION_X",
+            0x0204:"ACCELERATION_Y", 0x0205:"ACCELERATION_Z",
+            0x0206:"VIBRATION_RMS", 0x0207:"VIBRATION_PEAK",
+            0x0208:"VIBRATION_P2P", 0x0209:"VIBRATION_FREQUENCY",
+            0x020A:"VIBRATION_ALARM", 0x020B:"WALK",
+            0x0300:"DIGITAL_INPUT", 0x0301:"HALL_STATE",
+            0x0302:"COUNTER", 0x0303:"QUADRATURE_POSITION",
+            0x0304:"PULSE_FREQUENCY", 0x0400:"PRESENCE",
+            0x0401:"TRACKING_ACTIVE", 0x0500:"VOLTAGE",
+            0x0501:"CURRENT", 0x0502:"POWER", 0x0503:"ENERGY",
+            0x0504:"LINE_FREQUENCY", 0x0600:"FLOW_RATE",
+            0x0601:"VOLUME", 0x0602:"DISTANCE",
+            0x0603:"LEVEL_PERCENT", 0x0604:"RPM", 0x0605:"SPEED",
+        }
+        return names.get(cap_id, "UNKNOWN")
+
+    def _format_capability_descriptor(self, d):
+        kinds = {
+            1:"MEASUREMENT", 2:"STATE", 3:"EVENT",
+            4:"COUNTER", 5:"POSITION", 6:"STATUS",
+        }
+        types = {
+            1:"BOOL", 2:"U8", 3:"S8", 4:"U16",
+            5:"S16", 6:"U32", 7:"S32", 8:"ENUM8",
+        }
+        units = {
+            0x00:"-", 0x01:"BOOLEAN", 0x02:"%", 0x03:"V",
+            0x04:"A", 0x05:"W", 0x06:"Wh", 0x07:"C",
+            0x08:"Pa", 0x09:"lux", 0x0A:"ppm", 0x0B:"ppb",
+            0x0C:"mg", 0x0D:"Hz", 0x0E:"s", 0x0F:"m",
+            0x10:"m/s", 0x11:"L", 0x12:"L/min",
+            0x13:"rpm", 0x14:"count",
+        }
+        behavior = []
+        for bit, name in (
+            (0x01,"READABLE"), (0x02,"REPORTABLE"),
+            (0x04,"EVENT"), (0x08,"WRITABLE"), (0x10,"RETAINED"),
+        ):
+            if d["behavior"] & bit:
+                behavior.append(name)
+        state = []
+        for bit, name in (
+            (0x01,"SUPPORTED"), (0x02,"PRESENT"),
+            (0x04,"ENABLED"), (0x08,"FAULT"),
+        ):
+            if d["state"] & bit:
+                state.append(name)
+        return (
+            f"0x{d['capability_id']:04X} "
+            f"{self._capability_name(d['capability_id'])} "
+            f"ch={d['channel']} "
+            f"kind={kinds.get(d['kind'], d['kind'])} "
+            f"type={types.get(d['value_type'], d['value_type'])} "
+            f"scale={d['scale10']} "
+            f"unit={units.get(d['unit'], hex(d['unit']))} "
+            f"behavior={'|'.join(behavior) if behavior else '-'} "
+            f"state={'|'.join(state) if state else '-'}"
+        )
+
+    async def ninalink_capability_discovery_status(self):
+        p = await self.ndp_command(NDP_NINALINK_BRIDGE, b"\x0f")
+        if len(p) != 15:
+            raise RuntimeError(
+                f"Invalid capability discovery status length: {len(p)}"
+            )
+        states = {0:"IDLE",1:"PENDING",2:"WAIT_RESULT",3:"DONE"}
+        s = {
+            "pending": bool(p[0]),
+            "target_node": int.from_bytes(p[1:5], "little"),
+            "request_seq": int.from_bytes(p[5:7], "little"),
+            "page_index": p[7], "state": p[8],
+            "registry_version": p[9], "count": p[10],
+            "more": bool(p[11]), "sent_count": p[12],
+            "completed_count": p[13], "timeout_count": p[14],
+            "descriptors": [],
+        }
+        for index in range(s["count"]):
+            d = await self.ndp_command(
+                NDP_NINALINK_BRIDGE, bytes([16, index])
+            )
+            if len(d) != 9:
+                raise RuntimeError(
+                    f"Invalid capability descriptor length: {len(d)}"
+                )
+            scale10 = d[5] if d[5] < 128 else d[5] - 256
+            s["descriptors"].append({
+                "capability_id": int.from_bytes(d[0:2], "little"),
+                "channel": d[2], "kind": d[3], "value_type": d[4],
+                "scale10": scale10, "unit": d[6],
+                "behavior": d[7], "state": d[8],
+            })
+        print("=== NINALINK B4.10 CAPABILITY DISCOVERY ===")
+        print(f"Pending:          {'yes' if s['pending'] else 'no'}")
+        print(f"Target node:      0x{s['target_node']:08X}")
+        print(f"Request seq:      {s['request_seq']}")
+        print(f"Page index:       {s['page_index']}")
+        print(f"State:            {states.get(s['state'], s['state'])}")
+        print(f"Registry version: {s['registry_version']}")
+        print(f"Returned:         {s['count']}")
+        print(f"Sent total:       {s['sent_count']}")
+        print(f"Completed total:  {s['completed_count']}")
+        print(f"Result timeouts:  {s['timeout_count']}")
+        for i, d in enumerate(s["descriptors"]):
+            print(f"  [{i}] {self._format_capability_descriptor(d)}")
+        if s["more"]:
+            print(f"More:             yes (next page={s['page_index'] + 1})")
+        else:
+            print("More:             no")
+        return s
+
+    async def ninalink_capability_local(self, page_index=0):
+        if page_index < 0 or page_index > 255:
+            raise ValueError("--page must be 0..255")
+
+        p = await self.ndp_command(
+            NDP_NINALINK_LINK,
+            bytes([10, page_index]),
+        )
+        if len(p) != 4:
+            raise RuntimeError(
+                f"Invalid local capability page header length: {len(p)}"
+            )
+
+        s = {
+            "registry_version": p[0],
+            "page_index": p[1],
+            "count": p[2],
+            "more": bool(p[3]),
+            "descriptors": [],
+        }
+
+        if s["page_index"] != page_index:
+            raise RuntimeError(
+                f"Local capability page mismatch: requested={page_index} "
+                f"returned={s['page_index']}"
+            )
+
+        for index in range(s["count"]):
+            d = await self.ndp_command(
+                NDP_NINALINK_LINK,
+                bytes([11, page_index, index]),
+            )
+            if len(d) != 9:
+                raise RuntimeError(
+                    f"Invalid local capability descriptor length: {len(d)}"
+                )
+
+            scale10 = d[5] if d[5] < 128 else d[5] - 256
+            s["descriptors"].append({
+                "capability_id": int.from_bytes(d[0:2], "little"),
+                "channel": d[2],
+                "kind": d[3],
+                "value_type": d[4],
+                "scale10": scale10,
+                "unit": d[6],
+                "behavior": d[7],
+                "state": d[8],
+            })
+
+        print("=== NINALINK B4.10 LOCAL CAPABILITY DISCOVERY ===")
+        print(f"Registry version: {s['registry_version']}")
+        print(f"Page index:       {s['page_index']}")
+        print(f"Returned:         {s['count']}")
+        for i, d in enumerate(s["descriptors"]):
+            print(f"  [{i}] {self._format_capability_descriptor(d)}")
+        if s["more"]:
+            print(f"More:             yes (next page={page_index + 1})")
+        else:
+            print("More:             no")
+
+        return s
+
+    async def ninalink_node_capability_discovery_status(self):
+        p = await self.ndp_command(NDP_NINALINK_LINK, b"\x09")
+        if len(p) != 11:
+            raise RuntimeError(
+                f"Invalid node capability discovery status length: {len(p)}"
+            )
+        s = {
+            "valid": bool(p[0]),
+            "request_seq": int.from_bytes(p[1:3], "little"),
+            "page_index": p[3], "registry_version": p[4],
+            "count": p[5], "more": bool(p[6]),
+            "served_count": int.from_bytes(p[7:9], "little"),
+            "duplicate_count": int.from_bytes(p[9:11], "little"),
+        }
+        print("=== NINALINK B4.10 NODE CAPABILITY DISCOVERY ===")
+        print(f"Request seen:     {'yes' if s['valid'] else 'no'}")
+        print(f"Request seq:      {s['request_seq']}")
+        print(f"Page index:       {s['page_index']}")
+        print(f"Registry version: {s['registry_version']}")
+        print(f"Returned:         {s['count']}")
+        print(f"More:             {'yes' if s['more'] else 'no'}")
+        print(f"Served total:     {s['served_count']}")
+        print(f"Duplicate total:  {s['duplicate_count']}")
+        return s
 
     async def ninalink_command_discovery_status(self):
         p = await self.ndp_command(NDP_NINALINK_BRIDGE, b"\x0c")
@@ -6323,6 +6538,18 @@ async def main_async(args):
         elif args.action == "ninalink-node-command-discovery-status":
             await nrf.ninalink_node_command_discovery_status()
 
+        elif args.action == "ninalink-capability-local":
+            await nrf.ninalink_capability_local(args.page)
+
+        elif args.action == "ninalink-capability-discover":
+            await nrf.ninalink_capability_discover(args.node, args.page)
+
+        elif args.action == "ninalink-capability-discovery-status":
+            await nrf.ninalink_capability_discovery_status()
+
+        elif args.action == "ninalink-node-capability-discovery-status":
+            await nrf.ninalink_node_capability_discovery_status()
+
         elif args.action == "lora-rx-cancel":
             await nrf.lora_rx_cancel()
 
@@ -6845,6 +7072,41 @@ def build_parser():
     ndisc.add_argument("--start", type=lambda x: int(x, 0), default=0, help="registry start index")
     sub.add_parser("ninalink-command-discovery-status", help="Show B4.9 bridge discovery page")
     sub.add_parser("ninalink-node-command-discovery-status", help="Show B4.9 node discovery counters")
+    nlocal = sub.add_parser(
+        "ninalink-capability-local",
+        help="B4.10 inspect local capability metadata without LoRa",
+    )
+    nlocal.add_argument(
+        "--page",
+        type=lambda x: int(x, 0),
+        default=0,
+        help="CAPS page index",
+    )
+
+    ncaps = sub.add_parser(
+        "ninalink-capability-discover",
+        help="B4.10 discover node capability metadata",
+    )
+    ncaps.add_argument(
+        "--node",
+        type=lambda x: int(x, 0),
+        required=True,
+        help="target node id",
+    )
+    ncaps.add_argument(
+        "--page",
+        type=lambda x: int(x, 0),
+        default=0,
+        help="CAPS page index",
+    )
+    sub.add_parser(
+        "ninalink-capability-discovery-status",
+        help="Show B4.10 bridge capability page",
+    )
+    sub.add_parser(
+        "ninalink-node-capability-discovery-status",
+        help="Show B4.10 node capability discovery counters",
+    )
 
     ls = sub.add_parser("lora-set", help="Set the complete LLCC68 LoRa profile")
     ls.add_argument("--freq", type=int, required=True, help="RF frequency in Hz")

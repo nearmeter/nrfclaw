@@ -11,6 +11,7 @@
 #include "nrfclaw_ninalink_command.h"
 #include "nrfclaw_ninalink_command_registry.h"
 #include "nrfclaw_ninalink_command_discovery.h"
+#include "nrfclaw_ninalink_capability_discovery.h"
 #include "nrfclaw_tracking.h"
 
 #include <string.h>
@@ -82,7 +83,16 @@ static uint8_t m_disc_last_count;
 static uint16_t m_disc_served_count;
 static uint16_t m_disc_duplicate_count;
 
-/* B4.6/B4.7/B4.9 deterministic result loss injection. */
+/* B4.10 semantic capability discovery status/replay observation. */
+static bool m_capdisc_last_valid;
+static uint16_t m_capdisc_last_sequence;
+static uint8_t m_capdisc_last_page;
+static uint8_t m_capdisc_last_count;
+static bool m_capdisc_last_more;
+static uint16_t m_capdisc_served_count;
+static uint16_t m_capdisc_duplicate_count;
+
+/* B4.6/B4.7/B4.9/B4.10 deterministic result loss injection. */
 static bool m_app_drop_next_result;
 static uint16_t m_app_result_drop_count;
 
@@ -456,6 +466,12 @@ static uint8_t apply_cap_set(uint16_t cap_id,
                              uint8_t type,
                              uint8_t value)
 {
+    nrfclaw_capability_desc_t desc;
+
+    if (!nrfclaw_capability_descriptor(cap_id, channel, &desc) ||
+        (desc.behavior_flags & NRFCLAW_CAP_BEHAVIOR_WRITABLE) == 0U)
+        return NRFCLAW_NINALINK_APP_UNSUPPORTED_CAP;
+
     if (cap_id != APP_CAP_TRACKING_ACTIVE || channel != 0U)
         return NRFCLAW_NINALINK_APP_UNSUPPORTED_CAP;
 
@@ -713,6 +729,102 @@ static bool accept_commands_request(const uint8_t *wire, uint8_t len)
     return true;
 }
 
+static bool build_capability_response(uint16_t network_id,
+                                      uint16_t request_seq,
+                                      uint8_t page_index)
+{
+    nrfclaw_ninalink_capability_discovery_page_t page;
+    nrfclaw_ninalink_frame_t frame;
+
+    if (!nrfclaw_ninalink_capability_discovery_build_page(
+            page_index, &page))
+        return false;
+
+    if (nrfclaw_ninalink_build_caps_response(
+            &frame,
+            network_id,
+            NRF_FICR->DEVICEID[0],
+            request_seq,
+            false,
+            page.more,
+            NRFCLAW_CAPABILITY_REGISTRY_VERSION,
+            page_index,
+            page.descriptors,
+            page.count) != NRFCLAW_NINALINK_MSG_OK)
+        return false;
+
+    if (nrfclaw_ninalink_encode(
+            &frame,
+            m_result_wire,
+            sizeof(m_result_wire),
+            &m_result_len) != NRFCLAW_NINALINK_OK)
+        return false;
+
+    m_capdisc_last_count = page.count;
+    m_capdisc_last_more = page.more;
+    return true;
+}
+
+static bool accept_capability_request(
+    const uint8_t *wire,
+    uint8_t len)
+{
+    nrfclaw_ninalink_frame_t frame;
+    uint16_t network_id;
+    uint32_t target_node;
+    uint16_t request_seq;
+    uint16_t reply_to_seq;
+    uint8_t page_index;
+
+    if (len != 18U)
+        return false;
+
+    if (nrfclaw_ninalink_decode(wire, len, &frame) != NRFCLAW_NINALINK_OK)
+        return false;
+
+    if (wire[3] != NRFCLAW_NINALINK_MSG_CAPS_REQUEST ||
+        wire[6] != 3U)
+        return false;
+
+    network_id = get_u16_le(&wire[4]);
+    target_node = get_u32_le(&wire[7]);
+    request_seq = get_u16_le(&wire[11]);
+    reply_to_seq = get_u16_le(&wire[13]);
+    page_index = wire[15];
+
+    if (network_id != m_pending_network_id ||
+        target_node != NRF_FICR->DEVICEID[0] ||
+        reply_to_seq != m_pending_sequence)
+        return false;
+
+    if (m_capdisc_last_valid &&
+        request_seq == m_capdisc_last_sequence) {
+        if (page_index != m_capdisc_last_page)
+            return false;
+        m_capdisc_duplicate_count++;
+    } else {
+        m_capdisc_last_valid = true;
+        m_capdisc_last_sequence = request_seq;
+        m_capdisc_last_page = page_index;
+        m_capdisc_served_count++;
+    }
+
+    if (!build_capability_response(
+            network_id, request_seq, page_index))
+        return false;
+
+    SEGGER_RTT_printf(
+        0,
+        "NINALINK B4.10 NODE: CAPS_REQUEST seq=%u page=%u count=%u more=%u dup=%u\\r\\n",
+        (unsigned)request_seq,
+        (unsigned)page_index,
+        (unsigned)m_capdisc_last_count,
+        m_capdisc_last_more ? 1U : 0U,
+        (unsigned)m_capdisc_duplicate_count);
+
+    return true;
+}
+
 void nrfclaw_ninalink_link_process(void)
 {
     if (!m_started)
@@ -790,6 +902,11 @@ void nrfclaw_ninalink_link_process(void)
             }
 
             if (accept_commands_request(wire, len)) {
+                m_status.state = NRFCLAW_NINALINK_LINK_APP_RESULT_ARM;
+                return;
+            }
+
+            if (accept_capability_request(wire, len)) {
                 m_status.state = NRFCLAW_NINALINK_LINK_APP_RESULT_ARM;
                 return;
             }
@@ -878,7 +995,16 @@ void nrfclaw_ninalink_link_get_app_status(nrfclaw_ninalink_app_status_t *out)
     out->result = m_app_last_result;
     out->applied_count = m_app_applied_count;
     out->duplicate_count = m_app_duplicate_count;
-    out->tracking_active = nrfclaw_tracking_active();
+    {
+        nrfclaw_tracking_debug_t tracking_debug;
+        nrfclaw_tracking_debug(&tracking_debug);
+        /*
+         * P0.21 stops TRACKING before NUS is opened. The tracking debug API
+         * returns the pre-stop latched state in that case, so this status
+         * remains meaningful when read through NUS.
+         */
+        out->tracking_active = tracking_debug.active != 0U;
+    }
 }
 
 void nrfclaw_ninalink_link_drop_next_app_result(void)
@@ -932,4 +1058,21 @@ void nrfclaw_ninalink_link_get_command_status(
             m_cmd_last_result_len);
     out->executed_count = m_cmd_executed_count;
     out->duplicate_count = m_cmd_duplicate_count;
+}
+
+void nrfclaw_ninalink_link_get_capability_discovery_status(
+    nrfclaw_ninalink_capability_discovery_node_status_t *out)
+{
+    if (!out)
+        return;
+
+    memset(out, 0, sizeof(*out));
+    out->valid = m_capdisc_last_valid;
+    out->request_seq = m_capdisc_last_sequence;
+    out->page_index = m_capdisc_last_page;
+    out->registry_version = NRFCLAW_CAPABILITY_REGISTRY_VERSION;
+    out->count = m_capdisc_last_count;
+    out->more = m_capdisc_last_more;
+    out->served_count = m_capdisc_served_count;
+    out->duplicate_count = m_capdisc_duplicate_count;
 }

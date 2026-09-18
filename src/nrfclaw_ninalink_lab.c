@@ -163,6 +163,109 @@ static nrfclaw_ninalink_lab_result_t send_cached_report(void)
     return NRFCLAW_NINALINK_LAB_SENT;
 }
 
+
+static uint16_t lab_crc16_ccitt_false(const uint8_t *data, uint8_t len)
+{
+    uint16_t crc = 0xFFFFU;
+    uint8_t i;
+
+    while (len--) {
+        crc ^= (uint16_t)(*data++) << 8;
+        for (i = 0U; i < 8U; i++) {
+            if (crc & 0x8000U)
+                crc = (uint16_t)((crc << 1) ^ 0x1021U);
+            else
+                crc <<= 1;
+        }
+    }
+
+    return crc;
+}
+
+static void lab_put_u16_le(uint8_t *p, uint16_t v)
+{
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+}
+
+static void lab_put_u32_le(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
+}
+
+bool nrfclaw_ninalink_lab_send_max_test(void)
+{
+    static const uint16_t cap_ids[6] = {
+        0x0102U, /* illuminance */
+        0x0103U, /* pressure */
+        0x0105U, /* tvoc */
+        0x0302U, /* counter */
+        0x0304U, /* pulse_frequency */
+        0x0503U  /* energy */
+    };
+
+    uint8_t wire[64];
+    uint8_t off;
+    uint8_t i;
+    uint16_t crc;
+    uint16_t seq;
+
+    memset(wire, 0, sizeof(wire));
+
+    seq = m_status.next_sequence;
+
+    wire[0] = 0x4EU; /* 'N' */
+    wire[1] = 0x01U; /* NinaLink v1 */
+    wire[2] = 0x00U; /* flags */
+    wire[3] = 0x10U; /* CAP_REPORT */
+    lab_put_u16_le(&wire[4], 0x0000U);
+    wire[6] = 49U;
+    lab_put_u32_le(&wire[7], m_status.node_id);
+    lab_put_u16_le(&wire[11], seq);
+
+    wire[13] = 6U;
+    off = 14U;
+
+    for (i = 0U; i < 6U; i++) {
+        lab_put_u16_le(&wire[off], cap_ids[i]);
+        wire[off + 2U] = 0U;
+        wire[off + 3U] = 0x06U; /* U32 */
+        lab_put_u32_le(&wire[off + 4U], (uint32_t)(i + 1U) * 1000UL);
+        off = (uint8_t)(off + 8U);
+    }
+
+    if (off != 62U) {
+        m_status.last_result = NRFCLAW_NINALINK_LAB_BUILD_ERROR;
+        return false;
+    }
+
+    crc = lab_crc16_ccitt_false(wire, 62U);
+    lab_put_u16_le(&wire[62], crc);
+
+    m_status.last_entry_count = 6U;
+    m_status.last_frame_length = 64U;
+
+    if (!nrfclaw_lora_send_async(wire, sizeof(wire))) {
+        m_status.last_result = NRFCLAW_NINALINK_LAB_RADIO_BUSY;
+        return false;
+    }
+
+    m_status.last_result = NRFCLAW_NINALINK_LAB_SENT;
+    m_status.next_sequence++;
+
+    SEGGER_RTT_printf(
+        0,
+        "NINALINK B4.2 MAX: TX node=0x%08lX seq=%u entries=6 len=64 crc=0x%04X\r\n",
+        (unsigned long)m_status.node_id,
+        (unsigned)seq,
+        (unsigned)crc);
+
+    return true;
+}
+
 void nrfclaw_ninalink_lab_process(void)
 {
     nrfclaw_ninalink_lab_result_t result;

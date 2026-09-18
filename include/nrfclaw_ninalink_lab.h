@@ -25,6 +25,7 @@ typedef struct {
 
 bool nrfclaw_ninalink_lab_init(void);
 bool nrfclaw_ninalink_lab_start(uint16_t period_s);
+bool nrfclaw_ninalink_lab_send_max_test(void);
 void nrfclaw_ninalink_lab_stop(void);
 void nrfclaw_ninalink_lab_process(void);
 void nrfclaw_ninalink_lab_get_status(nrfclaw_ninalink_lab_status_t *out);

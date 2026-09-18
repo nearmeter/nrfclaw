@@ -10,7 +10,7 @@
 
 #define LORA_MAX_PAYLOAD 64U
 #define LORA_DIAG_QUEUE_DEPTH 8U
-#define LORA_DIAG_MAX_PAYLOAD 48U
+#define LORA_DIAG_MAX_PAYLOAD 64U
 
 typedef struct {
     uint8_t len;

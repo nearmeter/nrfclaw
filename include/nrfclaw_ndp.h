@@ -66,7 +66,9 @@ typedef enum {
     NRFCLAW_NDP_RADIO_GET_EXT      = 87,
     NRFCLAW_NDP_RADIO_SET_EXT      = 88,
     /* B4.1 physical-NUS-only NinaLink autonomous lab uplink. */
-    NRFCLAW_NDP_NINALINK_LAB       = 89
+    NRFCLAW_NDP_NINALINK_LAB       = 89,
+    /* B4.2 physical-NUS bridge control / validated RX queue. */
+    NRFCLAW_NDP_NINALINK_BRIDGE    = 90
 } nrfclaw_ndp_opcode_t;
 
 /* Stable NDP v1 status values. */

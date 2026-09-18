@@ -389,6 +389,7 @@ NDP_LORA_DIAG_RX         = 0x56  # r3.8.16b1l physical NUS only
 NDP_RADIO_GET_EXT         = 0x57  # r3.8.18 extended persisted radio profile
 NDP_RADIO_SET_EXT         = 0x58  # r3.8.18 extended persisted radio profile
 NDP_NINALINK_LAB          = 0x59  # B4.1 physical NUS lab uplink
+NDP_NINALINK_BRIDGE       = 0x5A  # B4.2 validated bridge RX
 
 NDP_SENSOR_BATTERY       = 1
 NDP_SENSOR_HALL          = 2
@@ -429,8 +430,10 @@ NINALINK_CAPS = {
     0x0301: ("hall_state", 0, ""),
     0x0302: ("counter", 0, "count"),
     0x0303: ("quadrature_position", 0, "count"),
+    0x0304: ("pulse_frequency", -3, "Hz"),
     0x0400: ("presence", 0, ""),
     0x0401: ("tracking_active", 0, ""),
+    0x0503: ("energy", -3, "Wh"),
 }
 
 def ninalink_crc16(data: bytes) -> int:
@@ -2834,11 +2837,208 @@ class NRFClawClient:
         print("RAM-only mode; stops on reboot or ninalink-tx-stop.")
         return s
 
+    async def ninalink_tx_max(self):
+        p = await self.ndp_command(NDP_NINALINK_LAB, b"\x03")
+        s = self._decode_ninalink_lab_status(p)
+        print(
+            f"NinaLink 64-byte CAP_REPORT submitted: "
+            f"node=0x{s['node_id']:08X}, "
+            f"next_seq={s['next_sequence']}, "
+            f"entries={s['last_entry_count']}, "
+            f"len={s['last_frame_length']}"
+        )
+        if s["last_frame_length"] != 64 or s["last_entry_count"] != 6:
+            raise RuntimeError(
+                "Firmware did not report the expected 64-byte/6-entry frame"
+            )
+        return s
+
     async def ninalink_lab_stop(self):
         p = await self.ndp_command(NDP_NINALINK_LAB, b"\x02")
         s = self._decode_ninalink_lab_status(p)
         print("NinaLink lab TX stopped.")
         return s
+
+    def _decode_ninalink_bridge_status(self, p: bytes) -> dict:
+        if len(p) != 13:
+            raise RuntimeError(
+                f"Invalid NINALINK_BRIDGE status length: {len(p)}"
+            )
+        return {
+            "active": bool(p[0]),
+            "queued": p[1],
+            "received": int.from_bytes(p[2:4], "little"),
+            "valid": int.from_bytes(p[4:6], "little"),
+            "invalid": int.from_bytes(p[6:8], "little"),
+            "dropped": int.from_bytes(p[8:10], "little"),
+            "radio_dropped": int.from_bytes(p[10:12], "little"),
+            "last_error": p[12],
+        }
+
+    async def ninalink_bridge_status(self, quiet: bool = False):
+        p = await self.ndp_command(NDP_NINALINK_BRIDGE, b"\x00")
+        s = self._decode_ninalink_bridge_status(p)
+        if not quiet:
+            errors = {
+                0: "NONE",
+                1: "CORE",
+                2: "SEMANTIC",
+                3: "RADIO_STOPPED",
+            }
+            print("=== NINALINK B4.2 BRIDGE ===")
+            print(f"Active:          {'yes' if s['active'] else 'no'}")
+            print(f"Queued:          {s['queued']}")
+            print(f"RF received:     {s['received']}")
+            print(f"NinaLink valid:  {s['valid']}")
+            print(f"NinaLink invalid:{s['invalid']:>5}")
+            print(f"Bridge dropped:  {s['dropped']}")
+            print(f"Radio dropped:   {s['radio_dropped']}")
+            print(
+                f"Last error:      "
+                f"{errors.get(s['last_error'], s['last_error'])}"
+            )
+        return s
+
+    async def ninalink_bridge_start(self):
+        await self.ndp_command(NDP_NINALINK_BRIDGE, b"\x01")
+        print("NinaLink B4.2 bridge RX started.")
+        print("Bridge remains active after this NUS connection closes.")
+        return await self.ninalink_bridge_status()
+
+    async def ninalink_bridge_stop(self):
+        await self.ndp_command(NDP_NINALINK_BRIDGE, b"\x02")
+        print("NinaLink B4.2 bridge RX stopped.")
+
+    async def ninalink_bridge_rx(self, timeout_s: float = 45.0):
+        import time
+
+        if timeout_s <= 0:
+            raise ValueError("timeout must be > 0 seconds")
+
+        status = await self.ninalink_bridge_status(quiet=True)
+        if not status["active"]:
+            raise RuntimeError(
+                "NinaLink bridge is not active; run ninalink-bridge-start first"
+            )
+
+        print(
+            f"NinaLink B4.2 bridge: draining validated frames "
+            f"({timeout_s:g}s window)"
+        )
+        print(
+            "Frames shown here already passed on-device B3.1 validation; "
+            "CAP_REPORT/CAP_EVENT also passed B3.2 parsing."
+        )
+
+        deadline = time.monotonic() + timeout_s
+        packet_count = 0
+        assembly = bytearray()
+        expected_len = None
+        packet_rssi_x2 = 0
+        packet_snr_x4 = 0
+
+        while True:
+            remain = deadline - time.monotonic()
+            if remain <= 0:
+                break
+            if not self.client.is_connected:
+                raise ConnectionError("NUS connection lost")
+
+            await asyncio.sleep(min(0.03, remain))
+            remain = deadline - time.monotonic()
+            if remain <= 0:
+                break
+
+            poll_timeout = min(1.0, max(0.20, remain))
+            try:
+                p = await asyncio.wait_for(
+                    self.ndp_command(
+                        NDP_NINALINK_BRIDGE, b"\x03", timeout=poll_timeout
+                    ),
+                    timeout=poll_timeout + 0.25,
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                continue
+
+            if not p or p[0] == 0:
+                continue
+            if p[0] == 2:
+                raise RuntimeError("NinaLink bridge stopped unexpectedly")
+            if p[0] != 1 or len(p) < 7:
+                raise RuntimeError(
+                    f"Invalid bridge chunk response: {p.hex()}"
+                )
+
+            total_len = p[1]
+            offset = p[2]
+            rssi_x2 = int.from_bytes(p[3:5], "little", signed=True)
+            snr_x4 = int.from_bytes(p[5:7], "little", signed=True)
+            chunk = p[7:]
+
+            if total_len < 15 or total_len > 64:
+                raise RuntimeError(
+                    f"Invalid validated frame length: {total_len}"
+                )
+
+            if offset == 0:
+                assembly = bytearray()
+                expected_len = total_len
+                packet_rssi_x2 = rssi_x2
+                packet_snr_x4 = snr_x4
+            elif expected_len is None:
+                raise RuntimeError("Bridge continuation without packet start")
+
+            if total_len != expected_len:
+                raise RuntimeError("Bridge frame length changed during reassembly")
+            if offset != len(assembly):
+                raise RuntimeError(
+                    f"Bridge chunk offset mismatch: "
+                    f"got {offset}, expected {len(assembly)}"
+                )
+            if len(assembly) + len(chunk) > expected_len:
+                raise RuntimeError("Bridge chunk exceeds frame length")
+
+            assembly.extend(chunk)
+
+            if len(assembly) != expected_len:
+                continue
+
+            data = bytes(assembly)
+            packet_count += 1
+            elapsed = timeout_s - max(0.0, deadline - time.monotonic())
+
+            print(
+                f"[{packet_count:04d} +{elapsed:7.2f}s] "
+                f"VALIDATED len={len(data)} "
+                f"RSSI={packet_rssi_x2/2:.1f} dBm "
+                f"SNR={packet_snr_x4/4:.2f} dB"
+            )
+
+            nf = decode_ninalink(data)
+            tname = NINALINK_TYPE_NAMES.get(
+                nf["type"], f"0x{nf['type']:02X}"
+            )
+            print(
+                f"NinaLink v1 {tname} "
+                f"net=0x{nf['network_id']:04X} "
+                f"node=0x{nf['node_id']:08X} "
+                f"seq={nf['sequence']}"
+            )
+            for entry in nf["entries"]:
+                print("  " + format_ninalink_value(entry))
+
+            assembly = bytearray()
+            expected_len = None
+
+        final_status = await self.ninalink_bridge_status(quiet=True)
+        print(
+            f"NinaLink bridge window complete: {packet_count} frame(s); "
+            f"valid={final_status['valid']} "
+            f"invalid={final_status['invalid']} "
+            f"dropped={final_status['dropped']} "
+            f"radio_dropped={final_status['radio_dropped']}"
+        )
+        return packet_count
 
     async def ninalink_rx(self, timeout_s: float = 45.0):
         import time
@@ -5433,6 +5633,21 @@ async def main_async(args):
         elif args.action == "ninalink-tx-stop":
             await nrf.ninalink_lab_stop()
 
+        elif args.action == "ninalink-tx-max":
+            await nrf.ninalink_tx_max()
+
+        elif args.action == "ninalink-bridge-start":
+            await nrf.ninalink_bridge_start()
+
+        elif args.action == "ninalink-bridge-status":
+            await nrf.ninalink_bridge_status()
+
+        elif args.action == "ninalink-bridge-rx":
+            await nrf.ninalink_bridge_rx(args.timeout)
+
+        elif args.action == "ninalink-bridge-stop":
+            await nrf.ninalink_bridge_stop()
+
         elif args.action == "lora-rx-cancel":
             await nrf.lora_rx_cancel()
 
@@ -5910,6 +6125,12 @@ def build_parser():
     nltx.add_argument("--every", type=int, default=15, metavar="SECONDS", help="period 2..300s; first TX after one full period")
     sub.add_parser("ninalink-tx-status", help="Show B4.1 autonomous NinaLink lab TX status")
     sub.add_parser("ninalink-tx-stop", help="Stop B4.1 autonomous NinaLink lab TX")
+    sub.add_parser("ninalink-tx-max", help="B4.2 transmit one valid maximum 64-byte CAP_REPORT")
+    sub.add_parser("ninalink-bridge-start", help="B4.2 start continuous on-device validated NinaLink bridge RX")
+    sub.add_parser("ninalink-bridge-status", help="Show B4.2 NinaLink bridge counters/status")
+    nbrx = sub.add_parser("ninalink-bridge-rx", help="Drain B4.2 on-device validated NinaLink frames")
+    nbrx.add_argument("--timeout", type=float, default=45.0, help="validated bridge-drain window in seconds")
+    sub.add_parser("ninalink-bridge-stop", help="Stop B4.2 NinaLink bridge RX")
 
     ls = sub.add_parser("lora-set", help="Set the complete LLCC68 LoRa profile")
     ls.add_argument("--freq", type=int, required=True, help="RF frequency in Hz")

@@ -1,21 +1,25 @@
 #ifndef NRFCLAW_NINALINK_COMMAND_H
 #define NRFCLAW_NINALINK_COMMAND_H
 
-/*
- * NinaLink v1 application command ABI, frozen at B4.7.
- *
- * Keep these definitions in a dedicated shared header so bridge and node do
- * not depend on whether the base NinaLink message IDs are represented by an
- * enum or by preprocessor macros in a particular revision.
- */
+#ifndef NRFCLAW_NINALINK_MSG_COMMAND
 #define NRFCLAW_NINALINK_MSG_COMMAND         0x31U
+#endif
+#ifndef NRFCLAW_NINALINK_MSG_COMMAND_RESULT
 #define NRFCLAW_NINALINK_MSG_COMMAND_RESULT  0x32U
+#endif
 
-#define NRFCLAW_NINALINK_COMMAND_ECHO_U32    0x0001U
+#define NRFCLAW_NINALINK_COMMAND_ECHO_U32            0x0001U
+#define NRFCLAW_NINALINK_COMMAND_GET_NODE_INFO       0x0002U
+#define NRFCLAW_NINALINK_COMMAND_GET_TRACKING_STATE  0x0003U
 
 #define NRFCLAW_NINALINK_COMMAND_STATUS_OK           0U
 #define NRFCLAW_NINALINK_COMMAND_STATUS_UNSUPPORTED  1U
 #define NRFCLAW_NINALINK_COMMAND_STATUS_BAD_ARGS     2U
 #define NRFCLAW_NINALINK_COMMAND_STATUS_EXEC_FAILED  3U
+
+#define NRFCLAW_NINALINK_NODE_FEATURE_CAP_SET           0x01U
+#define NRFCLAW_NINALINK_NODE_FEATURE_RELIABLE_COMMAND  0x02U
+#define NRFCLAW_NINALINK_NODE_FEATURE_COMMAND_REGISTRY  0x04U
+#define NRFCLAW_NINALINK_NODE_FEATURE_TRACKING          0x08U
 
 #endif

@@ -58,6 +58,15 @@ static volatile bool m_tx_due;
 static bridge_tx_state_t m_tx_state;
 static bridge_tx_kind_t m_tx_kind;
 
+/*
+ * B4.8 recovery guard.
+ *
+ * A timed RX completion can leave the LLCC68 busy for a short interval after
+ * nrfclaw_lora_take_rx(). Do not permanently disable the bridge if the
+ * immediate continuous-RX rearm races that cleanup.
+ */
+static bool m_restart_pending;
+
 static bridge_queue_packet_t m_queue[NRFCLAW_NINALINK_BRIDGE_QUEUE_DEPTH];
 static uint8_t m_head;
 static uint8_t m_tail;
@@ -240,11 +249,24 @@ static bool queue_validated(const uint8_t *data,
 
 static bool restart_stream(void)
 {
-    if (!nrfclaw_lora_diag_stream_start()) {
-        m_last_error = NRFCLAW_NINALINK_BRIDGE_ERR_ACK_RESTART;
-        m_active = false;
-        return false;
+    if (nrfclaw_lora_diag_stream_active()) {
+        m_restart_pending = false;
+        return true;
     }
+
+    if (!nrfclaw_lora_idle()) {
+        m_restart_pending = true;
+        return true;
+    }
+
+    if (nrfclaw_lora_diag_stream_start()) {
+        m_restart_pending = false;
+        m_last_error = NRFCLAW_NINALINK_BRIDGE_ERR_NONE;
+        return true;
+    }
+
+    m_last_error = NRFCLAW_NINALINK_BRIDGE_ERR_ACK_RESTART;
+    m_restart_pending = true;
     return true;
 }
 
@@ -506,6 +528,7 @@ bool nrfclaw_ninalink_bridge_start(void)
     m_tx_state = BRIDGE_TX_IDLE;
     m_tx_kind = BRIDGE_TX_KIND_NONE;
     m_tx_due = false;
+    m_restart_pending = false;
 
     memset(&m_app, 0, sizeof(m_app));
     m_app.state = NRFCLAW_NINALINK_APP_DL_IDLE;
@@ -541,6 +564,7 @@ void nrfclaw_ninalink_bridge_stop(void)
     m_tx_state = BRIDGE_TX_IDLE;
     m_tx_kind = BRIDGE_TX_KIND_NONE;
     m_tx_due = false;
+    m_restart_pending = false;
     reset_queue();
 }
 
@@ -635,6 +659,29 @@ void nrfclaw_ninalink_bridge_process(void)
 
     if (!m_active)
         return;
+
+    /*
+     * Complete a deferred continuous-RX rearm before processing application
+     * traffic. This closes the RX_DONE -> stream-start race that can strand
+     * the bridge with a pending command and Sent=0.
+     */
+    if (m_restart_pending) {
+        if (nrfclaw_lora_diag_stream_active()) {
+            m_restart_pending = false;
+            m_last_error = NRFCLAW_NINALINK_BRIDGE_ERR_NONE;
+        } else {
+            if (!nrfclaw_lora_idle())
+                return;
+
+            if (!nrfclaw_lora_diag_stream_start()) {
+                m_last_error = NRFCLAW_NINALINK_BRIDGE_ERR_ACK_RESTART;
+                return;
+            }
+
+            m_restart_pending = false;
+            m_last_error = NRFCLAW_NINALINK_BRIDGE_ERR_NONE;
+        }
+    }
 
     if (m_tx_state == BRIDGE_TX_DELAY) {
         if (!m_tx_due)

@@ -9,6 +9,7 @@
 #include "nrfclaw_ninalink.h"
 #include "nrfclaw_ninalink_msg.h"
 #include "nrfclaw_ninalink_command.h"
+#include "nrfclaw_ninalink_command_registry.h"
 #include "nrfclaw_tracking.h"
 
 #include <string.h>
@@ -503,18 +504,18 @@ static uint8_t execute_command(uint16_t command_id,
                                uint8_t *result,
                                uint8_t *result_len)
 {
-    *result_len = 0U;
+    nrfclaw_ninalink_command_context_t context;
 
-    if (command_id == COMMAND_ECHO_U32) {
-        if (arg_len != 4U)
-            return NRFCLAW_NINALINK_COMMAND_BAD_ARGS;
+    context.node_id = NRF_FICR->DEVICEID[0];
+    context.tracking_active = nrfclaw_tracking_active();
 
-        memcpy(result, args, 4U);
-        *result_len = 4U;
-        return NRFCLAW_NINALINK_COMMAND_OK;
-    }
-
-    return NRFCLAW_NINALINK_COMMAND_UNSUPPORTED;
+    return nrfclaw_ninalink_command_registry_execute(
+        &context,
+        command_id,
+        args,
+        arg_len,
+        result,
+        result_len);
 }
 
 static bool accept_command(const uint8_t *wire, uint8_t len)
@@ -582,7 +583,9 @@ static bool accept_command(const uint8_t *wire, uint8_t len)
         m_cmd_last_result = result;
         m_cmd_last_result_len = result_len;
         memcpy(m_cmd_last_result_data, result_data, result_len);
-        m_cmd_executed_count++;
+        if (result != NRFCLAW_NINALINK_COMMAND_UNSUPPORTED &&
+            result != NRFCLAW_NINALINK_COMMAND_BAD_ARGS)
+            m_cmd_executed_count++;
     }
 
     build_command_result(

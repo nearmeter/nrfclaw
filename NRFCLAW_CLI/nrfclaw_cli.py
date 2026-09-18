@@ -3175,6 +3175,36 @@ class NRFClawClient:
         print(f"Result drops:     {s['result_drop_count']}")
         return s
 
+    async def ninalink_command_node_info(self, node_id):
+        return await self.ninalink_command(node_id, 0x0002, "")
+
+    async def ninalink_command_tracking_state(self, node_id):
+        return await self.ninalink_command(node_id, 0x0003, "")
+
+    def _print_ninalink_known_command_result(self, command_id, data):
+        if command_id == 0x0001 and len(data) == 4:
+            print(
+                f"ECHO token:      "
+                f"0x{int.from_bytes(data, 'little'):08X}"
+            )
+            return
+
+        if command_id == 0x0002 and len(data) == 8:
+            flags = data[3]
+            node_id = int.from_bytes(data[4:8], "little")
+            print(f"NinaLink version: {data[0]}")
+            print(f"Max RF frame:     {data[1]} bytes")
+            print(f"Command count:    {data[2]}")
+            print(f"Feature flags:    0x{flags:02X}")
+            print(f"Reported node:    0x{node_id:08X}")
+            return
+
+        if command_id == 0x0003 and len(data) == 1:
+            print(
+                f"Tracking active:  "
+                f"{'yes' if data[0] else 'no'}"
+            )
+
     async def _ninalink_command_result_chunks(self, opcode, action, total_len):
         data = bytearray()
         off = 0
@@ -3246,7 +3276,7 @@ class NRFClawClient:
                 NDP_NINALINK_BRIDGE, 10, s["result_len"]
             )
         s["result_data"] = data
-        print("=== NINALINK B4.7 COMMAND DOWNLINK ===")
+        print("=== NINALINK COMMAND DOWNLINK ===")
         print(f"Pending:         {'yes' if s['pending'] else 'no'}")
         print(f"Target node:     0x{s['target_node']:08X}")
         print(f"Command seq:     {s['command_seq']}")
@@ -3259,8 +3289,9 @@ class NRFClawClient:
         print(f"Result length:   {s['result_len']}")
         if data:
             print(f"Result data:     {data.hex()}")
-            if s["command_id"] == 1 and len(data) == 4:
-                print(f"ECHO token:      0x{int.from_bytes(data, 'little'):08X}")
+            self._print_ninalink_known_command_result(
+                s["command_id"], data
+            )
         return s
 
     async def ninalink_node_command_status(self):
@@ -3286,7 +3317,7 @@ class NRFClawClient:
             "duplicate_count": int.from_bytes(p[9:11], "little"),
             "result_data": data,
         }
-        print("=== NINALINK B4.7 NODE COMMAND ===")
+        print("=== NINALINK NODE COMMAND ===")
         print(f"Command seen:    {'yes' if s['valid'] else 'no'}")
         print(f"Command seq:     {s['sequence']}")
         print(f"Command ID:      0x{s['command_id']:04X}")
@@ -3296,8 +3327,9 @@ class NRFClawClient:
         print(f"Result length:   {s['result_len']}")
         if data:
             print(f"Result data:     {data.hex()}")
-            if s["command_id"] == 1 and len(data) == 4:
-                print(f"ECHO token:      0x{int.from_bytes(data, 'little'):08X}")
+            self._print_ninalink_known_command_result(
+                s["command_id"], data
+            )
         return s
 
     async def ninalink_node_drop_next_command_result(self):
@@ -6150,6 +6182,12 @@ async def main_async(args):
         elif args.action == "ninalink-node-drop-next-command-result":
             await nrf.ninalink_node_drop_next_command_result()
 
+        elif args.action == "ninalink-command-node-info":
+            await nrf.ninalink_command_node_info(args.node)
+
+        elif args.action == "ninalink-command-tracking-state":
+            await nrf.ninalink_command_tracking_state(args.node)
+
         elif args.action == "lora-rx-cancel":
             await nrf.lora_rx_cancel()
 
@@ -6662,7 +6700,11 @@ def build_parser():
     necho.add_argument("--token", type=lambda x: int(x, 0), required=True, help="u32 echo token")
     sub.add_parser("ninalink-command-status", help="Show B4.7 bridge COMMAND state/result")
     sub.add_parser("ninalink-node-command-status", help="Show B4.7 last COMMAND executed by node")
-    sub.add_parser("ninalink-node-drop-next-command-result", help="B4.7 suppress next COMMAND result once")
+    sub.add_parser("ninalink-node-drop-next-command-result", help="B4.7/B4.8 suppress next COMMAND result once")
+    ninfo = sub.add_parser("ninalink-command-node-info", help="B4.8 queue GET_NODE_INFO")
+    ninfo.add_argument("--node", type=lambda x: int(x, 0), required=True, help="target node id")
+    ntrack = sub.add_parser("ninalink-command-tracking-state", help="B4.8 queue GET_TRACKING_STATE")
+    ntrack.add_argument("--node", type=lambda x: int(x, 0), required=True, help="target node id")
 
     ls = sub.add_parser("lora-set", help="Set the complete LLCC68 LoRa profile")
     ls.add_argument("--freq", type=int, required=True, help="RF frequency in Hz")

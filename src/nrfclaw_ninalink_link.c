@@ -8,6 +8,7 @@
 #include "nrfclaw_lora.h"
 #include "nrfclaw_ninalink.h"
 #include "nrfclaw_ninalink_msg.h"
+#include "nrfclaw_tracking.h"
 
 #include <string.h>
 
@@ -16,6 +17,12 @@
 #define LINK_ACK_MAX_WINDOW_MS  4000U
 #define LINK_MAX_ATTEMPTS       5U
 #define LINK_MAX_BACKOFF_MS     4000U
+
+#define APP_CAP_TRACKING_ACTIVE 0x0401U
+#define APP_TYPE_BOOL           0x01U
+#define APP_CAP_SET_PAYLOAD_LEN 7U
+#define APP_CAP_SET_FRAME_LEN   22U
+#define APP_ACK_FRAME_LEN       18U
 
 APP_TIMER_DEF(m_retry_timer);
 
@@ -37,6 +44,79 @@ static uint16_t m_timeout_total;
 static uint16_t m_retry_total;
 
 static nrfclaw_ninalink_link_status_t m_status;
+
+/* B4.5 application-downlink replay protection/result cache. */
+static bool m_app_last_valid;
+static uint16_t m_app_last_sequence;
+static uint8_t m_app_last_result;
+static uint16_t m_app_applied_count;
+static uint16_t m_app_duplicate_count;
+static uint8_t m_app_result_wire[APP_ACK_FRAME_LEN];
+
+static uint16_t get_u16_le(const uint8_t *p)
+{
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static uint32_t get_u32_le(const uint8_t *p)
+{
+    return (uint32_t)p[0] |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static void put_u16_le(uint8_t *p, uint16_t v)
+{
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+}
+
+static void put_u32_le(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
+}
+
+static uint16_t crc16_ccitt_false(const uint8_t *data, uint8_t len)
+{
+    uint16_t crc = 0xFFFFU;
+    uint8_t i;
+
+    while (len--) {
+        crc ^= (uint16_t)(*data++) << 8;
+        for (i = 0U; i < 8U; i++) {
+            if (crc & 0x8000U)
+                crc = (uint16_t)((crc << 1) ^ 0x1021U);
+            else
+                crc <<= 1;
+        }
+    }
+    return crc;
+}
+
+static void build_result_ack(uint16_t network_id,
+                             uint16_t command_seq,
+                             uint8_t result)
+{
+    uint16_t crc;
+
+    memset(m_app_result_wire, 0, sizeof(m_app_result_wire));
+    m_app_result_wire[0] = 0x4EU;
+    m_app_result_wire[1] = 0x01U;
+    m_app_result_wire[2] = 0x00U;
+    m_app_result_wire[3] = NRFCLAW_NINALINK_MSG_ACK;
+    put_u16_le(&m_app_result_wire[4], network_id);
+    m_app_result_wire[6] = 3U;
+    put_u32_le(&m_app_result_wire[7], NRF_FICR->DEVICEID[0]);
+    put_u16_le(&m_app_result_wire[11], command_seq);
+    put_u16_le(&m_app_result_wire[13], command_seq);
+    m_app_result_wire[15] = result;
+    crc = crc16_ccitt_false(m_app_result_wire, 16U);
+    put_u16_le(&m_app_result_wire[16], crc);
+}
 
 static void retry_timer_handler(void *context)
 {
@@ -145,15 +225,6 @@ static bool submit_attempt(bool retry)
 
     m_status.state = NRFCLAW_NINALINK_LINK_WAIT_TX;
     m_status.result = NRFCLAW_NINALINK_LINK_RESULT_NONE;
-
-    SEGGER_RTT_printf(
-        0,
-        "NINALINK B4.4 NODE: TX seq=%u attempt=%u/%u retry=%u\r\n",
-        (unsigned)m_pending_sequence,
-        (unsigned)m_status.attempts,
-        (unsigned)m_status.max_attempts,
-        retry ? 1U : 0U);
-
     return true;
 }
 
@@ -189,14 +260,6 @@ static bool schedule_retry(void)
     }
 
     m_status.state = NRFCLAW_NINALINK_LINK_BACKOFF;
-
-    SEGGER_RTT_printf(
-        0,
-        "NINALINK B4.4 NODE: retry seq=%u backoff=%lu ms next_attempt=%u\r\n",
-        (unsigned)m_pending_sequence,
-        (unsigned long)delay,
-        (unsigned)(m_status.attempts + 1U));
-
     return true;
 }
 
@@ -259,7 +322,7 @@ bool nrfclaw_ninalink_link_start(uint16_t ack_window_ms)
     return nrfclaw_ninalink_link_start_reliable(ack_window_ms, 1U, 0U);
 }
 
-static bool accept_ack(const uint8_t *wire, uint8_t len)
+static bool accept_normal_ack(const uint8_t *wire, uint8_t len)
 {
     nrfclaw_ninalink_frame_t frame;
     uint16_t network_id;
@@ -268,17 +331,110 @@ static bool accept_ack(const uint8_t *wire, uint8_t len)
     if (nrfclaw_ninalink_decode(wire, len, &frame) != NRFCLAW_NINALINK_OK)
         return false;
 
-    if (len != 18U ||
+    if (len != APP_ACK_FRAME_LEN ||
         wire[3] != NRFCLAW_NINALINK_MSG_ACK ||
         wire[6] != 3U)
         return false;
 
-    network_id = (uint16_t)wire[4] | ((uint16_t)wire[5] << 8);
-    ack_seq = (uint16_t)wire[13] | ((uint16_t)wire[14] << 8);
+    network_id = get_u16_le(&wire[4]);
+    ack_seq = get_u16_le(&wire[13]);
 
     return network_id == m_pending_network_id &&
            ack_seq == m_pending_sequence &&
            wire[15] == 0U;
+}
+
+static uint8_t apply_cap_set(uint16_t cap_id,
+                             uint8_t channel,
+                             uint8_t type,
+                             uint8_t value)
+{
+    if (cap_id != APP_CAP_TRACKING_ACTIVE || channel != 0U)
+        return NRFCLAW_NINALINK_APP_UNSUPPORTED_CAP;
+
+    if (type != APP_TYPE_BOOL)
+        return NRFCLAW_NINALINK_APP_BAD_TYPE;
+
+    if (value > 1U)
+        return NRFCLAW_NINALINK_APP_BAD_VALUE;
+
+    if (value == 0U) {
+        nrfclaw_tracking_stop();
+        return nrfclaw_tracking_active()
+            ? NRFCLAW_NINALINK_APP_APPLY_FAILED
+            : NRFCLAW_NINALINK_APP_OK;
+    }
+
+    if (nrfclaw_tracking_active())
+        return NRFCLAW_NINALINK_APP_OK;
+
+    return nrfclaw_tracking_start() == NRFCLAW_TRACKING_OK
+        ? NRFCLAW_NINALINK_APP_OK
+        : NRFCLAW_NINALINK_APP_APPLY_FAILED;
+}
+
+static bool accept_cap_set(const uint8_t *wire, uint8_t len)
+{
+    nrfclaw_ninalink_frame_t frame;
+    uint16_t network_id;
+    uint32_t target_node;
+    uint16_t command_seq;
+    uint16_t reply_to_seq;
+    uint16_t cap_id;
+    uint8_t channel;
+    uint8_t type;
+    uint8_t value;
+    uint8_t result;
+
+    if (len != APP_CAP_SET_FRAME_LEN)
+        return false;
+
+    if (nrfclaw_ninalink_decode(wire, len, &frame) != NRFCLAW_NINALINK_OK)
+        return false;
+
+    if (wire[3] != NRFCLAW_NINALINK_MSG_CAP_SET ||
+        wire[6] != APP_CAP_SET_PAYLOAD_LEN)
+        return false;
+
+    network_id = get_u16_le(&wire[4]);
+    target_node = get_u32_le(&wire[7]);
+    command_seq = get_u16_le(&wire[11]);
+    reply_to_seq = get_u16_le(&wire[13]);
+
+    if (network_id != m_pending_network_id ||
+        target_node != NRF_FICR->DEVICEID[0] ||
+        reply_to_seq != m_pending_sequence)
+        return false;
+
+    cap_id = get_u16_le(&wire[15]);
+    channel = wire[17];
+    type = wire[18];
+    value = wire[19];
+
+    if (m_app_last_valid && command_seq == m_app_last_sequence) {
+        result = m_app_last_result;
+        m_app_duplicate_count++;
+    } else {
+        result = apply_cap_set(cap_id, channel, type, value);
+        m_app_last_valid = true;
+        m_app_last_sequence = command_seq;
+        m_app_last_result = result;
+        m_app_applied_count++;
+    }
+
+    build_result_ack(network_id, command_seq, result);
+
+    SEGGER_RTT_printf(
+        0,
+        "NINALINK B4.5 NODE: CAP_SET seq=%u reply_to=%u cap=0x%04X value=%u result=%u dup=%u\r\n",
+        (unsigned)command_seq,
+        (unsigned)reply_to_seq,
+        (unsigned)cap_id,
+        (unsigned)value,
+        (unsigned)result,
+        (unsigned)m_app_duplicate_count);
+
+    return true;
 }
 
 void nrfclaw_ninalink_link_process(void)
@@ -335,10 +491,20 @@ void nrfclaw_ninalink_link_process(void)
                 m_status.ack_snr_x4 = snr;
             }
 
-            if (accept_ack(wire, len)) {
+            if (accept_normal_ack(wire, len)) {
                 m_acked_total++;
                 set_done(NRFCLAW_NINALINK_LINK_RESULT_ACKED);
                 m_started = false;
+                return;
+            }
+
+            /*
+             * CAP_SET carries reply_to_seq, so receiving a valid command is
+             * also proof that the bridge received this uplink. The node sends
+             * an application-result ACK for the command sequence.
+             */
+            if (accept_cap_set(wire, len)) {
+                m_status.state = NRFCLAW_NINALINK_LINK_APP_RESULT_ARM;
                 return;
             }
 
@@ -359,6 +525,32 @@ void nrfclaw_ninalink_link_process(void)
             set_done(NRFCLAW_NINALINK_LINK_RESULT_TIMEOUT);
             m_started = false;
         }
+        return;
+    }
+
+    if (m_status.state == NRFCLAW_NINALINK_LINK_APP_RESULT_ARM) {
+        if (!nrfclaw_lora_idle())
+            return;
+
+        if (!nrfclaw_lora_send_async(
+                m_app_result_wire,
+                (uint8_t)sizeof(m_app_result_wire))) {
+            set_done(NRFCLAW_NINALINK_LINK_RESULT_TX_FAIL);
+            m_started = false;
+            return;
+        }
+
+        m_status.state = NRFCLAW_NINALINK_LINK_APP_RESULT_TX;
+        return;
+    }
+
+    if (m_status.state == NRFCLAW_NINALINK_LINK_APP_RESULT_TX) {
+        if (!nrfclaw_lora_idle())
+            return;
+
+        m_acked_total++;
+        set_done(NRFCLAW_NINALINK_LINK_RESULT_ACKED);
+        m_started = false;
     }
 }
 
@@ -369,4 +561,17 @@ void nrfclaw_ninalink_link_get_status(nrfclaw_ninalink_link_status_t *out)
 
     refresh_totals();
     *out = m_status;
+}
+
+void nrfclaw_ninalink_link_get_app_status(nrfclaw_ninalink_app_status_t *out)
+{
+    if (!out)
+        return;
+
+    out->valid = m_app_last_valid;
+    out->sequence = m_app_last_sequence;
+    out->result = m_app_last_result;
+    out->applied_count = m_app_applied_count;
+    out->duplicate_count = m_app_duplicate_count;
+    out->tracking_active = nrfclaw_tracking_active();
 }

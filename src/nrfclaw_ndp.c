@@ -749,11 +749,13 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
         return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
       case NDP_NINALINK_BRIDGE: {
         nrfclaw_ninalink_bridge_status_t bs;
+        nrfclaw_ninalink_app_dl_status_t as;
 
         if(enforce_auth) return reply(op,seq,NDP_FORBIDDEN,0,0,out,ol);
-        if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+        if(n<1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
 
         if(p[0]==0U) {
+            if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
             nrfclaw_ninalink_bridge_get_status(&bs);
             r[0]=bs.active?1U:0U;
             r[1]=bs.queued;
@@ -768,6 +770,7 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
         }
 
         if(p[0]==1U) {
+            if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
             memset(&m_ninalink_bridge_chunk,0,sizeof(m_ninalink_bridge_chunk));
             return reply(op,seq,
                          nrfclaw_ninalink_bridge_start()?NDP_OK:NDP_BUSY,
@@ -775,12 +778,14 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
         }
 
         if(p[0]==2U) {
+            if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
             memset(&m_ninalink_bridge_chunk,0,sizeof(m_ninalink_bridge_chunk));
             nrfclaw_ninalink_bridge_stop();
             return reply(op,seq,NDP_OK,0,0,out,ol);
         }
 
         if(p[0]==3U) {
+            if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
             if(!m_ninalink_bridge_chunk.active) {
                 nrfclaw_ninalink_bridge_packet_t packet;
                 if(nrfclaw_ninalink_bridge_take(&packet)) {
@@ -819,6 +824,7 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
         }
 
         if(p[0]==4U) {
+            if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
             nrfclaw_ninalink_bridge_get_status(&bs);
             r[0]=(uint8_t)bs.duplicates;r[1]=(uint8_t)(bs.duplicates>>8);
             r[2]=(uint8_t)bs.ack_sent;r[3]=(uint8_t)(bs.ack_sent>>8);
@@ -829,8 +835,35 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
         }
 
         if(p[0]==5U) {
+            if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
             nrfclaw_ninalink_bridge_drop_next_ack();
             return reply(op,seq,NDP_OK,0,0,out,ol);
+        }
+
+        if(p[0]==6U) {
+            uint32_t node;
+            bool active;
+            if(n!=6U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            memcpy(&node,&p[1],4);
+            active=p[5]?true:false;
+            if(!nrfclaw_ninalink_bridge_queue_tracking(node,active))
+                return reply(op,seq,NDP_BUSY,0,0,out,ol);
+            return reply(op,seq,NDP_OK,0,0,out,ol);
+        }
+
+        if(p[0]==7U) {
+            if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            nrfclaw_ninalink_bridge_get_app_status(&as);
+            r[0]=as.pending?1U:0U;
+            memcpy(&r[1],&as.target_node,4);
+            r[5]=(uint8_t)as.command_seq;r[6]=(uint8_t)(as.command_seq>>8);
+            r[7]=as.requested_value?1U:0U;
+            r[8]=as.state;
+            r[9]=as.result;
+            r[10]=(uint8_t)as.sent_count;r[11]=(uint8_t)(as.sent_count>>8);
+            r[12]=(uint8_t)as.completed_count;r[13]=(uint8_t)(as.completed_count>>8);
+            r[14]=as.timeout_count;
+            return reply(op,seq,NDP_OK,r,15,out,ol);
         }
 
         return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
@@ -838,6 +871,7 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
 
       case NDP_NINALINK_LINK: {
         nrfclaw_ninalink_link_status_t ls;
+        nrfclaw_ninalink_app_status_t aps;
 
         if(enforce_auth) return reply(op,seq,NDP_FORBIDDEN,0,0,out,ol);
         if(n<1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
@@ -896,6 +930,18 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
             r[6]=(uint8_t)ls.base_backoff_ms;r[7]=(uint8_t)(ls.base_backoff_ms>>8);
             r[8]=(uint8_t)ls.last_backoff_ms;r[9]=(uint8_t)(ls.last_backoff_ms>>8);
             return reply(op,seq,NDP_OK,r,10,out,ol);
+        }
+
+        if(p[0]==3U) {
+            if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            nrfclaw_ninalink_link_get_app_status(&aps);
+            r[0]=aps.valid?1U:0U;
+            r[1]=(uint8_t)aps.sequence;r[2]=(uint8_t)(aps.sequence>>8);
+            r[3]=aps.result;
+            r[4]=(uint8_t)aps.applied_count;r[5]=(uint8_t)(aps.applied_count>>8);
+            r[6]=(uint8_t)aps.duplicate_count;r[7]=(uint8_t)(aps.duplicate_count>>8);
+            r[8]=aps.tracking_active?1U:0U;
+            return reply(op,seq,NDP_OK,r,9,out,ol);
         }
 
         return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);

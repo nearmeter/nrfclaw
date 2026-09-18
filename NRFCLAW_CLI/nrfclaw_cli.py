@@ -2881,7 +2881,7 @@ class NRFClawClient:
         p = await self.ndp_command(NDP_NINALINK_LINK, b"\x00")
         s = self._decode_ninalink_link_status(p)
         if not quiet:
-            states = {0:"IDLE",1:"WAIT_TX",2:"WAIT_ACK",3:"BACKOFF",4:"DONE"}
+            states = {0:"IDLE",1:"WAIT_TX",2:"WAIT_ACK",3:"BACKOFF",4:"DONE",5:"APP_RESULT_ARM",6:"APP_RESULT_TX"}
             results = {
                 0:"NONE",1:"ACKED",2:"TIMEOUT",3:"BAD_ACK",
                 4:"TX_FAIL",5:"RX_FAIL",6:"NO_DATA",7:"BUILD_FAIL",
@@ -2891,7 +2891,7 @@ class NRFClawClient:
             print(f"Result:          {results.get(s['result'], s['result'])}")
             print(f"Sequence:        {s['sequence']}")
             print(f"TX frame:        {s['tx_len']} bytes")
-            print(f"ACK frame:       {s['ack_len']} bytes")
+            print(f"RX/downlink frame:{s['ack_len']:>4} bytes")
             if s["ack_len"]:
                 print(f"ACK RSSI:        {s['ack_rssi_x2']/2:.1f} dBm")
                 print(f"ACK SNR:         {s['ack_snr_x4']/4:.2f} dB")
@@ -3064,6 +3064,90 @@ class NRFClawClient:
             "Bridge armed: the next unique ACK_REQ frame will be accepted "
             "but its first ACK will be suppressed."
         )
+
+    async def ninalink_bridge_app_status(self):
+        p = await self.ndp_command(NDP_NINALINK_BRIDGE, b"\x07")
+        if len(p) != 15:
+            raise RuntimeError(
+                f"Invalid bridge app status length: {len(p)}"
+            )
+        states = {0:"IDLE",1:"PENDING",2:"WAIT_RESULT",3:"DONE"}
+        results = {
+            0:"OK",1:"UNSUPPORTED_CAP",2:"BAD_TYPE",
+            3:"BAD_VALUE",4:"APPLY_FAILED",255:"NONE",
+        }
+        s = {
+            "pending": bool(p[0]),
+            "target_node": int.from_bytes(p[1:5], "little"),
+            "command_seq": int.from_bytes(p[5:7], "little"),
+            "requested_value": bool(p[7]),
+            "state": p[8],
+            "result": p[9],
+            "sent_count": int.from_bytes(p[10:12], "little"),
+            "completed_count": int.from_bytes(p[12:14], "little"),
+            "timeout_count": p[14],
+        }
+        print("=== NINALINK B4.5 APPLICATION DOWNLINK ===")
+        print(f"Pending:         {'yes' if s['pending'] else 'no'}")
+        print(f"Target node:     0x{s['target_node']:08X}")
+        print(f"Command seq:     {s['command_seq']}")
+        print(
+            f"tracking_active: "
+            f"{'ON' if s['requested_value'] else 'OFF'}"
+        )
+        print(f"State:           {states.get(s['state'], s['state'])}")
+        print(f"Result:          {results.get(s['result'], s['result'])}")
+        print(f"Sent total:      {s['sent_count']}")
+        print(f"Completed total: {s['completed_count']}")
+        print(f"Result timeouts: {s['timeout_count']}")
+        return s
+
+    async def ninalink_cap_set_tracking(self, node_id: int, value: str):
+        active = value.lower() == "on"
+        payload = (
+            b"\x06"
+            + struct.pack("<I", node_id)
+            + bytes([1 if active else 0])
+        )
+        await self.ndp_command(NDP_NINALINK_BRIDGE, payload)
+        print(
+            f"Queued CAP_SET tracking_active={'ON' if active else 'OFF'} "
+            f"for node 0x{node_id:08X}."
+        )
+        print(
+            "It will be delivered in the node's next ACK receive window."
+        )
+        return await self.ninalink_bridge_app_status()
+
+    async def ninalink_node_app_status(self):
+        p = await self.ndp_command(NDP_NINALINK_LINK, b"\x03")
+        if len(p) != 9:
+            raise RuntimeError(
+                f"Invalid node app status length: {len(p)}"
+            )
+        results = {
+            0:"OK",1:"UNSUPPORTED_CAP",2:"BAD_TYPE",
+            3:"BAD_VALUE",4:"APPLY_FAILED",
+        }
+        s = {
+            "valid": bool(p[0]),
+            "sequence": int.from_bytes(p[1:3], "little"),
+            "result": p[3],
+            "applied_count": int.from_bytes(p[4:6], "little"),
+            "duplicate_count": int.from_bytes(p[6:8], "little"),
+            "tracking_active": bool(p[8]),
+        }
+        print("=== NINALINK B4.5 NODE APPLICATION ===")
+        print(f"Command seen:    {'yes' if s['valid'] else 'no'}")
+        print(f"Command seq:     {s['sequence']}")
+        print(f"Result:          {results.get(s['result'], s['result'])}")
+        print(f"Applied total:   {s['applied_count']}")
+        print(f"Duplicate total: {s['duplicate_count']}")
+        print(
+            f"Tracking active: "
+            f"{'yes' if s['tracking_active'] else 'no'}"
+        )
+        return s
 
     def _decode_ninalink_bridge_status(self, p: bytes) -> dict:
         if len(p) != 15:
@@ -5877,6 +5961,15 @@ async def main_async(args):
         elif args.action == "ninalink-bridge-drop-next-ack":
             await nrf.ninalink_bridge_drop_next_ack()
 
+        elif args.action == "ninalink-cap-set-tracking":
+            await nrf.ninalink_cap_set_tracking(args.node, args.value)
+
+        elif args.action == "ninalink-app-status":
+            await nrf.ninalink_bridge_app_status()
+
+        elif args.action == "ninalink-node-app-status":
+            await nrf.ninalink_node_app_status()
+
         elif args.action == "lora-rx-cancel":
             await nrf.lora_rx_cancel()
 
@@ -6373,6 +6466,11 @@ def build_parser():
     sub.add_parser("ninalink-link-reliability", help="Show B4.4 node retry/backoff counters")
     sub.add_parser("ninalink-bridge-reliability", help="Show B4.4 bridge duplicate/ACK counters")
     sub.add_parser("ninalink-bridge-drop-next-ack", help="B4.4 lab gate: suppress exactly the next first ACK")
+    nset = sub.add_parser("ninalink-cap-set-tracking", help="B4.5 queue tracking_active CAP_SET on the bridge")
+    nset.add_argument("--node", type=lambda x: int(x, 0), required=True, help="target node id, e.g. 0xAD64D423")
+    nset.add_argument("--value", choices=("on","off"), required=True, help="requested tracking_active value")
+    sub.add_parser("ninalink-app-status", help="Show B4.5 bridge application-downlink state")
+    sub.add_parser("ninalink-node-app-status", help="Show B4.5 last CAP_SET result on the node")
 
     ls = sub.add_parser("lora-set", help="Set the complete LLCC68 LoRa profile")
     ls.add_argument("--freq", type=int, required=True, help="RF frequency in Hz")

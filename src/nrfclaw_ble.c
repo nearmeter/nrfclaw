@@ -1528,6 +1528,20 @@ void nrfclaw_ble_programming_close(void)
 }
 */
 
+void nrfclaw_ble_programming_release(void)
+{
+    /*
+     * B5.5 handoff: stop authorizing new NUS work but keep the current link
+     * alive long enough for the command response.  When the CLI disconnects,
+     * the existing DISCONNECTED path sees programming_allowed=false and
+     * returns ownership to the Application/NDP plane.
+     */
+    m_programming_allowed = false;
+    m_session_connected_once = false;
+    stop_timer_safely(m_discovery_timer);
+    stop_timer_safely(m_idle_timer);
+}
+
 void nrfclaw_ble_programming_close(void)
 {
     ret_code_t err;

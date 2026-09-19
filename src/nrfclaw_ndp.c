@@ -20,7 +20,10 @@
 #include "nrfclaw_ninalink_auto_discovery.h"
 #include "nrfclaw_ninalink_state_cache.h"
 #include "nrfclaw_ninalink_external.h"
+#include "nrfclaw_ble.h"
+#include "nrfclaw_ninalink_external_subscription.h"
 #include "nrfclaw_ninalink_link.h"
+#include "nrfclaw_b55_gate.h"
 #include "nrfclaw_ninalink_capability_discovery.h"
 #include <string.h>
 
@@ -130,9 +133,12 @@ static bool auth_exempt_opcode(uint8_t op)
 
 static bool nus_owner_key_opcode(uint8_t op)
 {
-    return op == NDP_KEY_GENERATE || op == NDP_KEY_GET || op == NDP_KEY_STATUS ||
-           op == NDP_BLE_BOOT_CONTROL || op == NDP_BLE_BEACON_CONTROL ||
-           op == NDP_NINALINK_LAB || op == NDP_NINALINK_BRIDGE ||
+    return op == NDP_KEY_GENERATE ||
+           op == NDP_KEY_GET ||
+           op == NDP_KEY_STATUS ||
+           op == NDP_BLE_BOOT_CONTROL ||
+           op == NDP_BLE_BEACON_CONTROL ||
+           op == NDP_NINALINK_LAB ||
            op == NDP_NINALINK_LINK;
 }
 
@@ -323,6 +329,8 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
       case NDP_AUTH_LOGOUT:
         if(n!=0U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
         nrfclaw_ndp_access_on_disconnect();
+        /* B5.5 logout clears external subscription. */
+        nrfclaw_ninalink_external_subscription_reset();
         return reply(op,seq,NDP_OK,0,0,out,ol);
 
       case NDP_SENSOR_READ:
@@ -760,7 +768,17 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
         nrfclaw_ninalink_command_discovery_status_t ds;
         nrfclaw_ninalink_capability_discovery_status_t cds;
 
-        if(enforce_auth) return reply(op,seq,NDP_FORBIDDEN,0,0,out,ol);
+        /* B5.5 Application plane exposes only read-only/external selectors.
+
+         * Top-level NDP access control still requires CONTROL when provisioned.
+
+         * Bridge radio/test/clear operations remain physical-NUS-only. */
+
+        if(enforce_auth &&
+
+           (n<1U || p[0]<30U || p[0]>38U))
+
+            return reply(op,seq,NDP_FORBIDDEN,0,0,out,ol);
         if(n<1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
 
         if(p[0]==0U) {
@@ -1362,6 +1380,75 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
             r[3]=(uint8_t)xd54.scale10;r[4]=xd54.unit;r[5]=xd54.behavior_flags;
             return reply(op,seq,NDP_OK,r,6,out,ol);
         }
+        /* B5.5 External Change Notification / Subscription v1. */
+        if(p[0]==36U) {
+            nrfclaw_ninalink_change_status_t xs55;
+            if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            nrfclaw_ninalink_external_subscription_get_status(&xs55);
+            r[0]=xs55.schema_version;r[1]=xs55.mask;r[2]=xs55.pending_flags;
+            r[3]=(uint8_t)xs55.state_revision;
+            r[4]=(uint8_t)(xs55.state_revision>>8);
+            r[5]=(uint8_t)(xs55.state_revision>>16);
+            r[6]=(uint8_t)(xs55.state_revision>>24);
+            r[7]=(uint8_t)xs55.event_revision;
+            r[8]=(uint8_t)(xs55.event_revision>>8);
+            r[9]=(uint8_t)(xs55.event_revision>>16);
+            r[10]=(uint8_t)(xs55.event_revision>>24);
+            r[11]=(uint8_t)xs55.newest_event_id;
+            r[12]=(uint8_t)(xs55.newest_event_id>>8);
+            r[13]=(uint8_t)(xs55.newest_event_id>>16);
+            r[14]=(uint8_t)(xs55.newest_event_id>>24);
+            return reply(op,seq,NDP_OK,r,15,out,ol);
+        }
+
+        if(p[0]==37U) {
+            nrfclaw_ninalink_change_status_t xs55;
+            if(n!=2U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            if((p[1]&~NRFCLAW_NINALINK_CHANGE_ALL)!=0U)
+                return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+            nrfclaw_ninalink_external_subscription_set(p[1]);
+            nrfclaw_ninalink_external_subscription_get_status(&xs55);
+            r[0]=xs55.schema_version;r[1]=xs55.mask;r[2]=xs55.pending_flags;
+            r[3]=(uint8_t)xs55.state_revision;
+            r[4]=(uint8_t)(xs55.state_revision>>8);
+            r[5]=(uint8_t)(xs55.state_revision>>16);
+            r[6]=(uint8_t)(xs55.state_revision>>24);
+            r[7]=(uint8_t)xs55.event_revision;
+            r[8]=(uint8_t)(xs55.event_revision>>8);
+            r[9]=(uint8_t)(xs55.event_revision>>16);
+            r[10]=(uint8_t)(xs55.event_revision>>24);
+            r[11]=(uint8_t)xs55.newest_event_id;
+            r[12]=(uint8_t)(xs55.newest_event_id>>8);
+            r[13]=(uint8_t)(xs55.newest_event_id>>16);
+            r[14]=(uint8_t)(xs55.newest_event_id>>24);
+            return reply(op,seq,NDP_OK,r,15,out,ol);
+        }
+
+        if(p[0]==38U) {
+            nrfclaw_ninalink_change_stats_t st55;
+            if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            nrfclaw_ninalink_external_subscription_get_stats(&st55);
+            r[0]=(uint8_t)st55.change_revision;
+            r[1]=(uint8_t)(st55.change_revision>>8);
+            r[2]=(uint8_t)(st55.change_revision>>16);
+            r[3]=(uint8_t)(st55.change_revision>>24);
+            r[4]=(uint8_t)st55.notifications_sent;
+            r[5]=(uint8_t)(st55.notifications_sent>>8);
+            r[6]=(uint8_t)st55.coalesced;r[7]=(uint8_t)(st55.coalesced>>8);
+            r[8]=(uint8_t)st55.busy_retries;r[9]=(uint8_t)(st55.busy_retries>>8);
+            r[10]=(uint8_t)st55.disconnect_resets;r[11]=(uint8_t)(st55.disconnect_resets>>8);
+            r[12]=(uint8_t)st55.send_errors;r[13]=(uint8_t)(st55.send_errors>>8);
+            return reply(op,seq,NDP_OK,r,14,out,ol);
+        }
+
+        if(p[0]==39U) {
+            if(enforce_auth)
+                return reply(op,seq,NDP_FORBIDDEN,0,0,out,ol);
+            if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            nrfclaw_ble_programming_release();
+            return reply(op,seq,NDP_OK,0,0,out,ol);
+        }
+
 
         return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
       }
@@ -1672,6 +1759,43 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
             r[4]=(uint8_t)(session_id>>24);
             r[5]=(uint8_t)generation;
             r[6]=(uint8_t)(generation>>8);
+            return reply(op,seq,NDP_OK,r,7,out,ol);
+        }
+
+        /* B5.5 no-dual-BLE deferred hardware gate. */
+        if(p[0]==15U) {
+            nrfclaw_b55_gate_status_t gs;
+            if(enforce_auth)
+                return reply(op,seq,NDP_FORBIDDEN,0,0,out,ol);
+            if(n!=3U)
+                return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            if(!nrfclaw_b55_gate_arm(p[1],p[2]))
+                return reply(op,seq,NDP_BUSY,0,0,out,ol);
+            nrfclaw_b55_gate_get_status(&gs);
+            r[0]=gs.stage;
+            r[1]=gs.error;
+            r[2]=gs.state_result;
+            r[3]=gs.event_result;
+            r[4]=gs.state_sent?1U:0U;
+            r[5]=gs.event_sent?1U:0U;
+            r[6]=gs.armed?1U:0U;
+            return reply(op,seq,NDP_OK,r,7,out,ol);
+        }
+
+        if(p[0]==16U) {
+            nrfclaw_b55_gate_status_t gs;
+            if(enforce_auth)
+                return reply(op,seq,NDP_FORBIDDEN,0,0,out,ol);
+            if(n!=1U)
+                return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            nrfclaw_b55_gate_get_status(&gs);
+            r[0]=gs.stage;
+            r[1]=gs.error;
+            r[2]=gs.state_result;
+            r[3]=gs.event_result;
+            r[4]=gs.state_sent?1U:0U;
+            r[5]=gs.event_sent?1U:0U;
+            r[6]=gs.armed?1U:0U;
             return reply(op,seq,NDP_OK,r,7,out,ol);
         }
 

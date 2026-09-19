@@ -63,4 +63,7 @@ nrfclaw_ble_app_status_t nrfclaw_ble_app_send_raw(const uint8_t *data,
 void nrfclaw_ble_app_on_rx(const uint8_t *data, uint16_t len);
 bool nrfclaw_ble_app_last_frame(nrfclaw_app_frame_t *frame);
 
+
+uint32_t nrfclaw_ble_app_tx_generation(void);
+
 #endif

@@ -32,7 +32,9 @@
 #include "nrfclaw_ds18b20.h"
 #include "nrfclaw_ninalink_lab.h"
 #include "nrfclaw_ninalink_bridge.h"
+#include "nrfclaw_ninalink_external_subscription.h"
 #include "nrfclaw_ninalink_link.h"
+#include "nrfclaw_b55_gate.h"
 
 static void lora_dio_handler(nrf_drv_gpiote_pin_t pin,
                              nrf_gpiote_polarity_t action)
@@ -339,9 +341,16 @@ int main(void)
         nrfclaw_scheduler_process();
 
         nrfclaw_ninalink_lab_process();
-        nrfclaw_ninalink_link_process();
         nrfclaw_lora_process();
         nrfclaw_ninalink_bridge_process();
+
+        /*
+         * NinaLink low-power turnaround invariant:
+         * finish TX housekeeping before WAIT_TX evaluates radio idle.
+         * Otherwise the MCU may sleep before arming the ACK RX window.
+         */
+        nrfclaw_ninalink_link_process();
+        nrfclaw_b55_gate_process();
         nrfclaw_lora_profile_process();
 
         /*
@@ -363,6 +372,7 @@ int main(void)
 
         /* Pack 02 R2G: deferred/retried Application advertising restart. */
         nrfclaw_ble_app_process();
+        nrfclaw_ninalink_external_subscription_process();
 
         nrf_pwr_mgmt_run();
     }

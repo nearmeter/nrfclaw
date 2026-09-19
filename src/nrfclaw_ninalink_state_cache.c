@@ -27,11 +27,33 @@ static uint8_t m_event_count;
 static uint16_t m_event_ingested;
 static uint16_t m_event_dropped;
 static uint32_t m_event_next_id;
+static uint32_t m_state_revision;
+static uint32_t m_event_revision;
+static uint32_t m_change_revision;
 
 static uint16_t sat_inc16(uint16_t v)
 {
     return v == 0xFFFFU ? v : (uint16_t)(v + 1U);
 }
+
+static uint32_t revision_next(uint32_t value)
+{
+    value++;
+    return value == 0U ? 1U : value;
+}
+
+static void mark_state_changed(void)
+{
+    m_state_revision = revision_next(m_state_revision);
+    m_change_revision = revision_next(m_change_revision);
+}
+
+static void mark_event_changed(void)
+{
+    m_event_revision = revision_next(m_event_revision);
+    m_change_revision = revision_next(m_change_revision);
+}
+
 
 static bool sequence_newer(uint16_t candidate, uint16_t reference)
 {
@@ -153,6 +175,16 @@ static void push_event(uint32_t node_id,
 
 void nrfclaw_ninalink_state_cache_clear(void)
 {
+    bool had_state = false;
+    bool had_events = m_event_count != 0U;
+    uint8_t i;
+
+    for (i = 0U; i < NRFCLAW_NINALINK_STATE_CACHE_NODES; i++) {
+        if (m_nodes[i].pub.valid && m_nodes[i].pub.value_count != 0U) {
+            had_state = true;
+            break;
+        }
+    }
     memset(m_nodes, 0, sizeof(m_nodes));
     memset(m_event_history, 0, sizeof(m_event_history));
     m_touch_order = 0U;
@@ -164,6 +196,11 @@ void nrfclaw_ninalink_state_cache_clear(void)
     m_event_count = 0U;
     m_event_ingested = 0U;
     m_event_dropped = 0U;
+
+    if (had_state)
+        mark_state_changed();
+    if (had_events)
+        mark_event_changed();
 }
 
 bool nrfclaw_ninalink_state_cache_ingest_values_session(
@@ -179,6 +216,7 @@ bool nrfclaw_ninalink_state_cache_ingest_values_session(
     int found;
     uint8_t node_index;
     uint8_t i;
+    bool state_changed = false;
 
     if (node_id == 0U || node_id == 0xFFFFFFFFUL || !entries || entry_count == 0U)
         return false;
@@ -202,6 +240,8 @@ bool nrfclaw_ninalink_state_cache_ingest_values_session(
         if (!node->pub.session_valid) {
             /* First session observation establishes an explicit epoch. */
             if (node->pub.updates != 0U) {
+                if (node->pub.value_count != 0U)
+                    state_changed = true;
                 memset(node->values, 0, sizeof(node->values));
                 node->pub.value_count = 0U;
             }
@@ -210,6 +250,8 @@ bool nrfclaw_ninalink_state_cache_ingest_values_session(
             node->sequence_valid = false;
         } else if (node->pub.session_id != session_id) {
             /* A real node restart/session transition invalidates old state. */
+            if (node->pub.value_count != 0U)
+                state_changed = true;
             memset(node->values, 0, sizeof(node->values));
             node->pub.value_count = 0U;
             node->pub.session_id = session_id;
@@ -236,6 +278,7 @@ bool nrfclaw_ninalink_state_cache_ingest_values_session(
     if (message_type == NRFCLAW_NINALINK_MSG_CAP_EVENT) {
         for (i = 0U; i < entry_count; i++)
             push_event(node_id, sequence, &entries[i], now_s);
+        mark_event_changed();
         return true;
     }
 
@@ -255,6 +298,7 @@ bool nrfclaw_ninalink_state_cache_ingest_values_session(
             value_index = choose_value(node);
         }
         slot = &node->values[value_index];
+        state_changed = true;
         memset(&slot->pub, 0, sizeof(slot->pub));
         slot->pub.valid = true;
         slot->pub.capability_id = entries[i].capability_id;
@@ -275,6 +319,9 @@ bool nrfclaw_ninalink_state_cache_ingest_values_session(
         if (node->values[i].pub.valid)
             node->pub.value_count++;
     }
+    if (state_changed)
+        mark_state_changed();
+
     return true;
 }
 
@@ -475,6 +522,19 @@ bool nrfclaw_ninalink_event_history_get_after(
         if (event.event_id > cursor) { *out = event; return true; }
     }
     return false;
+}
+
+void nrfclaw_ninalink_state_cache_get_revisions(
+    uint32_t *state_revision,
+    uint32_t *event_revision,
+    uint32_t *change_revision)
+{
+    if (state_revision)
+        *state_revision = m_state_revision;
+    if (event_revision)
+        *event_revision = m_event_revision;
+    if (change_revision)
+        *change_revision = m_change_revision;
 }
 
 uint32_t nrfclaw_ninalink_state_cache_value_raw(

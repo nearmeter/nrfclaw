@@ -66,7 +66,9 @@ CORE_SRC := \
   src/nrfclaw_ninalink_auto_discovery.c \
   src/nrfclaw_ninalink_state_cache.c \
   src/nrfclaw_ninalink_external.c \
+  src/nrfclaw_ninalink_external_subscription.c \
   src/nrfclaw_ninalink_link.c \
+  src/nrfclaw_b55_gate.c \
   src/nrfclaw_ninalink_command_registry.c \
   src/nrfclaw_ninalink_command_discovery.c \
   src/nrfclaw_ninalink_capability_discovery.c \

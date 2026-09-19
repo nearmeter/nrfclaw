@@ -1273,8 +1273,13 @@ async def find_app_device(suffix: str, timeout: float, verbose: bool = False):
         if not identity_match:
             continue
 
-        # If BlueZ explicitly says this is NUS-only, do not steal the
-        # programming plane.  Missing UUIDs are accepted and proven by GATT.
+        # Plane name is authoritative. BlueZ may expose stale/cached GATT
+        # service UUIDs from the other plane for the same BLE address.
+        if name.upper().startswith("NRFCLAW(NUS)-"):
+            continue
+
+        # UUID-only fallback: reject a clearly NUS-only advertisement.
+        # If both UUIDs are present, the explicit advertised name above wins.
         if NUS_SERVICE.lower() in uuids and APP_SERVICE.lower() not in uuids:
             continue
 
@@ -1320,6 +1325,7 @@ class ApplicationNDPClient:
         self.access_key = access_key
         self.client = BleakClient(dev)
         self.response_queue = asyncio.Queue()
+        self.change_queue = asyncio.Queue()
         self._seq = 0
         self._notify_started = False
 
@@ -1387,7 +1393,75 @@ class ApplicationNDPClient:
             await asyncio.sleep(0.20)
 
     def _notify(self, _sender, data: bytearray):
-        self.response_queue.put_nowait(bytes(data))
+        raw = bytes(data)
+        if len(raw) == 20 and raw[0] == 0xE5 and raw[1] == 1:
+            self.change_queue.put_nowait(raw)
+            return
+        self.response_queue.put_nowait(raw)
+
+    @staticmethod
+    def _decode_b55_change(raw: bytes) -> dict:
+        if len(raw) != 20 or raw[0] != 0xE5 or raw[1] != 1:
+            raise RuntimeError("Invalid B5.5 change notification")
+        flags = raw[2]
+        return {
+            "schema": raw[1],
+            "flags": flags,
+            "state_changed": bool(flags & 0x01),
+            "event_changed": bool(flags & 0x02),
+            "mask": raw[3],
+            "state_revision": int.from_bytes(raw[4:8], "little"),
+            "event_revision": int.from_bytes(raw[8:12], "little"),
+            "newest_event_id": int.from_bytes(raw[12:16], "little"),
+            "change_revision": int.from_bytes(raw[16:20], "little"),
+        }
+
+    @staticmethod
+    def _decode_b55_status(p: bytes) -> dict:
+        if len(p) != 15:
+            raise RuntimeError(f"Invalid B5.5 status length: {len(p)}")
+        return {
+            "schema": p[0],
+            "mask": p[1],
+            "pending_flags": p[2],
+            "state_revision": int.from_bytes(p[3:7], "little"),
+            "event_revision": int.from_bytes(p[7:11], "little"),
+            "newest_event_id": int.from_bytes(p[11:15], "little"),
+        }
+
+    async def ninalink_change_status(self):
+        p = await self.ndp_command(NDP_NINALINK_BRIDGE, bytes([36]))
+        return self._decode_b55_status(p)
+
+    async def ninalink_change_subscribe(self, mask: int):
+        if mask < 0 or mask > 3:
+            raise ValueError("B5.5 subscription mask must be 0..3")
+        p = await self.ndp_command(
+            NDP_NINALINK_BRIDGE, bytes([37, mask])
+        )
+        return self._decode_b55_status(p)
+
+    async def ninalink_change_stats(self):
+        p = await self.ndp_command(NDP_NINALINK_BRIDGE, bytes([38]))
+        if len(p) != 14:
+            raise RuntimeError(f"Invalid B5.5 stats length: {len(p)}")
+        return {
+            "change_revision": int.from_bytes(p[0:4], "little"),
+            "notifications_sent": int.from_bytes(p[4:6], "little"),
+            "coalesced": int.from_bytes(p[6:8], "little"),
+            "busy_retries": int.from_bytes(p[8:10], "little"),
+            "disconnect_resets": int.from_bytes(p[10:12], "little"),
+            "send_errors": int.from_bytes(p[12:14], "little"),
+        }
+
+    async def ninalink_wait_change(self, timeout: float = 30.0):
+        try:
+            raw = await asyncio.wait_for(self.change_queue.get(), timeout)
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(
+                f"Timeout waiting B5.5 change notification ({timeout}s)"
+            ) from exc
+        return self._decode_b55_change(raw)
 
     async def ndp_command_raw(self, opcode: int, payload: bytes = b"", timeout: float = 5.0):
         if len(payload) > 16:
@@ -1754,33 +1828,39 @@ async def find_device(suffix: str, timeout: float):
             for u in ((getattr(adv, "service_uuids", None) or []) if adv is not None else [])
         }
 
-        name_match = name.upper() == wanted.upper()
+        upper_name = name.upper()
+        name_match = upper_name == wanted.upper()
         address_match = bool(suffix) and address_compact.endswith(suffix)
         nus_match = nus_uuid in uuids
+        app_match = APP_SERVICE.lower() in uuids
 
-        # Another nearby nRFClaw can advertise NUS too, so UUID alone cannot
-        # select a board. Conversely MAC alone cannot distinguish NDP from NUS.
-        if not (name_match or address_match):
-            return
-        if not (name_match or nus_match):
+        # Plane name is authoritative. The same BLE address can expose both
+        # GATT services and BlueZ can retain UUIDs across a plane handoff.
+        if upper_name.startswith("NRFCLAW(NDP)-"):
             return
 
-        score = 0
-        if nus_match:
-            score += 16
+        # Exact NUS name is the strongest possible match, regardless of stale
+        # UUID metadata.
         if name_match:
-            score += 8
-        if address_match:
-            score += 4
+            score = 100
+            if address_match:
+                score += 4
+            if score > best["score"]:
+                best["score"] = score
+                best["dev"] = dev
+            loop.call_soon_threadsafe(found_event.set)
+            return
 
+        # UUID fallback is allowed only for the requested board and only when
+        # the advertisement does not simultaneously identify the APP plane.
+        if not address_match or not nus_match or app_match:
+            return
+
+        score = 20
         if score > best["score"]:
             best["score"] = score
             best["dev"] = dev
-
-        # Exact name is authoritative.  NUS UUID + requested BLE suffix is
-        # also strong enough and avoids waiting for a later scan-response name.
-        if name_match or (nus_match and address_match):
-            loop.call_soon_threadsafe(found_event.set)
+        loop.call_soon_threadsafe(found_event.set)
 
     scanner = BleakScanner(consider)
     try:
@@ -3806,6 +3886,73 @@ class NRFClawClient:
 
         return s
 
+    @staticmethod
+    def _decode_b55_gate_status(p: bytes) -> dict:
+        if len(p) != 7:
+            raise RuntimeError(f"Invalid B5.5 deferred-gate status length: {len(p)}")
+        stages = {
+            0: "IDLE",
+            1: "WAIT_STATE",
+            2: "STATE_RUNNING",
+            3: "WAIT_EVENT",
+            4: "EVENT_RUNNING",
+            5: "DONE",
+            6: "ERROR",
+        }
+        errors = {
+            0: "NONE",
+            1: "TIMER_CREATE",
+            2: "TIMER_START",
+            3: "LINK_BUSY",
+            4: "STATE_START",
+            5: "STATE_RESULT",
+            6: "EVENT_START",
+            7: "EVENT_RESULT",
+        }
+        return {
+            "stage_id": p[0],
+            "stage": stages.get(p[0], f"UNKNOWN_{p[0]}"),
+            "error_id": p[1],
+            "error": errors.get(p[1], f"UNKNOWN_{p[1]}"),
+            "state_result": p[2],
+            "event_result": p[3],
+            "state_sent": bool(p[4]),
+            "event_sent": bool(p[5]),
+            "armed": bool(p[6]),
+        }
+
+    async def ninalink_b55_gate_arm(self, state_delay=25, event_gap=8):
+        if not (5 <= state_delay <= 60):
+            raise ValueError("--state-delay must be 5..60 seconds")
+        if not (2 <= event_gap <= 60):
+            raise ValueError("--event-gap must be 2..60 seconds")
+        p = await self.ndp_command(
+            NDP_NINALINK_LINK,
+            bytes([15, state_delay, event_gap]),
+        )
+        s = self._decode_b55_gate_status(p)
+        print("B5.5 no-dual-BLE node gate armed.")
+        print(f"STATE delay:      {state_delay} s")
+        print(f"EVENT gap:        {event_gap} s after STATE ACK")
+        print(f"Stage:            {s['stage']}")
+        return s
+
+    async def ninalink_b55_gate_status(self, json_output=False):
+        p = await self.ndp_command(NDP_NINALINK_LINK, bytes([16]))
+        s = self._decode_b55_gate_status(p)
+        if json_output:
+            print(json.dumps({"type": "b55_gate", **s}, sort_keys=True))
+        else:
+            print("=== NINALINK B5.5 NO-DUAL-BLE GATE ===")
+            print(f"Stage:            {s['stage']}")
+            print(f"Error:            {s['error']}")
+            print(f"STATE result:     {s['state_result']}")
+            print(f"EVENT result:     {s['event_result']}")
+            print(f"STATE sent:       {'yes' if s['state_sent'] else 'no'}")
+            print(f"EVENT sent:       {'yes' if s['event_sent'] else 'no'}")
+            print(f"Armed:            {'yes' if s['armed'] else 'no'}")
+        return s
+
     async def ninalink_session_status(self, quiet=False):
         p = await self.ndp_command(NDP_NINALINK_LINK, bytes([14]))
         if len(p) != 7:
@@ -4302,6 +4449,10 @@ class NRFClawClient:
             "last_error": p[12],
             "ack_sent": int.from_bytes(p[13:15], "little"),
         }
+
+    async def ninalink_bridge_handoff(self):
+        await self.ndp_command(NDP_NINALINK_BRIDGE, bytes([39]))
+        print("NinaLink bridge preserved; programming/NUS released to Application plane.")
 
     async def ninalink_bridge_status(self, quiet: bool = False):
         p = await self.ndp_command(NDP_NINALINK_BRIDGE, b"\x00")
@@ -6832,6 +6983,57 @@ async def firmware_upgrade(args):
     finally:
         await dfu.close()
 
+async def run_ninalink_external_watch(args):
+    masks = {"state": 1, "event": 2, "all": 3}
+    mask = masks[args.change_mask]
+    name, dev = await find_app_device(args.device, args.scan_timeout)
+    print(f"Connecting Application: {name} ({dev.address})", flush=True)
+    async with ApplicationNDPClient(dev, ndp_access_key(args.ndp_key)) as app:
+        baseline = await app.ninalink_change_subscribe(mask)
+        ready = {
+            "type": "subscription",
+            "schema": baseline["schema"],
+            "mask": baseline["mask"],
+            "state_revision": baseline["state_revision"],
+            "event_revision": baseline["event_revision"],
+            "newest_event_id": baseline["newest_event_id"],
+        }
+        if args.json:
+            print(json.dumps(ready, sort_keys=True), flush=True)
+        else:
+            print("=== NINALINK B5.5 SUBSCRIPTION ===", flush=True)
+            print(f"Mask:             {args.change_mask}", flush=True)
+            print(f"State revision:   {baseline['state_revision']}", flush=True)
+            print(f"Event revision:   {baseline['event_revision']}", flush=True)
+            print(f"Newest event ID:  {baseline['newest_event_id']}", flush=True)
+            print("Subscribed:       yes", flush=True)
+
+        for _ in range(args.count):
+            change = await app.ninalink_wait_change(args.timeout)
+            if args.json:
+                row = {"type": "change", **change}
+                print(json.dumps(row, sort_keys=True), flush=True)
+            else:
+                names=[]
+                if change["state_changed"]: names.append("STATE")
+                if change["event_changed"]: names.append("EVENT")
+                print(
+                    f"CHANGE flags={'+'.join(names) or 'NONE'} "
+                    f"state_rev={change['state_revision']} "
+                    f"event_rev={change['event_revision']} "
+                    f"newest_event={change['newest_event_id']} "
+                    f"change_rev={change['change_revision']}",
+                    flush=True,
+                )
+
+        stats = await app.ninalink_change_stats()
+        if args.json:
+            print(json.dumps({"type":"stats", **stats}, sort_keys=True), flush=True)
+        else:
+            print("=== B5.5 STATS ===")
+            for k,v in stats.items():
+                print(f"{k}: {v}")
+
 async def main_async(args):
     # R3.8.16 local semantic/agent configuration commands never touch BLE.
     if _handle_semantic_admin(args) or _handle_agent_admin(args):
@@ -6859,6 +7061,10 @@ async def main_async(args):
 
     if not args.device:
         raise RuntimeError("--device is required for commands that access BLE hardware")
+
+    if args.action == "ninalink-external-watch":
+        await run_ninalink_external_watch(args)
+        return
 
     # 'ha' is the reference client for the normal Application BLE plane.
     # All pre-existing commands below remain on the validated NUS plane.
@@ -7071,6 +7277,14 @@ async def main_async(args):
         elif args.action == "ninalink-nodes-clear":
             await nrf.ninalink_nodes_clear()
 
+        elif args.action == "ninalink-b55-gate-arm":
+            await nrf.ninalink_b55_gate_arm(
+                args.state_delay, args.event_gap
+            )
+
+        elif args.action == "ninalink-b55-gate-status":
+            await nrf.ninalink_b55_gate_status(args.json)
+
         elif args.action == "ninalink-session-status":
             await nrf.ninalink_session_status()
 
@@ -7113,6 +7327,9 @@ async def main_async(args):
 
         elif args.action == "ninalink-bridge-start":
             await nrf.ninalink_bridge_start()
+
+        elif args.action == "ninalink-bridge-handoff":
+            await nrf.ninalink_bridge_handoff()
 
         elif args.action == "ninalink-bridge-status":
             await nrf.ninalink_bridge_status()
@@ -7687,6 +7904,25 @@ def build_parser():
         "ninalink-nodes-clear",
         help="B5.1 clear the bridge RAM node registry",
     )
+    nb55arm = sub.add_parser(
+        "ninalink-b55-gate-arm",
+        help="B5.5 lab: defer CAP_REPORT then TAP CAP_EVENT so bridge can watch without dual BLE",
+    )
+    nb55arm.add_argument(
+        "--state-delay", type=int, default=25, metavar="SECONDS",
+        help="delay before reliable CAP_REPORT (5..60, default 25)",
+    )
+    nb55arm.add_argument(
+        "--event-gap", type=int, default=8, metavar="SECONDS",
+        help="delay after STATE ACK before TAP CAP_EVENT (2..60, default 8)",
+    )
+
+    nb55status = sub.add_parser(
+        "ninalink-b55-gate-status",
+        help="show B5.5 no-dual-BLE deferred node gate state",
+    )
+    nb55status.add_argument("--json", action="store_true")
+
     sub.add_parser(
         "ninalink-session-status",
         help="B5.3d show current node boot/session epoch",
@@ -7780,6 +8016,32 @@ def build_parser():
         help="status (default), on, or off",
     )
     sub.add_parser("ninalink-bridge-start", help="B4.2 start continuous on-device validated NinaLink bridge RX")
+    sub.add_parser(
+        "ninalink-bridge-handoff",
+        help="B5.5 NUS-only: preserve bridge RX and return BLE ownership to Application plane",
+    )
+
+    nw = sub.add_parser(
+        "ninalink-external-watch",
+        help="B5.5 watch state/event change notifications on Application BLE",
+    )
+    nw.add_argument(
+        "--mask", dest="change_mask", choices=["state","event","all"],
+        default="all", help="change classes to subscribe (default: all)",
+    )
+    nw.add_argument(
+        "--count", type=int, default=1,
+        help="number of change notifications before exit (default: 1)",
+    )
+    nw.add_argument(
+        "--timeout", type=float, default=30.0,
+        help="timeout per notification in seconds (default: 30)",
+    )
+    nw.add_argument(
+        "--json", action="store_true",
+        help="emit JSON-lines subscription/change/stats records",
+    )
+
     sub.add_parser("ninalink-bridge-status", help="Show B4.2 NinaLink bridge counters/status")
     nbrx = sub.add_parser("ninalink-bridge-rx", help="Drain B4.2 on-device validated NinaLink frames")
     nbrx.add_argument("--timeout", type=float, default=45.0, help="validated bridge-drain window in seconds")

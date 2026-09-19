@@ -38,6 +38,7 @@ static nrfclaw_ble_app_role_t m_role;
 static bool m_suspended;
 static bool m_adv_active;
 static bool m_notify_enabled;
+static uint32_t m_tx_generation;
 static uint16_t m_conn_handle;
 
 /*
@@ -222,7 +223,7 @@ void nrfclaw_ble_app_init(void)
     m_adv_handle = nrfclaw_ble_shared_adv_handle();
 
     m_role=NRFCLAW_BLE_APP_OFF; m_suspended=false; m_adv_active=false;
-    m_notify_enabled=false; m_conn_handle=BLE_CONN_HANDLE_INVALID;
+    m_notify_enabled=false; m_tx_generation=0U; m_conn_handle=BLE_CONN_HANDLE_INVALID;
     m_adv_restart_pending=false; m_adv_restart_due=false;
     m_adv_restart_attempts=0U; m_adv_last_sd_error=NRF_SUCCESS;
     m_adv_adaptive_enabled=false; m_adv_adaptive_due=false;
@@ -777,6 +778,8 @@ nrfclaw_ble_app_status_t nrfclaw_ble_app_send(const nrfclaw_app_frame_t *f)
     return NRFCLAW_BLE_APP_BUSY;
 }
 
+uint32_t nrfclaw_ble_app_tx_generation(void){return m_tx_generation;}
+
 nrfclaw_ble_app_status_t nrfclaw_ble_app_send_raw(const uint8_t *data,
                                                    uint16_t len)
 {
@@ -1133,6 +1136,12 @@ static void ble_evt(ble_evt_t const *e,void *ctx)
             if(w->handle==m_rx_handles.value_handle)nrfclaw_ble_app_on_rx(w->data,w->len);
             else if(w->handle==m_tx_handles.cccd_handle && w->len==2U)m_notify_enabled=ble_srv_is_notification_enabled(w->data);
             break;}
+        case BLE_GATTS_EVT_HVN_TX_COMPLETE:
+            if(e->evt.gatts_evt.conn_handle==m_conn_handle){
+                m_tx_generation++;
+                if(m_tx_generation==0U)m_tx_generation=1U;
+            }
+            break;
         default:break;
     }
 }

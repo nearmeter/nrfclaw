@@ -104,6 +104,10 @@ bool nrfclaw_ninalink_event_history_get_by_id(
 bool nrfclaw_ninalink_event_history_get_after(
     uint32_t cursor,
     nrfclaw_ninalink_cached_event_t *out);
+void nrfclaw_ninalink_state_cache_get_revisions(
+    uint32_t *state_revision,
+    uint32_t *event_revision,
+    uint32_t *change_revision);
 uint32_t nrfclaw_ninalink_state_cache_value_raw(
     const nrfclaw_capability_value_t *value);
 

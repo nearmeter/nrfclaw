@@ -141,4 +141,26 @@ bool nrfclaw_ninalink_bridge_queue_capability_discovery(
 void nrfclaw_ninalink_bridge_get_capability_discovery_status(
     nrfclaw_ninalink_capability_discovery_status_t *out);
 
+
+/* B5.2 automatic discovery ownership helpers. */
+bool nrfclaw_ninalink_bridge_cancel_capability_discovery(
+    uint32_t target_node,
+    uint16_t request_seq);
+bool nrfclaw_ninalink_bridge_cancel_command_discovery(
+    uint32_t target_node,
+    uint16_t request_seq);
+
+
+typedef struct {
+    uint8_t admission_queued;
+    uint16_t consumed;
+    uint16_t cached_frames;
+    uint16_t cache_errors;
+    uint8_t diagnostic_queued;
+    uint16_t diagnostic_dropped;
+} nrfclaw_ninalink_bridge_consumer_status_t;
+
+void nrfclaw_ninalink_bridge_get_consumer_status(
+    nrfclaw_ninalink_bridge_consumer_status_t *out);
+
 #endif

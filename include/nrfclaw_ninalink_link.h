@@ -106,8 +106,20 @@ bool nrfclaw_ninalink_link_start(uint16_t ack_window_ms);
 bool nrfclaw_ninalink_link_start_reliable(uint16_t ack_window_ms,
                                           uint8_t max_attempts,
                                           uint16_t base_backoff_ms);
+bool nrfclaw_ninalink_link_start_event_test(uint8_t event_kind,
+                                            uint16_t ack_window_ms,
+                                            uint8_t max_attempts,
+                                            uint16_t base_backoff_ms);
+bool nrfclaw_ninalink_link_start_state_test(int16_t temperature_centi,
+                                            uint16_t forced_sequence,
+                                            uint16_t ack_window_ms,
+                                            uint8_t max_attempts,
+                                            uint16_t base_backoff_ms);
 void nrfclaw_ninalink_link_process(void);
 void nrfclaw_ninalink_link_get_status(nrfclaw_ninalink_link_status_t *out);
+bool nrfclaw_ninalink_link_get_session(uint32_t *session_id,
+                                       uint16_t *generation);
+bool nrfclaw_ninalink_link_force_session(uint32_t session_id);
 void nrfclaw_ninalink_link_get_app_status(nrfclaw_ninalink_app_status_t *out);
 void nrfclaw_ninalink_link_get_command_status(
     nrfclaw_ninalink_command_status_t *out);

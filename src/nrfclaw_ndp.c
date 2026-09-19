@@ -1,4 +1,5 @@
 #include "nrfclaw_ndp.h"
+#include "nrfclaw_rtc.h"
 #include "nrfclaw_native.h"
 #include "nrfclaw_battery.h"
 #include "nrfclaw_lora.h"
@@ -15,6 +16,10 @@
 #include "nrfclaw_lora_profile_store.h"
 #include "nrfclaw_ninalink_lab.h"
 #include "nrfclaw_ninalink_bridge.h"
+#include "nrfclaw_ninalink_node_registry.h"
+#include "nrfclaw_ninalink_auto_discovery.h"
+#include "nrfclaw_ninalink_state_cache.h"
+#include "nrfclaw_ninalink_external.h"
 #include "nrfclaw_ninalink_link.h"
 #include "nrfclaw_ninalink_capability_discovery.h"
 #include <string.h>
@@ -1038,6 +1043,326 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
             return reply(op,seq,NDP_OK,r,9,out,ol);
         }
 
+        if(p[0]==17U) {
+            nrfclaw_ninalink_node_registry_status_t rs;
+            if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            nrfclaw_ninalink_node_registry_get_status(&rs);
+            r[0]=rs.count;
+            r[1]=rs.capacity;
+            r[2]=(uint8_t)rs.updates;r[3]=(uint8_t)(rs.updates>>8);
+            r[4]=(uint8_t)rs.creations;r[5]=(uint8_t)(rs.creations>>8);
+            r[6]=(uint8_t)rs.evictions;r[7]=(uint8_t)(rs.evictions>>8);
+            return reply(op,seq,NDP_OK,r,8,out,ol);
+        }
+
+        if(p[0]==18U) {
+            nrfclaw_ninalink_node_entry_t e;
+            uint32_t now;
+            uint32_t age32;
+            uint16_t age;
+            if(n!=2U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            if(!nrfclaw_ninalink_node_registry_get_at(p[1],&e))
+                return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+
+            now=nrfclaw_rtc_now();
+            age32=now>=e.last_seen_s?(now-e.last_seen_s):0U;
+            age=age32>0xFFFFU?0xFFFFU:(uint16_t)age32;
+
+            r[0]=e.valid?1U:0U;
+            r[1]=(uint8_t)e.node_id;
+            r[2]=(uint8_t)(e.node_id>>8);
+            r[3]=(uint8_t)(e.node_id>>16);
+            r[4]=(uint8_t)(e.node_id>>24);
+            r[5]=(uint8_t)e.network_id;r[6]=(uint8_t)(e.network_id>>8);
+            r[7]=(uint8_t)e.last_sequence;r[8]=(uint8_t)(e.last_sequence>>8);
+            r[9]=e.last_message_type;
+            r[10]=(uint8_t)e.seen_count;r[11]=(uint8_t)(e.seen_count>>8);
+            r[12]=(uint8_t)age;r[13]=(uint8_t)(age>>8);
+            return reply(op,seq,NDP_OK,r,14,out,ol);
+        }
+
+        if(p[0]==19U) {
+            nrfclaw_ninalink_node_entry_t e;
+            uint32_t now;
+            uint32_t age32;
+            uint16_t age;
+            if(n!=2U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            if(!nrfclaw_ninalink_node_registry_get_at(p[1],&e))
+                return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+
+            now=nrfclaw_rtc_now();
+            age32=now>=e.last_seen_s?(now-e.last_seen_s):0U;
+            age=age32>0xFFFFU?0xFFFFU:(uint16_t)age32;
+
+            r[0]=e.valid?1U:0U;
+            r[1]=(uint8_t)e.node_id;
+            r[2]=(uint8_t)(e.node_id>>8);
+            r[3]=(uint8_t)(e.node_id>>16);
+            r[4]=(uint8_t)(e.node_id>>24);
+            memcpy(&r[5],&e.rssi_x2,2);
+            memcpy(&r[7],&e.snr_x4,2);
+            r[9]=(uint8_t)age;r[10]=(uint8_t)(age>>8);
+            return reply(op,seq,NDP_OK,r,11,out,ol);
+        }
+
+        if(p[0]==20U) {
+            if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            nrfclaw_ninalink_auto_discovery_abort();
+            nrfclaw_ninalink_node_registry_clear();
+            nrfclaw_ninalink_state_cache_clear();
+            return reply(op,seq,NDP_OK,0,0,out,ol);
+        }
+
+        if(p[0]==21U) {
+            nrfclaw_ninalink_node_entry_t e;
+            if(n!=2U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            nrfclaw_ninalink_auto_discovery_process();
+            if(!nrfclaw_ninalink_node_registry_get_at(p[1],&e))
+                return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+            r[0]=e.discovery.state;
+            r[1]=e.discovery.capability_count;
+            r[2]=e.discovery.command_count;
+            r[3]=e.discovery.capability_registry_version;
+            r[4]=e.discovery.command_registry_version;
+            r[5]=e.discovery.next_capability_page;
+            r[6]=e.discovery.next_command_index;
+            r[7]=e.discovery.retry_count;
+            r[8]=e.discovery.last_error;
+            return reply(op,seq,NDP_OK,r,9,out,ol);
+        }
+
+        if(p[0]==22U) {
+            nrfclaw_ninalink_auto_discovery_status_t ads;
+            if(n==2U) {
+                if(p[1]>1U) return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+                nrfclaw_ninalink_auto_discovery_set_enabled(p[1]!=0U);
+            } else if(n!=1U) {
+                return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            }
+            nrfclaw_ninalink_auto_discovery_process();
+            nrfclaw_ninalink_auto_discovery_get_status(&ads);
+            r[0]=ads.enabled?1U:0U;
+            r[1]=ads.inflight?1U:0U;
+            r[2]=ads.kind;
+            r[3]=(uint8_t)ads.node_id;
+            r[4]=(uint8_t)(ads.node_id>>8);
+            r[5]=(uint8_t)(ads.node_id>>16);
+            r[6]=(uint8_t)(ads.node_id>>24);
+            r[7]=(uint8_t)ads.request_seq;
+            r[8]=(uint8_t)(ads.request_seq>>8);
+            return reply(op,seq,NDP_OK,r,9,out,ol);
+        }
+
+        if(p[0]==23U) {
+            nrfclaw_ninalink_bridge_consumer_status_t cs3;
+            nrfclaw_ninalink_state_cache_status_t ss3;
+            if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            nrfclaw_ninalink_bridge_get_consumer_status(&cs3);
+            nrfclaw_ninalink_state_cache_get_status(&ss3);
+            r[0]=cs3.admission_queued;
+            r[1]=(uint8_t)cs3.consumed;r[2]=(uint8_t)(cs3.consumed>>8);
+            r[3]=(uint8_t)cs3.cached_frames;r[4]=(uint8_t)(cs3.cached_frames>>8);
+            r[5]=(uint8_t)cs3.cache_errors;r[6]=(uint8_t)(cs3.cache_errors>>8);
+            r[7]=cs3.diagnostic_queued;
+            r[8]=(uint8_t)cs3.diagnostic_dropped;r[9]=(uint8_t)(cs3.diagnostic_dropped>>8);
+            r[10]=ss3.nodes;r[11]=ss3.values;
+            return reply(op,seq,NDP_OK,r,12,out,ol);
+        }
+
+        if(p[0]==24U) {
+            nrfclaw_ninalink_state_cache_node_t sn3;
+            uint32_t node3,now3,age32_3;
+            uint16_t age3;
+            if(n!=5U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            node3=((uint32_t)p[1])|((uint32_t)p[2]<<8)|((uint32_t)p[3]<<16)|((uint32_t)p[4]<<24);
+            if(!nrfclaw_ninalink_state_cache_get_node(node3,&sn3))
+                return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+            now3=nrfclaw_rtc_now();age32_3=now3>=sn3.last_seen_s?(now3-sn3.last_seen_s):0U;
+            age3=age32_3>0xFFFFU?0xFFFFU:(uint16_t)age32_3;
+            r[0]=sn3.value_count;
+            r[1]=(uint8_t)sn3.updates;r[2]=(uint8_t)(sn3.updates>>8);
+            r[3]=(uint8_t)sn3.reports;r[4]=(uint8_t)(sn3.reports>>8);
+            r[5]=(uint8_t)sn3.events;r[6]=(uint8_t)(sn3.events>>8);
+            r[7]=(uint8_t)sn3.last_sequence;r[8]=(uint8_t)(sn3.last_sequence>>8);
+            r[9]=sn3.last_message_type;r[10]=(uint8_t)age3;r[11]=(uint8_t)(age3>>8);
+            r[12]=3U;
+            return reply(op,seq,NDP_OK,r,13,out,ol);
+        }
+
+        if(p[0]==25U) {
+            nrfclaw_ninalink_cached_value_t cv3;
+            uint32_t node3,now3,age32_3,raw3;
+            uint16_t age3;
+            if(n!=6U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            node3=((uint32_t)p[1])|((uint32_t)p[2]<<8)|((uint32_t)p[3]<<16)|((uint32_t)p[4]<<24);
+            if(!nrfclaw_ninalink_state_cache_get_value_at(node3,p[5],&cv3))
+                return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+            now3=nrfclaw_rtc_now();age32_3=now3>=cv3.updated_s?(now3-cv3.updated_s):0U;
+            age3=age32_3>0xFFFFU?0xFFFFU:(uint16_t)age32_3;
+            raw3=nrfclaw_ninalink_state_cache_value_raw(&cv3.value);
+            r[0]=(uint8_t)cv3.capability_id;r[1]=(uint8_t)(cv3.capability_id>>8);
+            r[2]=cv3.channel;r[3]=cv3.value.type;
+            r[4]=(uint8_t)raw3;r[5]=(uint8_t)(raw3>>8);r[6]=(uint8_t)(raw3>>16);r[7]=(uint8_t)(raw3>>24);
+            r[8]=(uint8_t)cv3.last_sequence;r[9]=(uint8_t)(cv3.last_sequence>>8);
+            r[10]=cv3.last_message_type;r[11]=(uint8_t)age3;r[12]=(uint8_t)(age3>>8);
+            r[13]=(uint8_t)cv3.update_count;r[14]=(uint8_t)(cv3.update_count>>8);
+            return reply(op,seq,NDP_OK,r,15,out,ol);
+        }
+
+        if(p[0]==26U) {
+            nrfclaw_ninalink_event_history_status_t es3b;
+            uint32_t node3b;
+            if(n!=5U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            node3b=((uint32_t)p[1])|((uint32_t)p[2]<<8)|((uint32_t)p[3]<<16)|((uint32_t)p[4]<<24);
+            nrfclaw_ninalink_event_history_get_status(&es3b);
+            r[0]=nrfclaw_ninalink_event_history_count(node3b);
+            r[1]=(uint8_t)es3b.ingested;r[2]=(uint8_t)(es3b.ingested>>8);
+            r[3]=(uint8_t)es3b.dropped;r[4]=(uint8_t)(es3b.dropped>>8);
+            r[5]=NRFCLAW_NINALINK_EVENT_HISTORY_DEPTH;
+            return reply(op,seq,NDP_OK,r,6,out,ol);
+        }
+
+        if(p[0]==27U) {
+            nrfclaw_ninalink_cached_event_t ev3b;
+            uint32_t node3b,now3b,age32_3b,raw3b;
+            uint16_t age3b;
+            if(n!=6U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            node3b=((uint32_t)p[1])|((uint32_t)p[2]<<8)|((uint32_t)p[3]<<16)|((uint32_t)p[4]<<24);
+            if(!nrfclaw_ninalink_event_history_get_at(node3b,p[5],&ev3b))
+                return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+            now3b=nrfclaw_rtc_now();age32_3b=now3b>=ev3b.occurred_s?(now3b-ev3b.occurred_s):0U;
+            age3b=age32_3b>0xFFFFU?0xFFFFU:(uint16_t)age32_3b;
+            raw3b=nrfclaw_ninalink_state_cache_value_raw(&ev3b.value);
+            r[0]=(uint8_t)ev3b.capability_id;r[1]=(uint8_t)(ev3b.capability_id>>8);
+            r[2]=ev3b.channel;r[3]=ev3b.value.type;
+            r[4]=(uint8_t)raw3b;r[5]=(uint8_t)(raw3b>>8);r[6]=(uint8_t)(raw3b>>16);r[7]=(uint8_t)(raw3b>>24);
+            r[8]=(uint8_t)ev3b.sequence;r[9]=(uint8_t)(ev3b.sequence>>8);
+            r[10]=(uint8_t)age3b;r[11]=(uint8_t)(age3b>>8);
+            return reply(op,seq,NDP_OK,r,12,out,ol);
+        }
+
+        if(p[0]==28U) {
+            if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            nrfclaw_ninalink_state_cache_clear();
+            return reply(op,seq,NDP_OK,0,0,out,ol);
+        }
+
+        if(p[0]==29U) {
+            nrfclaw_ninalink_state_cache_node_t sn53d;
+            uint32_t node53d;
+            if(n!=5U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            node53d=((uint32_t)p[1])|
+                    ((uint32_t)p[2]<<8)|
+                    ((uint32_t)p[3]<<16)|
+                    ((uint32_t)p[4]<<24);
+            if(!nrfclaw_ninalink_state_cache_get_node(node53d,&sn53d))
+                return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+            r[0]=sn53d.session_valid?1U:0U;
+            r[1]=(uint8_t)sn53d.session_id;
+            r[2]=(uint8_t)(sn53d.session_id>>8);
+            r[3]=(uint8_t)(sn53d.session_id>>16);
+            r[4]=(uint8_t)(sn53d.session_id>>24);
+            r[5]=(uint8_t)sn53d.session_changes;
+            r[6]=(uint8_t)(sn53d.session_changes>>8);
+            return reply(op,seq,NDP_OK,r,7,out,ol);
+        }
+
+        /* B5.4 External State/Event Interface v1. */
+        if(p[0]==30U) {
+            nrfclaw_ninalink_external_status_t xs54;
+            if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            nrfclaw_ninalink_external_get_status(&xs54);
+            r[0]=xs54.schema_version;r[1]=xs54.node_count;
+            r[2]=xs54.state_value_count;r[3]=xs54.event_count;
+            r[4]=(uint8_t)xs54.oldest_event_id;
+            r[5]=(uint8_t)(xs54.oldest_event_id>>8);
+            r[6]=(uint8_t)(xs54.oldest_event_id>>16);
+            r[7]=(uint8_t)(xs54.oldest_event_id>>24);
+            r[8]=(uint8_t)xs54.newest_event_id;
+            r[9]=(uint8_t)(xs54.newest_event_id>>8);
+            r[10]=(uint8_t)(xs54.newest_event_id>>16);
+            r[11]=(uint8_t)(xs54.newest_event_id>>24);
+            return reply(op,seq,NDP_OK,r,12,out,ol);
+        }
+
+        if(p[0]==31U) {
+            nrfclaw_ninalink_external_node_t xn54;
+            if(n!=2U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            if(!nrfclaw_ninalink_external_get_node(p[1],nrfclaw_rtc_now(),&xn54))
+                return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+            r[0]=(uint8_t)xn54.node_id;r[1]=(uint8_t)(xn54.node_id>>8);
+            r[2]=(uint8_t)(xn54.node_id>>16);r[3]=(uint8_t)(xn54.node_id>>24);
+            r[4]=xn54.state_count;r[5]=xn54.event_count;r[6]=xn54.discovery_state;
+            r[7]=(uint8_t)xn54.age_s;r[8]=(uint8_t)(xn54.age_s>>8);
+            memcpy(&r[9],&xn54.rssi_x2,2);memcpy(&r[11],&xn54.snr_x4,2);
+            r[13]=xn54.flags;r[14]=xn54.last_message_type;
+            return reply(op,seq,NDP_OK,r,15,out,ol);
+        }
+
+        if(p[0]==32U) {
+            nrfclaw_ninalink_external_state_t xv54;
+            uint32_t node54;
+            if(n!=6U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            node54=((uint32_t)p[1])|((uint32_t)p[2]<<8)|
+                   ((uint32_t)p[3]<<16)|((uint32_t)p[4]<<24);
+            if(!nrfclaw_ninalink_external_get_state(node54,p[5],nrfclaw_rtc_now(),&xv54))
+                return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+            r[0]=(uint8_t)xv54.capability_id;r[1]=(uint8_t)(xv54.capability_id>>8);
+            r[2]=xv54.channel;r[3]=xv54.value_type;
+            r[4]=(uint8_t)xv54.raw_value;r[5]=(uint8_t)(xv54.raw_value>>8);
+            r[6]=(uint8_t)(xv54.raw_value>>16);r[7]=(uint8_t)(xv54.raw_value>>24);
+            r[8]=(uint8_t)xv54.sequence;r[9]=(uint8_t)(xv54.sequence>>8);
+            r[10]=(uint8_t)xv54.age_s;r[11]=(uint8_t)(xv54.age_s>>8);
+            r[12]=(uint8_t)xv54.update_count;r[13]=(uint8_t)(xv54.update_count>>8);
+            r[14]=xv54.source_message_type;
+            return reply(op,seq,NDP_OK,r,15,out,ol);
+        }
+
+        if(p[0]==33U) {
+            nrfclaw_ninalink_external_event_meta_t xe54;
+            uint32_t cursor54;bool found54;
+            if(n!=5U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            cursor54=((uint32_t)p[1])|((uint32_t)p[2]<<8)|
+                     ((uint32_t)p[3]<<16)|((uint32_t)p[4]<<24);
+            memset(&xe54,0,sizeof(xe54));
+            found54=nrfclaw_ninalink_external_get_event_after(cursor54,&xe54);
+            r[0]=found54?1U:0U;
+            r[1]=(uint8_t)xe54.event_id;r[2]=(uint8_t)(xe54.event_id>>8);
+            r[3]=(uint8_t)(xe54.event_id>>16);r[4]=(uint8_t)(xe54.event_id>>24);
+            r[5]=(uint8_t)xe54.node_id;r[6]=(uint8_t)(xe54.node_id>>8);
+            r[7]=(uint8_t)(xe54.node_id>>16);r[8]=(uint8_t)(xe54.node_id>>24);
+            r[9]=(uint8_t)xe54.capability_id;r[10]=(uint8_t)(xe54.capability_id>>8);
+            r[11]=xe54.channel;r[12]=xe54.value_type;
+            r[13]=(uint8_t)xe54.sequence;r[14]=(uint8_t)(xe54.sequence>>8);
+            return reply(op,seq,NDP_OK,r,15,out,ol);
+        }
+
+        if(p[0]==34U) {
+            nrfclaw_ninalink_external_event_value_t xev54;
+            uint32_t event54;bool found54;
+            if(n!=5U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            event54=((uint32_t)p[1])|((uint32_t)p[2]<<8)|
+                    ((uint32_t)p[3]<<16)|((uint32_t)p[4]<<24);
+            memset(&xev54,0,sizeof(xev54));
+            found54=nrfclaw_ninalink_external_get_event_value(event54,nrfclaw_rtc_now(),&xev54);
+            r[0]=found54?1U:0U;
+            r[1]=(uint8_t)xev54.raw_value;r[2]=(uint8_t)(xev54.raw_value>>8);
+            r[3]=(uint8_t)(xev54.raw_value>>16);r[4]=(uint8_t)(xev54.raw_value>>24);
+            r[5]=(uint8_t)xev54.age_s;r[6]=(uint8_t)(xev54.age_s>>8);
+            return reply(op,seq,NDP_OK,r,7,out,ol);
+        }
+
+        if(p[0]==35U) {
+            nrfclaw_ninalink_external_descriptor_t xd54;
+            uint16_t cap54;
+            if(n!=4U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            cap54=(uint16_t)p[1]|((uint16_t)p[2]<<8);
+            nrfclaw_ninalink_external_get_descriptor(cap54,p[3],&xd54);
+            r[0]=xd54.known?1U:0U;r[1]=xd54.kind;r[2]=xd54.value_type;
+            r[3]=(uint8_t)xd54.scale10;r[4]=xd54.unit;r[5]=xd54.behavior_flags;
+            return reply(op,seq,NDP_OK,r,6,out,ol);
+        }
+
         return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
       }
 
@@ -1260,6 +1585,94 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
             r[7]=d->desc.behavior_flags;
             r[8]=d->runtime_state_flags;
             return reply(op,seq,NDP_OK,r,9,out,ol);
+        }
+
+        if(p[0]==12U) {
+            uint8_t event_kind;
+            uint16_t window_ms;
+            uint8_t attempts;
+            uint16_t backoff_ms;
+            if(n!=7U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            event_kind=p[1];
+            if(event_kind<1U || event_kind>2U)
+                return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+            window_ms=(uint16_t)p[2]|((uint16_t)p[3]<<8);
+            attempts=p[4];
+            backoff_ms=(uint16_t)p[5]|((uint16_t)p[6]<<8);
+            if(!nrfclaw_ninalink_link_start_event_test(
+                    event_kind,window_ms,attempts,backoff_ms))
+                return reply(op,seq,NDP_BUSY,0,0,out,ol);
+            nrfclaw_ninalink_link_get_status(&ls);
+            r[0]=ls.state;
+            r[1]=ls.result;
+            r[2]=(uint8_t)ls.sequence;r[3]=(uint8_t)(ls.sequence>>8);
+            r[4]=ls.tx_len;
+            r[5]=ls.ack_len;
+            memcpy(&r[6],&ls.ack_rssi_x2,2);
+            memcpy(&r[8],&ls.ack_snr_x4,2);
+            r[10]=(uint8_t)ls.acked_count;r[11]=(uint8_t)(ls.acked_count>>8);
+            r[12]=(uint8_t)ls.timeout_count;r[13]=(uint8_t)(ls.timeout_count>>8);
+            return reply(op,seq,NDP_OK,r,14,out,ol);
+        }
+
+        if(p[0]==13U) {
+            int16_t temperature_centi;
+            uint16_t forced_sequence;
+            uint16_t window_ms;
+            uint8_t attempts;
+            uint16_t backoff_ms;
+
+            if(n!=10U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+
+            temperature_centi=(int16_t)((uint16_t)p[1]|((uint16_t)p[2]<<8));
+            forced_sequence=(uint16_t)p[3]|((uint16_t)p[4]<<8);
+            window_ms=(uint16_t)p[5]|((uint16_t)p[6]<<8);
+            attempts=p[7];
+            backoff_ms=(uint16_t)p[8]|((uint16_t)p[9]<<8);
+
+            if(!nrfclaw_ninalink_link_start_state_test(
+                    temperature_centi,forced_sequence,
+                    window_ms,attempts,backoff_ms))
+                return reply(op,seq,NDP_BUSY,0,0,out,ol);
+
+            nrfclaw_ninalink_link_get_status(&ls);
+            r[0]=ls.state;
+            r[1]=ls.result;
+            r[2]=(uint8_t)ls.sequence;r[3]=(uint8_t)(ls.sequence>>8);
+            r[4]=ls.tx_len;
+            r[5]=ls.ack_len;
+            memcpy(&r[6],&ls.ack_rssi_x2,2);
+            memcpy(&r[8],&ls.ack_snr_x4,2);
+            r[10]=(uint8_t)ls.acked_count;r[11]=(uint8_t)(ls.acked_count>>8);
+            r[12]=(uint8_t)ls.timeout_count;r[13]=(uint8_t)(ls.timeout_count>>8);
+            return reply(op,seq,NDP_OK,r,14,out,ol);
+        }
+
+        if(p[0]==14U) {
+            uint32_t session_id=0U;
+            uint16_t generation=0U;
+            bool valid;
+
+            if(n==5U) {
+                uint32_t forced=((uint32_t)p[1])|
+                    ((uint32_t)p[2]<<8)|
+                    ((uint32_t)p[3]<<16)|
+                    ((uint32_t)p[4]<<24);
+                if(!nrfclaw_ninalink_link_force_session(forced))
+                    return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+            } else if(n!=1U) {
+                return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            }
+
+            valid=nrfclaw_ninalink_link_get_session(&session_id,&generation);
+            r[0]=valid?1U:0U;
+            r[1]=(uint8_t)session_id;
+            r[2]=(uint8_t)(session_id>>8);
+            r[3]=(uint8_t)(session_id>>16);
+            r[4]=(uint8_t)(session_id>>24);
+            r[5]=(uint8_t)generation;
+            r[6]=(uint8_t)(generation>>8);
+            return reply(op,seq,NDP_OK,r,7,out,ol);
         }
 
         return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);

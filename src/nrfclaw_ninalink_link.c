@@ -2,6 +2,7 @@
 
 #include "app_timer.h"
 #include "nrf.h"
+#include "nrf_soc.h"
 #include "SEGGER_RTT.h"
 
 #include "nrfclaw_capability.h"
@@ -50,6 +51,11 @@ static uint16_t m_base_backoff_ms;
 static uint16_t m_acked_total;
 static uint16_t m_timeout_total;
 static uint16_t m_retry_total;
+
+static bool m_session_valid;
+static uint32_t m_session_id;
+static uint16_t m_session_generation;
+
 
 static nrfclaw_ninalink_link_status_t m_status;
 
@@ -270,6 +276,75 @@ static void set_done(uint8_t result)
     refresh_totals();
 }
 
+static bool session_try_init(void)
+{
+    uint8_t available = 0U;
+    uint8_t bytes[4];
+    uint32_t sid;
+
+    if (m_session_valid)
+        return true;
+
+    if (sd_rand_application_bytes_available_get(&available) != NRF_SUCCESS ||
+        available < sizeof(bytes))
+        return false;
+
+    if (sd_rand_application_vector_get(bytes, sizeof(bytes)) != NRF_SUCCESS)
+        return false;
+
+    sid = ((uint32_t)bytes[0]) |
+          ((uint32_t)bytes[1] << 8) |
+          ((uint32_t)bytes[2] << 16) |
+          ((uint32_t)bytes[3] << 24);
+
+    if (sid == 0U || sid == 0xFFFFFFFFUL)
+        sid ^= NRF_FICR->DEVICEID[0] ^ 0xA53D53D0UL;
+    if (sid == 0U || sid == 0xFFFFFFFFUL)
+        sid = 1U;
+
+    m_session_id = sid;
+    m_session_valid = true;
+    m_session_generation = m_session_generation == 0xFFFFU
+        ? m_session_generation
+        : (uint16_t)(m_session_generation + 1U);
+    return true;
+}
+
+static nrfclaw_ninalink_msg_status_t build_values_with_session(
+    nrfclaw_ninalink_frame_t *frame,
+    uint8_t message_type,
+    uint16_t seq,
+    const nrfclaw_ninalink_value_entry_t *entries,
+    uint8_t count)
+{
+    nrfclaw_ninalink_value_entry_t
+        work[NRFCLAW_NINALINK_MAX_VALUE_ENTRIES];
+
+    if (!frame || !entries || count == 0U ||
+        count >= NRFCLAW_NINALINK_MAX_VALUE_ENTRIES)
+        return NRFCLAW_NINALINK_MSG_ERR_BAD_ARG;
+
+    if (!session_try_init())
+        return NRFCLAW_NINALINK_MSG_ERR_BAD_VALUE;
+
+    memcpy(work, entries, (size_t)count * sizeof(work[0]));
+    memset(&work[count], 0, sizeof(work[count]));
+    work[count].capability_id = NRFCLAW_NINALINK_META_SESSION_ID;
+    work[count].channel = 0U;
+    work[count].value.type = NRFCLAW_CAP_VALUE_U32;
+    work[count].value.v.u32 = m_session_id;
+
+    return nrfclaw_ninalink_build_values(
+        frame,
+        message_type,
+        LINK_NETWORK_ID_DEFAULT,
+        NRF_FICR->DEVICEID[0],
+        seq,
+        true,
+        work,
+        (uint8_t)(count + 1U));
+}
+
 static bool build_report(uint16_t seq)
 {
     nrfclaw_ninalink_value_entry_t entries[2];
@@ -300,13 +375,10 @@ static bool build_report(uint16_t seq)
         return false;
     }
 
-    if (nrfclaw_ninalink_build_values(
+    if (build_values_with_session(
             &frame,
             NRFCLAW_NINALINK_MSG_CAP_REPORT,
-            LINK_NETWORK_ID_DEFAULT,
-            NRF_FICR->DEVICEID[0],
             seq,
-            true,
             entries,
             count) != NRFCLAW_NINALINK_MSG_OK) {
         m_status.result = NRFCLAW_NINALINK_LINK_RESULT_BUILD_FAIL;
@@ -318,6 +390,78 @@ static bool build_report(uint16_t seq)
             m_wire,
             sizeof(m_wire),
             &m_wire_len) != NRFCLAW_NINALINK_OK) {
+        m_status.result = NRFCLAW_NINALINK_LINK_RESULT_BUILD_FAIL;
+        return false;
+    }
+
+    return true;
+}
+
+static bool build_state_test(uint16_t seq, int16_t temperature_centi)
+{
+    nrfclaw_ninalink_value_entry_t entry;
+    nrfclaw_ninalink_frame_t frame;
+
+    memset(&entry, 0, sizeof(entry));
+    entry.capability_id = NRFCLAW_SEMCAP_TEMPERATURE;
+    entry.channel = 0U;
+    entry.value.type = NRFCLAW_CAP_VALUE_S16;
+    entry.value.v.s16 = temperature_centi;
+
+    if (build_values_with_session(
+            &frame,
+            NRFCLAW_NINALINK_MSG_CAP_REPORT,
+            seq,
+            &entry,
+            1U) != NRFCLAW_NINALINK_MSG_OK) {
+        m_status.result = NRFCLAW_NINALINK_LINK_RESULT_BUILD_FAIL;
+        return false;
+    }
+
+    if (nrfclaw_ninalink_encode(
+            &frame, m_wire, sizeof(m_wire), &m_wire_len) !=
+            NRFCLAW_NINALINK_OK) {
+        m_status.result = NRFCLAW_NINALINK_LINK_RESULT_BUILD_FAIL;
+        return false;
+    }
+
+    return true;
+}
+
+static bool build_event_test(uint16_t seq, uint8_t event_kind)
+{
+    nrfclaw_ninalink_value_entry_t entry;
+    nrfclaw_ninalink_frame_t frame;
+
+    memset(&entry, 0, sizeof(entry));
+    entry.channel = 0U;
+
+    if (event_kind == 1U) {
+        entry.capability_id = NRFCLAW_SEMCAP_TAP;
+        entry.value.type = NRFCLAW_CAP_VALUE_ENUM8;
+        entry.value.v.u8 = 2U;
+    } else if (event_kind == 2U) {
+        entry.capability_id = NRFCLAW_SEMCAP_FALL;
+        entry.value.type = NRFCLAW_CAP_VALUE_BOOL;
+        entry.value.v.boolean = true;
+    } else {
+        m_status.result = NRFCLAW_NINALINK_LINK_RESULT_BUILD_FAIL;
+        return false;
+    }
+
+    if (build_values_with_session(
+            &frame,
+            NRFCLAW_NINALINK_MSG_CAP_EVENT,
+            seq,
+            &entry,
+            1U) != NRFCLAW_NINALINK_MSG_OK) {
+        m_status.result = NRFCLAW_NINALINK_LINK_RESULT_BUILD_FAIL;
+        return false;
+    }
+
+    if (nrfclaw_ninalink_encode(
+            &frame, m_wire, sizeof(m_wire), &m_wire_len) !=
+            NRFCLAW_NINALINK_OK) {
         m_status.result = NRFCLAW_NINALINK_LINK_RESULT_BUILD_FAIL;
         return false;
     }
@@ -424,6 +568,104 @@ bool nrfclaw_ninalink_link_start_reliable(uint16_t ack_window_ms,
 
     m_status.tx_len = m_wire_len;
 
+    if (!submit_attempt(false)) {
+        set_done(NRFCLAW_NINALINK_LINK_RESULT_TX_FAIL);
+        return false;
+    }
+
+    m_next_sequence++;
+    m_started = true;
+    return true;
+}
+
+bool nrfclaw_ninalink_link_start_state_test(int16_t temperature_centi,
+                                            uint16_t forced_sequence,
+                                            uint16_t ack_window_ms,
+                                            uint8_t max_attempts,
+                                            uint16_t base_backoff_ms)
+{
+    if (ack_window_ms < LINK_ACK_MIN_WINDOW_MS ||
+        ack_window_ms > LINK_ACK_MAX_WINDOW_MS)
+        return false;
+    if (max_attempts == 0U || max_attempts > LINK_MAX_ATTEMPTS)
+        return false;
+    if (max_attempts > 1U &&
+        (base_backoff_ms == 0U || base_backoff_ms > LINK_MAX_BACKOFF_MS))
+        return false;
+    if (!nrfclaw_lora_idle())
+        return false;
+    if (max_attempts > 1U && !ensure_retry_timer())
+        return false;
+
+    memset(&m_status, 0, sizeof(m_status));
+    m_status.state = NRFCLAW_NINALINK_LINK_IDLE;
+    m_status.sequence = forced_sequence;
+    m_status.max_attempts = max_attempts;
+    m_status.base_backoff_ms = base_backoff_ms;
+    refresh_totals();
+
+    m_ack_window_ms = ack_window_ms;
+    m_pending_sequence = forced_sequence;
+    m_pending_network_id = LINK_NETWORK_ID_DEFAULT;
+    m_base_backoff_ms = base_backoff_ms;
+
+    if (!build_state_test(forced_sequence, temperature_centi)) {
+        set_done(m_status.result);
+        return false;
+    }
+
+    m_status.tx_len = m_wire_len;
+    if (!submit_attempt(false)) {
+        set_done(NRFCLAW_NINALINK_LINK_RESULT_TX_FAIL);
+        return false;
+    }
+
+    /* Lab-only forced sequence: do not modify production m_next_sequence. */
+    m_started = true;
+    return true;
+}
+
+bool nrfclaw_ninalink_link_start_event_test(uint8_t event_kind,
+                                            uint16_t ack_window_ms,
+                                            uint8_t max_attempts,
+                                            uint16_t base_backoff_ms)
+{
+    uint16_t seq;
+
+    if (event_kind < 1U || event_kind > 2U)
+        return false;
+    if (ack_window_ms < LINK_ACK_MIN_WINDOW_MS ||
+        ack_window_ms > LINK_ACK_MAX_WINDOW_MS)
+        return false;
+    if (max_attempts == 0U || max_attempts > LINK_MAX_ATTEMPTS)
+        return false;
+    if (max_attempts > 1U &&
+        (base_backoff_ms == 0U || base_backoff_ms > LINK_MAX_BACKOFF_MS))
+        return false;
+    if (!nrfclaw_lora_idle())
+        return false;
+    if (max_attempts > 1U && !ensure_retry_timer())
+        return false;
+
+    seq = m_next_sequence;
+    memset(&m_status, 0, sizeof(m_status));
+    m_status.state = NRFCLAW_NINALINK_LINK_IDLE;
+    m_status.sequence = seq;
+    m_status.max_attempts = max_attempts;
+    m_status.base_backoff_ms = base_backoff_ms;
+    refresh_totals();
+
+    m_ack_window_ms = ack_window_ms;
+    m_pending_sequence = seq;
+    m_pending_network_id = LINK_NETWORK_ID_DEFAULT;
+    m_base_backoff_ms = base_backoff_ms;
+
+    if (!build_event_test(seq, event_kind)) {
+        set_done(m_status.result);
+        return false;
+    }
+
+    m_status.tx_len = m_wire_len;
     if (!submit_attempt(false)) {
         set_done(NRFCLAW_NINALINK_LINK_RESULT_TX_FAIL);
         return false;
@@ -827,6 +1069,8 @@ static bool accept_capability_request(
 
 void nrfclaw_ninalink_link_process(void)
 {
+    (void)session_try_init();
+
     if (!m_started)
         return;
 
@@ -975,6 +1219,32 @@ void nrfclaw_ninalink_link_process(void)
         m_started = false;
     }
 }
+bool nrfclaw_ninalink_link_get_session(uint32_t *session_id,
+                                       uint16_t *generation)
+{
+    (void)session_try_init();
+    if (session_id)
+        *session_id = m_session_id;
+    if (generation)
+        *generation = m_session_generation;
+    return m_session_valid;
+}
+
+bool nrfclaw_ninalink_link_force_session(uint32_t session_id)
+{
+    if (session_id == 0U || session_id == 0xFFFFFFFFUL)
+        return false;
+    if (m_started)
+        return false;
+
+    m_session_id = session_id;
+    m_session_valid = true;
+    m_session_generation = m_session_generation == 0xFFFFU
+        ? m_session_generation
+        : (uint16_t)(m_session_generation + 1U);
+    return true;
+}
+
 
 void nrfclaw_ninalink_link_get_status(nrfclaw_ninalink_link_status_t *out)
 {

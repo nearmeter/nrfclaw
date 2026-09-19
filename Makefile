@@ -62,6 +62,10 @@ CORE_SRC := \
   src/nrfclaw_ninalink_msg.c \
   src/nrfclaw_ninalink_lab.c \
   src/nrfclaw_ninalink_bridge.c \
+  src/nrfclaw_ninalink_node_registry.c \
+  src/nrfclaw_ninalink_auto_discovery.c \
+  src/nrfclaw_ninalink_state_cache.c \
+  src/nrfclaw_ninalink_external.c \
   src/nrfclaw_ninalink_link.c \
   src/nrfclaw_ninalink_command_registry.c \
   src/nrfclaw_ninalink_command_discovery.c \

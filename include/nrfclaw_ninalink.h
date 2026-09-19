@@ -87,4 +87,8 @@ nrfclaw_ninalink_decode(const uint8_t *data,
 /* Stable diagnostic string; never returns NULL. */
 const char *nrfclaw_ninalink_status_str(nrfclaw_ninalink_status_t status);
 
+
+/* B5.3d transport metadata encoded as a private typed value entry. */
+#define NRFCLAW_NINALINK_META_SESSION_ID 0xC001U
+
 #endif

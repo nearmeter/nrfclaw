@@ -3681,6 +3681,611 @@ class NRFClawClient:
         print(f"Duplicate total:  {s['duplicate_count']}")
         return s
 
+    async def ninalink_nodes(self):
+        status = await self.ndp_command(NDP_NINALINK_BRIDGE, b"\x11")
+        if len(status) != 8:
+            raise RuntimeError(
+                f"Invalid B5.1 registry status length: {len(status)}"
+            )
+
+        s = {
+            "count": status[0],
+            "capacity": status[1],
+            "updates": int.from_bytes(status[2:4], "little"),
+            "creations": int.from_bytes(status[4:6], "little"),
+            "evictions": int.from_bytes(status[6:8], "little"),
+            "nodes": [],
+        }
+
+        msg_names = {
+            0x01:"HELLO", 0x02:"CAPS_REQUEST", 0x03:"CAPS_RESPONSE",
+            0x10:"CAP_REPORT", 0x11:"CAP_EVENT",
+            0x20:"ACK", 0x21:"NACK",
+            0x30:"CAP_SET", 0x31:"COMMAND",
+            0x32:"COMMAND_RESULT", 0x33:"COMMANDS_REQUEST",
+            0x34:"COMMANDS_RESPONSE",
+        }
+
+        for index in range(s["count"]):
+            core = await self.ndp_command(
+                NDP_NINALINK_BRIDGE, bytes([18, index])
+            )
+            link = await self.ndp_command(
+                NDP_NINALINK_BRIDGE, bytes([19, index])
+            )
+            disc = await self.ndp_command(
+                NDP_NINALINK_BRIDGE, bytes([21, index])
+            )
+
+            if len(core) != 14:
+                raise RuntimeError(
+                    f"Invalid B5.1 node core length: {len(core)}"
+                )
+            if len(link) != 11:
+                raise RuntimeError(
+                    f"Invalid B5.1 node link length: {len(link)}"
+                )
+            if len(disc) != 9:
+                raise RuntimeError(
+                    f"Invalid B5.2 discovery status length: {len(disc)}"
+                )
+
+            node = {
+                "node_id": int.from_bytes(core[1:5], "little"),
+                "network_id": int.from_bytes(core[5:7], "little"),
+                "last_sequence": int.from_bytes(core[7:9], "little"),
+                "last_message_type": core[9],
+                "seen_count": int.from_bytes(core[10:12], "little"),
+                "age_s": int.from_bytes(core[12:14], "little"),
+                "rssi_x2": int.from_bytes(
+                    link[5:7], "little", signed=True
+                ),
+                "snr_x4": int.from_bytes(
+                    link[7:9], "little", signed=True
+                ),
+                "discovery_state": disc[0],
+                "capability_count": disc[1],
+                "command_count": disc[2],
+                "cap_registry_version": disc[3],
+                "cmd_registry_version": disc[4],
+                "next_capability_page": disc[5],
+                "next_command_index": disc[6],
+                "discovery_retries": disc[7],
+                "discovery_error": disc[8],
+            }
+            s["nodes"].append(node)
+
+        print("=== NINALINK B5.2 NODE REGISTRY ===")
+        print(f"Nodes:            {s['count']}/{s['capacity']}")
+        print(f"Updates:          {s['updates']}")
+        print(f"Created:          {s['creations']}")
+        print(f"Evictions:        {s['evictions']}")
+
+        discovery_states = {
+            0:"NEW", 1:"CAPS_PENDING", 2:"CAPS_DONE",
+            3:"COMMANDS_PENDING", 4:"READY", 5:"ERROR",
+        }
+        discovery_errors = {
+            0:"NONE", 1:"CAPS_TIMEOUT", 2:"COMMANDS_TIMEOUT",
+            3:"CAPS_PROTOCOL", 4:"COMMANDS_PROTOCOL",
+        }
+
+        for i, node in enumerate(s["nodes"]):
+            mt = msg_names.get(
+                node["last_message_type"],
+                f"0x{node['last_message_type']:02X}",
+            )
+            print()
+            print(f"[{i}] Node 0x{node['node_id']:08X}")
+            print(f"  Network:        0x{node['network_id']:04X}")
+            print(f"  Seen frames:    {node['seen_count']}")
+            print(f"  Last seen:      {node['age_s']} s ago")
+            print(f"  Last sequence:  {node['last_sequence']}")
+            print(f"  Last message:   {mt}")
+            print(f"  RSSI:           {node['rssi_x2'] / 2.0:.1f} dBm")
+            print(f"  SNR:            {node['snr_x4'] / 4.0:.2f} dB")
+            print(
+                f"  Discovery:      "
+                f"{discovery_states.get(node['discovery_state'], node['discovery_state'])}"
+            )
+            print(f"  Capabilities:   {node['capability_count']}")
+            print(f"  Commands:       {node['command_count']}")
+            print(
+                f"  Registry ver:   caps={node['cap_registry_version']} "
+                f"commands={node['cmd_registry_version']}"
+            )
+            if node["discovery_state"] == 1:
+                print(f"  Next CAPS page: {node['next_capability_page']}")
+            elif node["discovery_state"] == 3:
+                print(f"  Next CMD index: {node['next_command_index']}")
+            print(f"  Disc retries:   {node['discovery_retries']}")
+            print(
+                f"  Disc error:     "
+                f"{discovery_errors.get(node['discovery_error'], node['discovery_error'])}"
+            )
+
+        return s
+
+    async def ninalink_session_status(self, quiet=False):
+        p = await self.ndp_command(NDP_NINALINK_LINK, bytes([14]))
+        if len(p) != 7:
+            raise RuntimeError(f"Invalid B5.3d session status length: {len(p)}")
+        s = {
+            "valid": bool(p[0]),
+            "session_id": int.from_bytes(p[1:5], "little"),
+            "generation": int.from_bytes(p[5:7], "little"),
+        }
+        if not quiet:
+            print("=== NINALINK B5.3d NODE SESSION ===")
+            print(f"Valid:            {'yes' if s['valid'] else 'no'}")
+            print(f"Session ID:       0x{s['session_id']:08X}")
+            print(f"Generation:       {s['generation']}")
+        return s
+
+    async def ninalink_session_force(self, session_id):
+        if session_id in (0, 0xFFFFFFFF):
+            raise ValueError("--id must not be 0 or 0xFFFFFFFF")
+        p = await self.ndp_command(
+            NDP_NINALINK_LINK,
+            bytes([14]) + struct.pack("<I", session_id),
+        )
+        if len(p) != 7:
+            raise RuntimeError(f"Invalid B5.3d session force length: {len(p)}")
+        print(f"Forced node session: 0x{session_id:08X}")
+        return await self.ninalink_session_status()
+
+    async def ninalink_state_test(
+        self, temperature_centi, sequence,
+        window_ms=600, attempts=3, backoff_ms=200, wait_s=6.0
+    ):
+        if not (-32768 <= temperature_centi <= 32767):
+            raise ValueError("--temp-centi must be -32768..32767")
+        if not (0 <= sequence <= 0xFFFF):
+            raise ValueError("--seq must be 0..65535")
+        if not (100 <= window_ms <= 4000):
+            raise ValueError("--window must be 100..4000 ms")
+        if not (1 <= attempts <= 5):
+            raise ValueError("--attempts must be 1..5")
+        if attempts > 1 and not (1 <= backoff_ms <= 4000):
+            raise ValueError("--backoff must be 1..4000 ms")
+
+        payload = (
+            bytes([13])
+            + struct.pack("<h", temperature_centi)
+            + struct.pack("<H", sequence)
+            + struct.pack("<H", window_ms)
+            + bytes([attempts])
+            + struct.pack("<H", backoff_ms if attempts > 1 else 0)
+        )
+
+        await self.ndp_command(NDP_NINALINK_LINK, payload)
+        print(
+            f"Synthetic CAP_REPORT submitted: "
+            f"TEMPERATURE[0]={temperature_centi} "
+            f"({temperature_centi / 100.0:.2f} C) "
+            f"seq={sequence} window={window_ms} ms attempts={attempts}"
+        )
+
+        deadline = time.monotonic() + wait_s
+        s = None
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+            s = await self.ninalink_link_status(quiet=True)
+            if s["state"] == 4:
+                break
+
+        if s is None or s["state"] != 4:
+            raise RuntimeError("CAP_REPORT state-test did not reach DONE before --wait")
+
+        await self.ninalink_link_status()
+        await self.ninalink_link_reliability_status()
+
+        if s["result"] != 1:
+            raise RuntimeError(
+                f"CAP_REPORT state-test reliable send failed with result={s['result']}"
+            )
+
+        print("CAP_REPORT state-test ACK observed: PASS")
+        return s
+
+    async def ninalink_event_test(
+        self, event_name="tap", window_ms=600, attempts=3,
+        backoff_ms=200, wait_s=6.0
+    ):
+        kinds = {"tap": 1, "fall": 2}
+        if event_name not in kinds:
+            raise ValueError("event must be tap or fall")
+        if not (100 <= window_ms <= 4000):
+            raise ValueError("--window must be 100..4000 ms")
+        if not (1 <= attempts <= 5):
+            raise ValueError("--attempts must be 1..5")
+        if attempts > 1 and not (1 <= backoff_ms <= 4000):
+            raise ValueError("--backoff must be 1..4000 ms")
+
+        payload = (
+            bytes([12, kinds[event_name]])
+            + struct.pack("<H", window_ms)
+            + bytes([attempts])
+            + struct.pack("<H", backoff_ms if attempts > 1 else 0)
+        )
+        await self.ndp_command(NDP_NINALINK_LINK, payload)
+        print(
+            f"Synthetic CAP_EVENT submitted: event={event_name.upper()} "
+            f"window={window_ms} ms attempts={attempts}"
+        )
+
+        deadline = time.monotonic() + wait_s
+        s = None
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+            s = await self.ninalink_link_status(quiet=True)
+            if s["state"] == 4:
+                break
+
+        if s is None or s["state"] != 4:
+            raise RuntimeError("CAP_EVENT test did not reach DONE before --wait")
+        await self.ninalink_link_status()
+        await self.ninalink_link_reliability_status()
+        if s["result"] != 1:
+            raise RuntimeError(
+                f"CAP_EVENT reliable send failed with result={s['result']}"
+            )
+        print("CAP_EVENT ACK observed: PASS")
+        return s
+
+    async def ninalink_events(self, node_id):
+        p = await self.ndp_command(
+            NDP_NINALINK_BRIDGE, bytes([26]) + struct.pack("<I", node_id)
+        )
+        if len(p) != 6:
+            raise RuntimeError(f"Invalid B5.3b event status length: {len(p)}")
+        s = {
+            "node_id": node_id,
+            "count": p[0],
+            "ingested": int.from_bytes(p[1:3], "little"),
+            "dropped": int.from_bytes(p[3:5], "little"),
+            "depth": p[5],
+            "events": [],
+        }
+        types = {1:"BOOL",2:"U8",3:"S8",4:"U16",5:"S16",6:"U32",7:"S32",8:"ENUM8"}
+        for index in range(s["count"]):
+            e = await self.ndp_command(
+                NDP_NINALINK_BRIDGE,
+                bytes([27]) + struct.pack("<I", node_id) + bytes([index]),
+            )
+            if len(e) != 12:
+                raise RuntimeError(f"Invalid B5.3b event entry length: {len(e)}")
+            raw = int.from_bytes(e[4:8], "little")
+            item = {
+                "capability_id": int.from_bytes(e[0:2], "little"),
+                "channel": e[2],
+                "value_type": e[3],
+                "value": self._b53_cached_value(e[3], raw),
+                "sequence": int.from_bytes(e[8:10], "little"),
+                "age_s": int.from_bytes(e[10:12], "little"),
+            }
+            s["events"].append(item)
+
+        print("=== NINALINK B5.3b EVENT HISTORY ===")
+        print(f"Node:             0x{node_id:08X}")
+        print(f"Entries:          {s['count']}/{s['depth']}")
+        print(f"Ingested total:   {s['ingested']}")
+        print(f"Dropped/evicted:  {s['dropped']}")
+        for i, item in enumerate(s["events"]):
+            name = self._capability_name(item["capability_id"])
+            tname = types.get(item["value_type"], f"TYPE{item['value_type']}")
+            print(
+                f"  [{i}] 0x{item['capability_id']:04X} "
+                f"{name}[{item['channel']}]: {tname}={item['value']} "
+                f"seq={item['sequence']} age={item['age_s']}s"
+            )
+        return s
+
+    async def ninalink_cache_clear(self):
+        await self.ndp_command(NDP_NINALINK_BRIDGE, bytes([28]))
+        print("NinaLink B5.3 state cache and event history cleared; node registry preserved.")
+
+    @staticmethod
+    def _b54_unit_name(unit):
+        return {0:"NONE",1:"BOOLEAN",2:"PERCENT",3:"VOLT",4:"AMPERE",
+                5:"WATT",6:"WATT_HOUR",7:"CELSIUS",8:"PASCAL",9:"LUX",
+                10:"PPM",11:"PPB",12:"MILLI_G",13:"HERTZ",14:"SECOND",
+                15:"METER",16:"METER_PER_SECOND",17:"LITER",
+                18:"LITER_PER_MINUTE",19:"RPM",20:"COUNT"}.get(unit, f"UNIT_{unit}")
+
+    @staticmethod
+    def _b54_kind_name(kind):
+        return {1:"MEASUREMENT",2:"STATE",3:"EVENT",4:"COUNTER",
+                5:"POSITION",6:"STATUS"}.get(kind, f"KIND_{kind}")
+
+    async def _b54_external_info(self):
+        p = await self.ndp_command(NDP_NINALINK_BRIDGE, bytes([30]))
+        if len(p) != 12:
+            raise RuntimeError(f"Invalid B5.4 external INFO length: {len(p)}")
+        return {"schema":p[0],"node_count":p[1],"state_value_count":p[2],
+                "event_count":p[3],
+                "oldest_event_id":int.from_bytes(p[4:8],"little"),
+                "newest_event_id":int.from_bytes(p[8:12],"little")}
+
+    async def _b54_external_descriptor(self, capability_id, channel):
+        p = await self.ndp_command(
+            NDP_NINALINK_BRIDGE,
+            bytes([35])+struct.pack("<H",capability_id)+bytes([channel]))
+        if len(p) != 6:
+            raise RuntimeError(f"Invalid B5.4 descriptor length: {len(p)}")
+        scale10 = p[3]-256 if p[3]&0x80 else p[3]
+        return {"known":bool(p[0]),"kind_code":p[1],
+                "kind":self._b54_kind_name(p[1]),"value_type":p[2],
+                "scale10":scale10,"unit_code":p[4],
+                "unit":self._b54_unit_name(p[4]),"behavior_flags":p[5]}
+
+    def _b54_external_value(self, value_type, raw, descriptor):
+        typed = self._b53_cached_value(value_type, raw)
+        if not descriptor["known"]:
+            return typed, None
+        if value_type in (1,8):
+            return typed, typed
+        try:
+            return typed, typed * (10 ** descriptor["scale10"])
+        except TypeError:
+            return typed, None
+
+    async def ninalink_external_snapshot(self, as_json=False):
+        info = await self._b54_external_info()
+        out = {"schema":info["schema"],"node_count":info["node_count"],
+               "state_value_count":info["state_value_count"],
+               "event_window":{"count":info["event_count"],
+                   "oldest_id":info["oldest_event_id"],
+                   "newest_id":info["newest_event_id"]},"nodes":[]}
+        dstates={0:"NEW",1:"CAPS_PENDING",2:"CAPS_DONE",3:"COMMANDS_PENDING",
+                 4:"READY",5:"ERROR"}
+        for index in range(info["node_count"]):
+            p=await self.ndp_command(NDP_NINALINK_BRIDGE,bytes([31,index]))
+            if len(p)!=15: raise RuntimeError(f"Invalid B5.4 NODE length: {len(p)}")
+            node_id=int.from_bytes(p[0:4],"little"); flags=p[13]
+            node={"node_id":f"0x{node_id:08X}","node_id_raw":node_id,
+                  "state_count":p[4],"event_count":p[5],
+                  "discovery_state":dstates.get(p[6],f"STATE_{p[6]}"),
+                  "age_s":int.from_bytes(p[7:9],"little"),
+                  "rssi_dbm":int.from_bytes(p[9:11],"little",signed=True)/2.0,
+                  "snr_db":int.from_bytes(p[11:13],"little",signed=True)/4.0,
+                  "valid":bool(flags&1),"ready":bool(flags&2),
+                  "has_state":bool(flags&4),"session_valid":bool(flags&8),
+                  "last_message_type":p[14],"states":[]}
+            for si in range(node["state_count"]):
+                v=await self.ndp_command(NDP_NINALINK_BRIDGE,
+                    bytes([32])+struct.pack("<I",node_id)+bytes([si]))
+                if len(v)!=15: raise RuntimeError(f"Invalid B5.4 STATE length: {len(v)}")
+                cap=int.from_bytes(v[0:2],"little"); ch=v[2]; typ=v[3]
+                raw=int.from_bytes(v[4:8],"little")
+                desc=await self._b54_external_descriptor(cap,ch)
+                typed,eng=self._b54_external_value(typ,raw,desc)
+                node["states"].append({"capability_id":f"0x{cap:04X}",
+                    "capability_id_raw":cap,"name":self._capability_name(cap),
+                    "channel":ch,"value_type":typ,"raw":raw,
+                    "typed_value":typed,"engineering_value":eng,
+                    "descriptor":desc,"sequence":int.from_bytes(v[8:10],"little"),
+                    "age_s":int.from_bytes(v[10:12],"little"),
+                    "updates":int.from_bytes(v[12:14],"little"),
+                    "source_message_type":v[14]})
+            out["nodes"].append(node)
+        if as_json:
+            print(json.dumps(out,indent=2,sort_keys=True))
+        else:
+            print("=== NINALINK B5.4 EXTERNAL SNAPSHOT ===")
+            print(f"Schema:           {out['schema']}")
+            print(f"Nodes:            {out['node_count']}")
+            print(f"State values:     {out['state_value_count']}")
+            ew=out["event_window"]
+            print(f"Event window:     {ew['count']} (oldest={ew['oldest_id']} newest={ew['newest_id']})")
+            for node in out["nodes"]:
+                print(f"Node {node['node_id']} state={node['state_count']} events={node['event_count']} discovery={node['discovery_state']} age={node['age_s']}s")
+                for item in node["states"]:
+                    d=item["descriptor"]
+                    val=item["engineering_value"] if d["known"] else item["typed_value"]
+                    unit=d["unit"] if d["known"] else "RAW"
+                    print(f"  {item['capability_id']} {item['name']}[{item['channel']}] value={val} {unit} seq={item['sequence']} updates={item['updates']}")
+        return out
+
+    async def ninalink_external_events(self, cursor=0, limit=8, as_json=False):
+        if not 0<=cursor<=0xFFFFFFFF: raise ValueError("--cursor must be 0..0xFFFFFFFF")
+        if not 1<=limit<=64: raise ValueError("--limit must be 1..64")
+        info=await self._b54_external_info(); oldest=info["oldest_event_id"]; newest=info["newest_event_id"]
+        stream_reset=bool(cursor and (newest==0 or cursor>newest))
+        cur=0 if stream_reset else cursor
+        overrun=bool(cur and oldest and (cur+1)<oldest)
+        events=[]
+        for _ in range(limit):
+            p=await self.ndp_command(NDP_NINALINK_BRIDGE,bytes([33])+struct.pack("<I",cur))
+            if len(p)!=15: raise RuntimeError(f"Invalid B5.4 EVENT_NEXT_META length: {len(p)}")
+            if not p[0]: break
+            eid=int.from_bytes(p[1:5],"little"); node=int.from_bytes(p[5:9],"little")
+            cap=int.from_bytes(p[9:11],"little"); ch=p[11]; typ=p[12]
+            seq=int.from_bytes(p[13:15],"little")
+            vp=await self.ndp_command(NDP_NINALINK_BRIDGE,bytes([34])+struct.pack("<I",eid))
+            if len(vp)!=7 or not vp[0]: raise RuntimeError(f"B5.4 event {eid} disappeared during read")
+            raw=int.from_bytes(vp[1:5],"little"); age=int.from_bytes(vp[5:7],"little")
+            desc=await self._b54_external_descriptor(cap,ch)
+            typed,eng=self._b54_external_value(typ,raw,desc)
+            events.append({"event_id":eid,"node_id":f"0x{node:08X}","node_id_raw":node,
+                "capability_id":f"0x{cap:04X}","capability_id_raw":cap,
+                "name":self._capability_name(cap),"channel":ch,"value_type":typ,
+                "raw":raw,"typed_value":typed,"engineering_value":eng,
+                "descriptor":desc,"sequence":seq,"age_s":age})
+            cur=eid
+        out={"schema":info["schema"],"requested_cursor":cursor,"next_cursor":cur,
+             "overrun":overrun,"stream_reset":stream_reset,
+             "window":{"count":info["event_count"],"oldest_id":oldest,"newest_id":newest},
+             "events":events}
+        if as_json:
+            print(json.dumps(out,indent=2,sort_keys=True))
+        else:
+            print("=== NINALINK B5.4 EXTERNAL EVENTS ===")
+            print(f"Requested cursor: {cursor}");print(f"Next cursor:      {cur}")
+            print(f"Overrun:          {'yes' if overrun else 'no'}")
+            print(f"Stream reset:     {'yes' if stream_reset else 'no'}")
+            for e in events:
+                print(f"  id={e['event_id']} node={e['node_id']} {e['capability_id']} {e['name']}[{e['channel']}] value={e['typed_value']} seq={e['sequence']} age={e['age_s']}s")
+        return out
+
+    async def ninalink_consumer_status(self):
+        p = await self.ndp_command(NDP_NINALINK_BRIDGE, b"\x17")
+        if len(p) != 12:
+            raise RuntimeError(f"Invalid B5.3 consumer status length: {len(p)}")
+        s = {
+            "admission_queued": p[0],
+            "consumed": int.from_bytes(p[1:3], "little"),
+            "cached_frames": int.from_bytes(p[3:5], "little"),
+            "cache_errors": int.from_bytes(p[5:7], "little"),
+            "diagnostic_queued": p[7],
+            "diagnostic_dropped": int.from_bytes(p[8:10], "little"),
+            "cache_nodes": p[10],
+            "cache_values": p[11],
+        }
+        print("=== NINALINK B5.3 INTERNAL CONSUMER ===")
+        print(f"Admission queued: {s['admission_queued']}")
+        print(f"Consumed:         {s['consumed']}")
+        print(f"Cached frames:    {s['cached_frames']}")
+        print(f"Cache errors:     {s['cache_errors']}")
+        print(f"Diag queued:      {s['diagnostic_queued']}")
+        print(f"Diag dropped:     {s['diagnostic_dropped']}")
+        print(f"Cache nodes:      {s['cache_nodes']}")
+        print(f"Cache values:     {s['cache_values']}")
+        return s
+
+    @staticmethod
+    def _b53_cached_value(value_type, raw):
+        if value_type == 1:
+            return bool(raw & 1)
+        if value_type in (2, 8):
+            return raw & 0xFF
+        if value_type == 3:
+            v = raw & 0xFF
+            return v - 0x100 if v & 0x80 else v
+        if value_type == 4:
+            return raw & 0xFFFF
+        if value_type == 5:
+            v = raw & 0xFFFF
+            return v - 0x10000 if v & 0x8000 else v
+        if value_type == 6:
+            return raw
+        if value_type == 7:
+            return raw - 0x100000000 if raw & 0x80000000 else raw
+        return raw
+
+    async def ninalink_state_cache(self, node_id):
+        p = await self.ndp_command(
+            NDP_NINALINK_BRIDGE, bytes([24]) + struct.pack("<I", node_id)
+        )
+        if len(p) != 13:
+            raise RuntimeError(f"Invalid B5.3 node cache status length: {len(p)}")
+        s = {
+            "node_id": node_id,
+            "value_count": p[0],
+            "updates": int.from_bytes(p[1:3], "little"),
+            "reports": int.from_bytes(p[3:5], "little"),
+            "events": int.from_bytes(p[5:7], "little"),
+            "last_sequence": int.from_bytes(p[7:9], "little"),
+            "last_message_type": p[9],
+            "age_s": int.from_bytes(p[10:12], "little"),
+            "schema": p[12],
+            "session_valid": False,
+            "session_id": 0,
+            "session_changes": 0,
+            "values": [],
+        }
+        if s["schema"] >= 3:
+            sp = await self.ndp_command(
+                NDP_NINALINK_BRIDGE,
+                bytes([29]) + struct.pack("<I", node_id),
+            )
+            if len(sp) != 7:
+                raise RuntimeError(
+                    f"Invalid B5.3d node session-cache status length: {len(sp)}"
+                )
+            s["session_valid"] = bool(sp[0])
+            s["session_id"] = int.from_bytes(sp[1:5], "little")
+            s["session_changes"] = int.from_bytes(sp[5:7], "little")
+        types = {1:"BOOL",2:"U8",3:"S8",4:"U16",5:"S16",6:"U32",7:"S32",8:"ENUM8"}
+        msg_names = {0x10:"CAP_REPORT",0x11:"CAP_EVENT"}
+        for index in range(s["value_count"]):
+            v = await self.ndp_command(
+                NDP_NINALINK_BRIDGE,
+                bytes([25]) + struct.pack("<I", node_id) + bytes([index]),
+            )
+            if len(v) != 15:
+                raise RuntimeError(f"Invalid B5.3 cached value length: {len(v)}")
+            raw = int.from_bytes(v[4:8], "little")
+            item = {
+                "capability_id": int.from_bytes(v[0:2], "little"),
+                "channel": v[2],
+                "value_type": v[3],
+                "value": self._b53_cached_value(v[3], raw),
+                "sequence": int.from_bytes(v[8:10], "little"),
+                "message_type": v[10],
+                "age_s": int.from_bytes(v[11:13], "little"),
+                "update_count": int.from_bytes(v[13:15], "little"),
+            }
+            s["values"].append(item)
+        print("=== NINALINK B5.3 NODE STATE CACHE ===")
+        print(f"Node:             0x{node_id:08X}")
+        print(f"Values:           {s['value_count']}")
+        print(f"Frame updates:    {s['updates']}")
+        print(f"Reports:          {s['reports']}")
+        print(f"Events:           {s['events']}")
+        print(f"Last sequence:    {s['last_sequence']}")
+        print(f"Last message:     {msg_names.get(s['last_message_type'], hex(s['last_message_type']))}")
+        print(f"Last seen:        {s['age_s']} s ago")
+        if s["schema"] >= 3:
+            print(f"Session:          {'0x%08X' % s['session_id'] if s['session_valid'] else 'NONE'}")
+            print(f"Session changes:  {s['session_changes']}")
+        for item in s["values"]:
+            name = self._capability_name(item["capability_id"])
+            tname = types.get(item["value_type"], f"TYPE{item['value_type']}")
+            source = msg_names.get(item["message_type"], f"0x{item['message_type']:02X}")
+            print(
+                f"  0x{item['capability_id']:04X} {name}[{item['channel']}]: "
+                f"{tname}={item['value']} seq={item['sequence']} "
+                f"source={source} age={item['age_s']}s updates={item['update_count']}"
+            )
+        return s
+
+    async def ninalink_auto_discovery(self, mode="status"):
+        mode = mode.lower()
+        if mode == "status":
+            req = b"\x16"
+        elif mode == "on":
+            req = b"\x16\x01"
+        elif mode == "off":
+            req = b"\x16\x00"
+        else:
+            raise ValueError("mode must be status, on, or off")
+
+        p = await self.ndp_command(NDP_NINALINK_BRIDGE, req)
+        if len(p) != 9:
+            raise RuntimeError(
+                f"Invalid B5.2 auto-discovery status length: {len(p)}"
+            )
+        kinds = {0:"NONE", 1:"CAPABILITY", 2:"COMMAND"}
+        s = {
+            "enabled": bool(p[0]),
+            "inflight": bool(p[1]),
+            "kind": p[2],
+            "node_id": int.from_bytes(p[3:7], "little"),
+            "request_seq": int.from_bytes(p[7:9], "little"),
+        }
+        print("=== NINALINK B5.2 AUTOMATIC DISCOVERY ===")
+        print(f"Enabled:          {'yes' if s['enabled'] else 'no'}")
+        print(f"In flight:        {'yes' if s['inflight'] else 'no'}")
+        print(f"Kind:             {kinds.get(s['kind'], s['kind'])}")
+        print(f"Target node:      0x{s['node_id']:08X}")
+        print(f"Request seq:      {s['request_seq']}")
+        return s
+
+    async def ninalink_nodes_clear(self):
+        await self.ndp_command(NDP_NINALINK_BRIDGE, b"\x14")
+        print("NinaLink B5 RAM node registry and state cache cleared.")
+
     def _decode_ninalink_bridge_status(self, p: bytes) -> dict:
         if len(p) != 15:
             raise RuntimeError(
@@ -3746,7 +4351,7 @@ class NRFClawClient:
             )
 
         print(
-            f"NinaLink B4.2 bridge: draining validated frames "
+            f"NinaLink B5.3 bridge: draining diagnostic mirror of validated frames "
             f"({timeout_s:g}s window)"
         )
         print(
@@ -6460,6 +7065,52 @@ async def main_async(args):
         elif args.action == "ninalink-tx-max":
             await nrf.ninalink_tx_max()
 
+        elif args.action == "ninalink-nodes":
+            await nrf.ninalink_nodes()
+
+        elif args.action == "ninalink-nodes-clear":
+            await nrf.ninalink_nodes_clear()
+
+        elif args.action == "ninalink-session-status":
+            await nrf.ninalink_session_status()
+
+        elif args.action == "ninalink-session-force":
+            await nrf.ninalink_session_force(args.id)
+
+        elif args.action == "ninalink-state-test":
+            await nrf.ninalink_state_test(
+                args.temp_centi, args.seq,
+                args.window, args.attempts,
+                args.backoff, args.wait
+            )
+
+        elif args.action == "ninalink-event-test":
+            await nrf.ninalink_event_test(
+                args.event, args.window, args.attempts,
+                args.backoff, args.wait
+            )
+
+        elif args.action == "ninalink-events":
+            await nrf.ninalink_events(args.node)
+
+        elif args.action == "ninalink-cache-clear":
+            await nrf.ninalink_cache_clear()
+
+        elif args.action == "ninalink-external-snapshot":
+            await nrf.ninalink_external_snapshot(args.json)
+
+        elif args.action == "ninalink-external-events":
+            await nrf.ninalink_external_events(args.cursor, args.limit, args.json)
+
+        elif args.action == "ninalink-consumer-status":
+            await nrf.ninalink_consumer_status()
+
+        elif args.action == "ninalink-state-cache":
+            await nrf.ninalink_state_cache(args.node)
+
+        elif args.action == "ninalink-auto-discovery":
+            await nrf.ninalink_auto_discovery(args.mode)
+
         elif args.action == "ninalink-bridge-start":
             await nrf.ninalink_bridge_start()
 
@@ -7028,6 +7679,106 @@ def build_parser():
     sub.add_parser("ninalink-tx-status", help="Show B4.1 autonomous NinaLink lab TX status")
     sub.add_parser("ninalink-tx-stop", help="Stop B4.1 autonomous NinaLink lab TX")
     sub.add_parser("ninalink-tx-max", help="B4.2 transmit one valid maximum 64-byte CAP_REPORT")
+    sub.add_parser(
+        "ninalink-nodes",
+        help="B5.1 list RAM node registry observed by the bridge",
+    )
+    sub.add_parser(
+        "ninalink-nodes-clear",
+        help="B5.1 clear the bridge RAM node registry",
+    )
+    sub.add_parser(
+        "ninalink-session-status",
+        help="B5.3d show current node boot/session epoch",
+    )
+    nsession = sub.add_parser(
+        "ninalink-session-force",
+        help="B5.3d lab-only force node session ID without changing sequence",
+    )
+    nsession.add_argument(
+        "--id", type=lambda x: int(x, 0), required=True,
+        help="forced 32-bit session ID, e.g. 0x22222222",
+    )
+
+    nstate = sub.add_parser(
+        "ninalink-state-test",
+        help="B5.3c send deterministic reliable CAP_REPORT with forced sequence",
+    )
+    nstate.add_argument(
+        "--temp-centi", type=int, required=True,
+        help="TEMPERATURE[0] value in centi-degrees C, e.g. 2025 = 20.25 C",
+    )
+    nstate.add_argument(
+        "--seq", type=lambda x: int(x, 0), required=True,
+        help="forced NinaLink sequence, 0..65535",
+    )
+    nstate.add_argument("--window", type=int, default=600, metavar="MS")
+    nstate.add_argument("--attempts", type=int, default=3)
+    nstate.add_argument("--backoff", type=int, default=200, metavar="MS")
+    nstate.add_argument("--wait", type=float, default=6.0, metavar="SECONDS")
+
+    nevent = sub.add_parser(
+        "ninalink-event-test",
+        help="B5.3b send deterministic reliable synthetic CAP_EVENT",
+    )
+    nevent.add_argument(
+        "--event", choices=("tap", "fall"), default="tap",
+        help="synthetic event kind (default: tap)",
+    )
+    nevent.add_argument("--window", type=int, default=600, metavar="MS")
+    nevent.add_argument("--attempts", type=int, default=3)
+    nevent.add_argument("--backoff", type=int, default=200, metavar="MS")
+    nevent.add_argument("--wait", type=float, default=6.0, metavar="SECONDS")
+
+    nevents = sub.add_parser(
+        "ninalink-events",
+        help="B5.3b show ephemeral CAP_EVENT history for a node",
+    )
+    nevents.add_argument(
+        "--node", type=lambda x: int(x, 0), required=True,
+        help="node id, e.g. 0xAD64D423",
+    )
+    sub.add_parser(
+        "ninalink-cache-clear",
+        help="B5.3b clear state/event cache without clearing node discovery registry",
+    )
+    nextsnap = sub.add_parser(
+        "ninalink-external-snapshot",
+        help="B5.4 read-only external node/state snapshot",
+    )
+    nextsnap.add_argument("--json", action="store_true", help="emit stable machine-readable JSON")
+
+    nextev = sub.add_parser(
+        "ninalink-external-events",
+        help="B5.4 read external events after a monotonic cursor",
+    )
+    nextev.add_argument("--cursor", type=lambda x: int(x, 0), default=0, help="last consumed event_id")
+    nextev.add_argument("--limit", type=int, default=8, help="maximum events to return (1..64)")
+    nextev.add_argument("--json", action="store_true", help="emit stable machine-readable JSON")
+
+    sub.add_parser(
+        "ninalink-consumer-status",
+        help="B5.3 show internal validated-queue consumer status",
+    )
+    ncache = sub.add_parser(
+        "ninalink-state-cache",
+        help="B5.3 show cached semantic values for a NinaLink node",
+    )
+    ncache.add_argument(
+        "--node", type=lambda x: int(x, 0), required=True,
+        help="node id, e.g. 0xAD64D423",
+    )
+    nauto = sub.add_parser(
+        "ninalink-auto-discovery",
+        help="B5.2 automatic capability/command discovery control",
+    )
+    nauto.add_argument(
+        "mode",
+        nargs="?",
+        choices=("status", "on", "off"),
+        default="status",
+        help="status (default), on, or off",
+    )
     sub.add_parser("ninalink-bridge-start", help="B4.2 start continuous on-device validated NinaLink bridge RX")
     sub.add_parser("ninalink-bridge-status", help="Show B4.2 NinaLink bridge counters/status")
     nbrx = sub.add_parser("ninalink-bridge-rx", help="Drain B4.2 on-device validated NinaLink frames")

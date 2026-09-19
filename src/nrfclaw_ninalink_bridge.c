@@ -1,8 +1,12 @@
 #include "nrfclaw_ninalink_bridge.h"
+#include "nrfclaw_ninalink_node_registry.h"
+#include "nrfclaw_ninalink_auto_discovery.h"
+#include "nrfclaw_ninalink_state_cache.h"
 
 #include "app_timer.h"
 #include "nrf.h"
 #include "nrfclaw_lora.h"
+#include "nrfclaw_rtc.h"
 #include "nrfclaw_ninalink_msg.h"
 #include "nrfclaw_ninalink_command.h"
 #include "nrfclaw_ninalink_command_discovery.h"
@@ -23,12 +27,21 @@
 #define COMMAND_PAYLOAD_BASE     5U
 #define COMMAND_RESULT_BASE      4U
 
+#define BRIDGE_DIAG_QUEUE_DEPTH 8U
+#define BRIDGE_SESSION_NODES 8U
+
 typedef struct {
     uint8_t len;
     uint8_t data[NRFCLAW_NINALINK_MAX_FRAME_SIZE];
     int16_t rssi_x2;
     int16_t snr_x4;
 } bridge_queue_packet_t;
+
+typedef struct {
+    bool valid;
+    uint32_t node_id;
+    uint32_t session_id;
+} bridge_session_entry_t;
 
 typedef struct {
     bool valid;
@@ -75,6 +88,17 @@ static bridge_queue_packet_t m_queue[NRFCLAW_NINALINK_BRIDGE_QUEUE_DEPTH];
 static uint8_t m_head;
 static uint8_t m_tail;
 static uint8_t m_count;
+
+static bridge_queue_packet_t m_diag_queue[BRIDGE_DIAG_QUEUE_DEPTH];
+static uint8_t m_diag_head;
+static uint8_t m_diag_tail;
+static uint8_t m_diag_count;
+static uint16_t m_consumer_consumed;
+static uint16_t m_consumer_cached_frames;
+static uint16_t m_consumer_cache_errors;
+static uint16_t m_diag_dropped;
+
+static bridge_session_entry_t m_sessions[BRIDGE_SESSION_NODES];
 
 static bridge_dup_entry_t m_dup[NRFCLAW_NINALINK_BRIDGE_DUP_CACHE];
 static uint8_t m_dup_head;
@@ -156,12 +180,106 @@ static void reset_queue(void)
     m_head = 0U;
     m_tail = 0U;
     m_count = 0U;
+    m_diag_head = 0U;
+    m_diag_tail = 0U;
+    m_diag_count = 0U;
 }
 
 static void reset_dup_cache(void)
 {
     memset(m_dup, 0, sizeof(m_dup));
     m_dup_head = 0U;
+}
+
+static int find_session(uint32_t node_id)
+{
+    uint8_t i;
+    for (i = 0U; i < BRIDGE_SESSION_NODES; i++) {
+        if (m_sessions[i].valid && m_sessions[i].node_id == node_id)
+            return (int)i;
+    }
+    return -1;
+}
+
+static bool session_needs_commit(uint32_t node_id, uint32_t session_id)
+{
+    int found;
+    if (session_id == 0U || session_id == 0xFFFFFFFFUL)
+        return false;
+    found = find_session(node_id);
+    return found < 0 || m_sessions[(uint8_t)found].session_id != session_id;
+}
+
+static void forget_duplicates_for_node(uint32_t node_id)
+{
+    uint8_t i;
+    for (i = 0U; i < NRFCLAW_NINALINK_BRIDGE_DUP_CACHE; i++) {
+        if (m_dup[i].valid && m_dup[i].node_id == node_id)
+            m_dup[i].valid = false;
+    }
+}
+
+static void commit_session(uint32_t node_id, uint32_t session_id)
+{
+    int found;
+    uint8_t i;
+
+    if (session_id == 0U || session_id == 0xFFFFFFFFUL)
+        return;
+
+    found = find_session(node_id);
+    if (found >= 0) {
+        m_sessions[(uint8_t)found].session_id = session_id;
+        return;
+    }
+
+    for (i = 0U; i < BRIDGE_SESSION_NODES; i++) {
+        if (!m_sessions[i].valid) {
+            m_sessions[i].valid = true;
+            m_sessions[i].node_id = node_id;
+            m_sessions[i].session_id = session_id;
+            return;
+        }
+    }
+
+    /* B5.3 cache itself is also bounded to eight nodes; deterministic fallback. */
+    m_sessions[0].valid = true;
+    m_sessions[0].node_id = node_id;
+    m_sessions[0].session_id = session_id;
+}
+
+static bool extract_session_metadata(
+    const nrfclaw_ninalink_frame_t *frame,
+    uint32_t *session_id)
+{
+    nrfclaw_ninalink_value_entry_t entries[NRFCLAW_NINALINK_MAX_VALUE_ENTRIES];
+    uint8_t count = 0U;
+    uint8_t i;
+
+    if (session_id)
+        *session_id = 0U;
+    if (!frame || !session_id)
+        return false;
+    if (frame->message_type != NRFCLAW_NINALINK_MSG_CAP_REPORT &&
+        frame->message_type != NRFCLAW_NINALINK_MSG_CAP_EVENT)
+        return false;
+    if (nrfclaw_ninalink_parse_values(
+            frame, entries, NRFCLAW_NINALINK_MAX_VALUE_ENTRIES, &count) !=
+            NRFCLAW_NINALINK_MSG_OK)
+        return false;
+
+    for (i = 0U; i < count; i++) {
+        if (entries[i].capability_id != NRFCLAW_NINALINK_META_SESSION_ID)
+            continue;
+        if (entries[i].channel != 0U ||
+            entries[i].value.type != NRFCLAW_CAP_VALUE_U32 ||
+            entries[i].value.v.u32 == 0U ||
+            entries[i].value.v.u32 == 0xFFFFFFFFUL)
+            return false;
+        *session_id = entries[i].value.v.u32;
+        return true;
+    }
+    return false;
 }
 
 static bool is_duplicate(const uint8_t *wire)
@@ -255,6 +373,79 @@ static bool queue_validated(const uint8_t *data,
     m_head = (uint8_t)((m_head + 1U) % NRFCLAW_NINALINK_BRIDGE_QUEUE_DEPTH);
     m_count++;
     return true;
+}
+
+static void diagnostic_mirror_push(
+    const bridge_queue_packet_t *src)
+{
+    bridge_queue_packet_t *dst;
+    if (!src)
+        return;
+    if (m_diag_count >= BRIDGE_DIAG_QUEUE_DEPTH) {
+        m_diag_tail = (uint8_t)((m_diag_tail + 1U) % BRIDGE_DIAG_QUEUE_DEPTH);
+        m_diag_count--;
+        if (m_diag_dropped != 0xFFFFU)
+            m_diag_dropped++;
+    }
+    dst = &m_diag_queue[m_diag_head];
+    *dst = *src;
+    m_diag_head = (uint8_t)((m_diag_head + 1U) % BRIDGE_DIAG_QUEUE_DEPTH);
+    m_diag_count++;
+}
+
+static void consume_validated_queue(void)
+{
+    while (m_count != 0U) {
+        bridge_queue_packet_t *packet = &m_queue[m_tail];
+        nrfclaw_ninalink_frame_t frame;
+
+        if (nrfclaw_ninalink_decode(packet->data, packet->len, &frame) ==
+                NRFCLAW_NINALINK_OK &&
+            (frame.message_type == NRFCLAW_NINALINK_MSG_CAP_REPORT ||
+             frame.message_type == NRFCLAW_NINALINK_MSG_CAP_EVENT)) {
+            nrfclaw_ninalink_value_entry_t entries[NRFCLAW_NINALINK_MAX_VALUE_ENTRIES];
+            uint8_t entry_count = 0U;
+            if (nrfclaw_ninalink_parse_values(
+                    &frame, entries, NRFCLAW_NINALINK_MAX_VALUE_ENTRIES,
+                    &entry_count) == NRFCLAW_NINALINK_MSG_OK) {
+                uint8_t src_i;
+                uint8_t dst_i = 0U;
+                uint32_t session_id = 0U;
+
+                for (src_i = 0U; src_i < entry_count; src_i++) {
+                    if (entries[src_i].capability_id ==
+                            NRFCLAW_NINALINK_META_SESSION_ID &&
+                        entries[src_i].channel == 0U &&
+                        entries[src_i].value.type == NRFCLAW_CAP_VALUE_U32) {
+                        session_id = entries[src_i].value.v.u32;
+                        continue;
+                    }
+                    if (dst_i != src_i)
+                        entries[dst_i] = entries[src_i];
+                    dst_i++;
+                }
+
+                if (dst_i != 0U &&
+                    nrfclaw_ninalink_state_cache_ingest_values_session(
+                        frame.node_id, session_id, frame.sequence,
+                        frame.message_type, entries, dst_i,
+                        nrfclaw_rtc_now())) {
+                    if (m_consumer_cached_frames != 0xFFFFU)
+                        m_consumer_cached_frames++;
+                } else if (m_consumer_cache_errors != 0xFFFFU) {
+                    m_consumer_cache_errors++;
+                }
+            } else if (m_consumer_cache_errors != 0xFFFFU) {
+                m_consumer_cache_errors++;
+            }
+        }
+
+        diagnostic_mirror_push(packet);
+        m_tail = (uint8_t)((m_tail + 1U) % NRFCLAW_NINALINK_BRIDGE_QUEUE_DEPTH);
+        m_count--;
+        if (m_consumer_consumed != 0xFFFFU)
+            m_consumer_consumed++;
+    }
 }
 
 static bool restart_stream(void)
@@ -717,6 +908,7 @@ bool nrfclaw_ninalink_bridge_start(void)
 
     reset_queue();
     reset_dup_cache();
+    memset(m_sessions, 0, sizeof(m_sessions));
 
     m_received = 0U;
     m_valid = 0U;
@@ -747,6 +939,13 @@ bool nrfclaw_ninalink_bridge_start(void)
 
     memset(&m_capdisc, 0, sizeof(m_capdisc));
     m_capdisc.state = NRFCLAW_NINALINK_APP_DL_IDLE;
+
+    nrfclaw_ninalink_auto_discovery_reset_runtime();
+
+    m_consumer_consumed = 0U;
+    m_consumer_cached_frames = 0U;
+    m_consumer_cache_errors = 0U;
+    m_diag_dropped = 0U;
 
     if (!nrfclaw_lora_diag_stream_start())
         return false;
@@ -927,6 +1126,38 @@ void nrfclaw_ninalink_bridge_get_capability_discovery_status(
         *out = m_capdisc;
 }
 
+bool nrfclaw_ninalink_bridge_cancel_capability_discovery(
+    uint32_t target_node,
+    uint16_t request_seq)
+{
+    if (!m_capdisc.pending ||
+        m_capdisc.target_node != target_node ||
+        m_capdisc.request_seq != request_seq)
+        return false;
+    if (m_tx_state == BRIDGE_TX_WAIT_APP_RESULT ||
+        m_tx_kind == BRIDGE_TX_KIND_CAPABILITY_DISCOVERY)
+        return false;
+    m_capdisc.pending = false;
+    m_capdisc.state = NRFCLAW_NINALINK_APP_DL_IDLE;
+    return true;
+}
+
+bool nrfclaw_ninalink_bridge_cancel_command_discovery(
+    uint32_t target_node,
+    uint16_t request_seq)
+{
+    if (!m_disc.pending ||
+        m_disc.target_node != target_node ||
+        m_disc.request_seq != request_seq)
+        return false;
+    if (m_tx_state == BRIDGE_TX_WAIT_APP_RESULT ||
+        m_tx_kind == BRIDGE_TX_KIND_COMMAND_DISCOVERY)
+        return false;
+    m_disc.pending = false;
+    m_disc.state = NRFCLAW_NINALINK_APP_DL_IDLE;
+    return true;
+}
+
 void nrfclaw_ninalink_bridge_process(void)
 {
     uint8_t wire[NRFCLAW_NINALINK_MAX_FRAME_SIZE];
@@ -936,6 +1167,8 @@ void nrfclaw_ninalink_bridge_process(void)
 
     if (!m_active)
         return;
+
+    nrfclaw_ninalink_auto_discovery_process();
 
     /*
      * Complete a deferred continuous-RX rearm before processing application
@@ -1124,6 +1357,9 @@ void nrfclaw_ninalink_bridge_process(void)
         nrfclaw_ninalink_frame_t frame;
         nrfclaw_ninalink_status_t st;
         bool ack_req;
+        uint32_t frame_session_id = 0U;
+        bool has_session;
+        bool session_changed;
 
         m_received++;
 
@@ -1140,12 +1376,23 @@ void nrfclaw_ninalink_bridge_process(void)
             continue;
         }
 
-        ack_req = (wire[2] & 0x01U) != 0U;
+        nrfclaw_ninalink_node_registry_observe(
+            &frame,
+            rssi_x2,
+            snr_x4,
+            nrfclaw_rtc_now());
 
-        if (is_duplicate(wire)) {
+        ack_req = (wire[2] & 0x01U) != 0U;
+        has_session = extract_session_metadata(&frame, &frame_session_id);
+        session_changed = has_session &&
+            session_needs_commit(frame.node_id, frame_session_id);
+
+        if (!session_changed && is_duplicate(wire)) {
             m_duplicates++;
 
             if (ack_req) {
+                nrfclaw_ninalink_auto_discovery_on_contact(
+                    frame.node_id);
                 (void)schedule_response_for_uplink(wire);
                 break;
             }
@@ -1155,33 +1402,53 @@ void nrfclaw_ninalink_bridge_process(void)
         if (!queue_validated(wire, len, rssi_x2, snr_x4))
             continue;
 
+        if (session_changed) {
+            forget_duplicates_for_node(frame.node_id);
+            commit_session(frame.node_id, frame_session_id);
+        }
+
         remember_frame(wire);
         m_valid++;
         m_last_error = NRFCLAW_NINALINK_BRIDGE_ERR_NONE;
 
+        consume_validated_queue();
+
         if (ack_req) {
+            nrfclaw_ninalink_auto_discovery_on_contact(
+                frame.node_id);
             (void)schedule_response_for_uplink(wire);
             break;
         }
     }
 }
 
-bool nrfclaw_ninalink_bridge_take(nrfclaw_ninalink_bridge_packet_t *out)
+bool nrfclaw_ninalink_bridge_take(
+    nrfclaw_ninalink_bridge_packet_t *out)
 {
     bridge_queue_packet_t const *p;
-
-    if (!out || m_count == 0U)
+    if (!out || m_diag_count == 0U)
         return false;
-
-    p = &m_queue[m_tail];
+    p = &m_diag_queue[m_diag_tail];
     out->len = p->len;
     memcpy(out->data, p->data, p->len);
     out->rssi_x2 = p->rssi_x2;
     out->snr_x4 = p->snr_x4;
-
-    m_tail = (uint8_t)((m_tail + 1U) % NRFCLAW_NINALINK_BRIDGE_QUEUE_DEPTH);
-    m_count--;
+    m_diag_tail = (uint8_t)((m_diag_tail + 1U) % BRIDGE_DIAG_QUEUE_DEPTH);
+    m_diag_count--;
     return true;
+}
+
+void nrfclaw_ninalink_bridge_get_consumer_status(
+    nrfclaw_ninalink_bridge_consumer_status_t *out)
+{
+    if (!out)
+        return;
+    out->admission_queued = m_count;
+    out->consumed = m_consumer_consumed;
+    out->cached_frames = m_consumer_cached_frames;
+    out->cache_errors = m_consumer_cache_errors;
+    out->diagnostic_queued = m_diag_count;
+    out->diagnostic_dropped = m_diag_dropped;
 }
 
 void nrfclaw_ninalink_bridge_get_status(nrfclaw_ninalink_bridge_status_t *out)

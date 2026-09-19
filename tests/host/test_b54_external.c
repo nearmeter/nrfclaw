@@ -1,0 +1,14 @@
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include "nrfclaw_ninalink_external.h"
+#include "nrfclaw_ninalink_node_registry.h"
+#include "nrfclaw_ninalink_state_cache.h"
+static unsigned t,f;
+#define C(n,x) do{t++;if(x)printf("PASS %s\n",n);else{printf("FAIL %s\n",n);f++;}}while(0)
+bool nrfclaw_capability_descriptor(uint16_t id,uint8_t ch,nrfclaw_capability_desc_t *o){if(!o||ch)return false;memset(o,0,sizeof(*o));o->capability_id=id;if(id==0x0001U){o->kind=NRFCLAW_CAP_KIND_MEASUREMENT;o->value_type=NRFCLAW_CAP_VALUE_U16;o->scale10=-3;o->unit=NRFCLAW_CAP_UNIT_VOLT;return true;}if(id==0x0100U){o->kind=NRFCLAW_CAP_KIND_MEASUREMENT;o->value_type=NRFCLAW_CAP_VALUE_S16;o->scale10=-2;o->unit=NRFCLAW_CAP_UNIT_CELSIUS;return true;}return false;}
+int main(void){const uint32_t A=0xAD64D423UL;nrfclaw_ninalink_frame_t fr;nrfclaw_ninalink_value_entry_t v[2],e;nrfclaw_ninalink_external_status_t xs;nrfclaw_ninalink_external_node_t n;nrfclaw_ninalink_external_state_t st;nrfclaw_ninalink_external_event_meta_t em;nrfclaw_ninalink_external_event_value_t ev;nrfclaw_ninalink_external_descriptor_t d;
+nrfclaw_ninalink_node_registry_clear();nrfclaw_ninalink_state_cache_clear();memset(&fr,0,sizeof(fr));fr.node_id=A;fr.sequence=1;fr.message_type=NRFCLAW_NINALINK_MSG_CAP_REPORT;nrfclaw_ninalink_node_registry_observe(&fr,-60,48,100U);
+memset(v,0,sizeof(v));v[0].capability_id=0x0001U;v[0].value.type=NRFCLAW_CAP_VALUE_U16;v[0].value.v.u16=3310;v[1].capability_id=0x0100U;v[1].value.type=NRFCLAW_CAP_VALUE_S16;v[1].value.v.s16=2162;C("report",nrfclaw_ninalink_state_cache_ingest_values_session(A,0x12345678UL,1U,NRFCLAW_NINALINK_MSG_CAP_REPORT,v,2U,100U));
+memset(&e,0,sizeof(e));e.capability_id=0x0201U;e.value.type=NRFCLAW_CAP_VALUE_ENUM8;e.value.v.u8=2U;C("event",nrfclaw_ninalink_state_cache_ingest_values_session(A,0x12345678UL,2U,NRFCLAW_NINALINK_MSG_CAP_EVENT,&e,1U,110U));
+nrfclaw_ninalink_external_get_status(&xs);C("info",xs.schema_version==1U&&xs.node_count==1U&&xs.state_value_count==2U&&xs.event_count==1U&&xs.oldest_event_id==1U&&xs.newest_event_id==1U);C("node",nrfclaw_ninalink_external_get_node(0U,120U,&n)&&n.node_id==A&&n.state_count==2U&&n.event_count==1U&&(n.flags&NRFCLAW_NINALINK_EXTERNAL_NODE_SESSION_VALID));C("state",nrfclaw_ninalink_external_get_state(A,0U,120U,&st)&&st.capability_id==0x0001U&&st.raw_value==3310U&&st.update_count==1U);C("eventmeta",nrfclaw_ninalink_external_get_event_after(0U,&em)&&em.event_id==1U&&em.capability_id==0x0201U);C("eventvalue",nrfclaw_ninalink_external_get_event_value(1U,120U,&ev)&&ev.raw_value==2U&&ev.age_s==10U);nrfclaw_ninalink_external_get_descriptor(0x0100U,0U,&d);C("desc known",d.known&&d.scale10==-2&&d.unit==NRFCLAW_CAP_UNIT_CELSIUS);nrfclaw_ninalink_external_get_descriptor(0x9000U,0U,&d);C("desc unknown",!d.known);printf("\n%u test(s), %u failure(s)\n",t,f);return f?1:0;}

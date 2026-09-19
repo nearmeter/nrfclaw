@@ -6983,6 +6983,93 @@ async def firmware_upgrade(args):
     finally:
         await dfu.close()
 
+async def run_ninalink_external_reconcile(args):
+    from nrfclaw_external import NinaLinkExternalReconciler
+
+    name, dev = await find_app_device(args.device, args.scan_timeout)
+    if not args.json:
+        print(f"Connecting Application: {name} ({dev.address})")
+
+    async with ApplicationNDPClient(
+        dev, ndp_access_key(args.ndp_key)
+    ) as app:
+        baseline = await app.ninalink_change_subscribe(3)
+        reconciler = NinaLinkExternalReconciler(
+            app, NDP_NINALINK_BRIDGE
+        )
+        initial = await reconciler.initialize(baseline)
+
+        if args.json:
+            print(json.dumps(initial, sort_keys=True), flush=True)
+        else:
+            print("=== NINALINK B6.1b LIVE RECONCILIATION ===")
+            print(f"State revision:   {initial['state_revision']}")
+            print(f"Event revision:   {initial['event_revision']}")
+            print(f"Event cursor:     {initial['event_cursor']}")
+            print(f"Nodes:            {initial['model']['node_count']}")
+
+        for _ in range(args.count):
+            change = await app.ninalink_wait_change(args.timeout)
+            row = await reconciler.reconcile(change)
+
+            if args.json:
+                print(json.dumps(row, sort_keys=True), flush=True)
+            else:
+                names = []
+                if row["state_changed"]:
+                    names.append("STATE")
+                if row["event_changed"]:
+                    names.append("EVENT")
+                print(
+                    f"RECONCILE flags={'+'.join(names) or 'NONE'} "
+                    f"state_rev={row['state_revision']} "
+                    f"event_rev={row['event_revision']} "
+                    f"cursor={row['event_cursor']} "
+                    f"events={len(row['events'])} "
+                    f"overrun={'yes' if row['overrun'] else 'no'} "
+                    f"reset={'yes' if row['stream_reset'] else 'no'}",
+                    flush=True,
+                )
+
+async def run_ninalink_external_model(args):
+    from nrfclaw_external import NinaLinkExternalModelBuilder
+
+    name, dev = await find_app_device(args.device, args.scan_timeout)
+    if not args.json:
+        print(f"Connecting Application: {name} ({dev.address})")
+
+    async with ApplicationNDPClient(
+        dev, ndp_access_key(args.ndp_key)
+    ) as app:
+        model = await NinaLinkExternalModelBuilder(
+            app, NDP_NINALINK_BRIDGE
+        ).read()
+
+    if args.json:
+        print(json.dumps(model, indent=2, sort_keys=True))
+        return
+
+    print("=== NINALINK B6.1a EXTERNAL MODEL ===")
+    print(f"Model schema:      {model['model_schema']}")
+    print(f"External schema:   {model['external_schema']}")
+    print(f"Nodes:             {model['node_count']}")
+    print(f"State values:      {model['state_value_count']}")
+    print(f"Event cursor:      {model['event_cursor']}")
+    for node in model["nodes"]:
+        print(
+            f"Node {node['node_id']} discovery={node['discovery_state']} "
+            f"ready={'yes' if node['ready'] else 'no'} "
+            f"caps={len(node['capabilities'])}"
+        )
+        for cap in node["capabilities"]:
+            d = cap["descriptor"]
+            unit = d["unit"] if d["known"] else "RAW"
+            print(
+                f"  {cap['key']} {cap['name']} "
+                f"value={cap['value']} {unit} "
+                f"seq={cap['sequence']} updates={cap['updates']}"
+            )
+
 async def run_ninalink_external_watch(args):
     masks = {"state": 1, "event": 2, "all": 3}
     mask = masks[args.change_mask]
@@ -7061,6 +7148,14 @@ async def main_async(args):
 
     if not args.device:
         raise RuntimeError("--device is required for commands that access BLE hardware")
+
+    if args.action == "ninalink-external-reconcile":
+        await run_ninalink_external_reconcile(args)
+        return
+
+    if args.action == "ninalink-external-model":
+        await run_ninalink_external_model(args)
+        return
 
     if args.action == "ninalink-external-watch":
         await run_ninalink_external_watch(args)
@@ -8019,6 +8114,32 @@ def build_parser():
     sub.add_parser(
         "ninalink-bridge-handoff",
         help="B5.5 NUS-only: preserve bridge RX and return BLE ownership to Application plane",
+    )
+
+    nreconcile = sub.add_parser(
+        "ninalink-external-reconcile",
+        help="B6.1b live B5.4 reconciliation driven by B5.5 notifications",
+    )
+    nreconcile.add_argument(
+        "--count", type=int, default=2,
+        help="number of B5.5 change notifications to reconcile (default: 2)",
+    )
+    nreconcile.add_argument(
+        "--timeout", type=float, default=45.0,
+        help="timeout per B5.5 notification in seconds (default: 45)",
+    )
+    nreconcile.add_argument(
+        "--json", action="store_true",
+        help="emit JSON-lines initial/reconcile records",
+    )
+
+    nmodel = sub.add_parser(
+        "ninalink-external-model",
+        help="B6.1a build one-shot external logical model over Application BLE",
+    )
+    nmodel.add_argument(
+        "--json", action="store_true",
+        help="emit stable machine-readable model JSON",
     )
 
     nw = sub.add_parser(

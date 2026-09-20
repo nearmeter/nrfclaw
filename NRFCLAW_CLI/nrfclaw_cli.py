@@ -6983,6 +6983,63 @@ async def firmware_upgrade(args):
     finally:
         await dfu.close()
 
+async def run_ninalink_ha_preview(args):
+    from nrfclaw_external import (
+        NinaLinkExternalModelBuilder,
+        NinaLinkExternalReconciler,
+    )
+
+    ha_path = (
+        Path(__file__).resolve().parents[1]
+        / "integrations/home-assistant/custom_components/nrfclaw"
+    )
+    if str(ha_path) not in sys.path:
+        sys.path.insert(0, str(ha_path))
+    from ninalink_semantics import project_model
+
+    name, dev = await find_app_device(args.device, args.scan_timeout)
+    if not args.json:
+        print(f"Connecting Application: {name} ({dev.address})")
+
+    async with ApplicationNDPClient(
+        dev, ndp_access_key(args.ndp_key)
+    ) as app:
+        model = await NinaLinkExternalModelBuilder(
+            app, NDP_NINALINK_BRIDGE
+        ).read()
+
+        # B7.1 can project event capabilities already observed in the B5.4
+        # journal. B7.2 will address full per-node capability inventory so
+        # EVENT entities can exist before their first event.
+        rec = NinaLinkExternalReconciler(app, NDP_NINALINK_BRIDGE)
+        events = await rec.read_events(0, 64)
+
+    bridge_key = f"bridge:{args.device.upper()}"
+    ha_model = project_model(
+        model,
+        bridge_key,
+        events["events"],
+    )
+
+    if args.json:
+        print(json.dumps(ha_model, indent=2, sort_keys=True))
+        return
+
+    print("=== NINALINK B7.1 HA PREVIEW ===")
+    print(f"Topology: {ha_model['device_topology']}")
+    for device in ha_model["devices"]:
+        print(
+            f"Device {device['device_key']} "
+            f"via={device['via_bridge_key']} "
+            f"entities={len(device['entities'])}"
+        )
+        for ent in device["entities"]:
+            print(
+                f"  {ent['platform']:13s} {ent['unique_key']} "
+                f"{ent['name']} class={ent.get('device_class')} "
+                f"value={ent.get('value')}"
+            )
+
 async def run_ninalink_external_reconcile(args):
     from nrfclaw_external import NinaLinkExternalReconciler
 
@@ -7148,6 +7205,10 @@ async def main_async(args):
 
     if not args.device:
         raise RuntimeError("--device is required for commands that access BLE hardware")
+
+    if args.action == "ninalink-ha-preview":
+        await run_ninalink_ha_preview(args)
+        return
 
     if args.action == "ninalink-external-reconcile":
         await run_ninalink_external_reconcile(args)
@@ -8114,6 +8175,15 @@ def build_parser():
     sub.add_parser(
         "ninalink-bridge-handoff",
         help="B5.5 NUS-only: preserve bridge RX and return BLE ownership to Application plane",
+    )
+
+    nhap = sub.add_parser(
+        "ninalink-ha-preview",
+        help="B7.1 preview Home Assistant device/entity projection",
+    )
+    nhap.add_argument(
+        "--json", action="store_true",
+        help="emit HA semantic projection JSON",
     )
 
     nreconcile = sub.add_parser(

@@ -1,0 +1,52 @@
+name: Home Assistant package
+
+on:
+  push:
+    paths:
+      - "integrations/home-assistant/custom_components/nrfclaw/**"
+      - "tools/build_home_assistant_package.py"
+      - "docs/HOME_ASSISTANT_INSTALL.md"
+      - "README.md"
+      - ".github/workflows/home-assistant-package.yml"
+  pull_request:
+    paths:
+      - "integrations/home-assistant/custom_components/nrfclaw/**"
+      - "tools/build_home_assistant_package.py"
+      - "docs/HOME_ASSISTANT_INSTALL.md"
+      - "README.md"
+      - ".github/workflows/home-assistant-package.yml"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate manifest JSON
+        run: python3 -m json.tool integrations/home-assistant/custom_components/nrfclaw/manifest.json >/dev/null
+      - name: Compile integration Python
+        run: python3 -m compileall -q integrations/home-assistant/custom_components/nrfclaw
+      - name: Build and verify release package
+        run: python3 tools/build_home_assistant_package.py
+      - name: Show archive layout
+        run: unzip -l dist/nrfclaw-home-assistant.zip
+      - name: Upload validation artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nrfclaw-home-assistant
+          path: |
+            dist/nrfclaw-home-assistant.zip
+            dist/nrfclaw-home-assistant.zip.sha256
+
+  hassfest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Stage canonical integration for hassfest
+        run: |
+          mkdir -p custom_components
+          cp -a integrations/home-assistant/custom_components/nrfclaw custom_components/
+      - name: Hassfest validation
+        uses: home-assistant/actions/hassfest@master

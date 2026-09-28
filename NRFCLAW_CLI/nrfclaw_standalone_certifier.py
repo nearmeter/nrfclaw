@@ -65,7 +65,15 @@ def extract_contract(source:str)->dict[str,Any]:
     # Dynamic state clauses must not collapse into static literal transmission.
     has_counter=bool(re.search(r'counter|contador',t))
     if has_counter and re.search(r'increment|incremente|incrementa|aumente|decrement|decremente',t): add('register.add')
-    if has_counter and re.search(r'format|forme|formate|prefix|prefixo|seguida|followed|test(?:e)?\s+lora|lora.{0,30}counter|contador.{0,30}lora',t) and re.search(r'lora',t): add('dynamic.lora_buffer')
+    # Dynamic LoRa-buffer certification applies to LoRa *transmitters*.  A raw
+    # LoRa RX -> BLE relay can mention both a counter format and LoRa without
+    # ever requesting a LoRa transmission; requiring LORA SEND BUFFER there
+    # incorrectly rejects the valid receive/RSSI/beacon composition.
+    lora_send_intent=bool(re.search(
+        r'(?:send|transmit|envie|enviar|envia|transmita|manda|mande)[^.;]{0,40}(?:via|over|por|pelo|pela)?\s*(?:the\s+)?lora|'
+        r'\blora\b\s+(?:send|transmit|tx)', t))
+    if has_counter and lora_send_intent and re.search(r'format|forme|formate|prefix|prefixo|seguida|followed|test(?:e)?\s+lora|lora.{0,30}counter|contador.{0,30}lora',t):
+        add('dynamic.lora_buffer')
     if re.search(r'ble|bluetooth|beacon|advertis|anunc',t):
         if re.search(r'advertis|anunc|beacon',t): add('ble.advertising')
 

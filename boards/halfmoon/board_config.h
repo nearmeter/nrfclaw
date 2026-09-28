@@ -17,6 +17,12 @@
 #define NRFCLAW_HW_REV_MAJOR     1U
 #define NRFCLAW_HW_REV_MINOR     0U
 
+/* HALFMOON has no physical LoRa transceiver. It inherits the NINASENSE
+ * software feature set above, so explicitly override the inherited board
+ * capability before native/NDP discovery is compiled. */
+#undef NRFCLAW_BOARD_HAS_LORA
+#define NRFCLAW_BOARD_HAS_LORA       0
+
 #undef P_LORA_SCK
 #undef P_LORA_NSS
 #undef P_LORA_MOSI

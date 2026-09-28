@@ -5,8 +5,6 @@
 #include "nrf_gpio.h"
 #include "nrf_delay.h"
 #include "app_error.h"
-#include "SEGGER_RTT.h"
-
 #include <string.h>
 
 /*
@@ -354,6 +352,30 @@ bool nrfclaw_llcc68_rl_start_rx(bool infinite)
     if (!prepare_rx()) return false;
     uint32_t t = infinite ? RX_CONTINUOUS : RX_TIMEOUT_4S;
     uint8_t timeout[3] = {(uint8_t)(t >> 16), (uint8_t)(t >> 8), (uint8_t)t};
+    return cmd_write(CMD_SET_RX, timeout, sizeof(timeout));
+}
+
+bool nrfclaw_llcc68_rl_start_rx_ms(uint32_t timeout_ms)
+{
+    uint32_t ticks;
+    uint8_t timeout[3];
+
+    if (timeout_ms == 0U || timeout_ms > 262143UL)
+        return false;
+
+    if (!nrfclaw_llcc68_rl_wakeup())
+        return false;
+    if (!prepare_rx())
+        return false;
+
+    /* SX126x/LLCC68 SetRx timeout unit is 15.625 us = 64 ticks/ms. */
+    ticks = timeout_ms * 64UL;
+    if (ticks > 0xFFFFFFUL)
+        ticks = 0xFFFFFFUL;
+
+    timeout[0] = (uint8_t)(ticks >> 16);
+    timeout[1] = (uint8_t)(ticks >> 8);
+    timeout[2] = (uint8_t)ticks;
     return cmd_write(CMD_SET_RX, timeout, sizeof(timeout));
 }
 

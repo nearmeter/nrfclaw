@@ -5,12 +5,12 @@
 
 #include "nrf_drv_gpiote.h"
 #include "nrf_gpio.h"
-#include "SEGGER_RTT.h"
+#include "app_timer.h"
 #include <string.h>
 
 #define LORA_MAX_PAYLOAD 64U
 #define LORA_DIAG_QUEUE_DEPTH 8U
-#define LORA_DIAG_MAX_PAYLOAD 48U
+#define LORA_DIAG_MAX_PAYLOAD 64U
 
 typedef struct {
     uint8_t len;
@@ -36,6 +36,43 @@ static bool m_last_packet_status_valid;
 static lora_diag_packet_t m_diag_q[LORA_DIAG_QUEUE_DEPTH];
 static uint8_t m_diag_head, m_diag_tail, m_diag_count;
 static uint16_t m_diag_dropped;
+static nrfclaw_lora_rx_diag_t m_rx_diag;
+static nrfclaw_lora_tx_diag_t m_tx_diag;
+static uint8_t m_tx_diag_current_len;
+static nrfclaw_lora_turnaround_timing_t m_turn_timing;
+static bool m_turn_timed_rx_active;
+
+
+#define TURN_VALID_RX18_DONE       0x01U
+#define TURN_VALID_TX64_START      0x02U
+#define TURN_VALID_TX64_DONE       0x04U
+#define TURN_VALID_TX18_DONE       0x08U
+#define TURN_VALID_TIMED_RX_START  0x10U
+#define TURN_VALID_TIMED_RX_TERM   0x20U
+#define TURN_RTC_MASK              0x00FFFFFFUL
+
+static uint32_t turn_tick_now(void)
+{
+    return app_timer_cnt_get();
+}
+
+static uint32_t turn_tick_diff(uint32_t newer, uint32_t older)
+{
+    return (newer - older) & TURN_RTC_MASK;
+}
+
+static void turn_timing_reset(void)
+{
+    memset(&m_turn_timing, 0, sizeof(m_turn_timing));
+    m_turn_timing.ticks_per_second = APP_TIMER_TICKS(1000U);
+    m_turn_timed_rx_active = false;
+}
+
+static void sat_inc_u16(uint16_t *v)
+{
+    if (v && *v != UINT16_MAX)
+        (*v)++;
+}
 
 static void rf_off(void) { nrf_gpio_pin_clear(P_LORA_RXEN); nrf_gpio_pin_clear(P_LORA_TXEN); }
 static void rf_rx(void)  { nrf_gpio_pin_clear(P_LORA_TXEN); nrf_gpio_pin_set(P_LORA_RXEN); }
@@ -47,23 +84,27 @@ void nrfclaw_lora_init(void)
 {
     if (m_initialized) return;
     nrfclaw_lora_profile_default(&m_profile);
+#if !NRFCLAW_BOARD_HAS_LORA
+    ((void)0);
+    return;
+#endif
     nrfclaw_lora_profile_store_init();
     if (nrfclaw_lora_profile_store_load(&m_profile)) {
-        SEGGER_RTT_printf(0, "LORA: restored persisted profile %lu Hz %+d dBm SF%u BW%u CR4/%u sync=0x%02X preamble=%u\r\n",
-                          (unsigned long)m_profile.frequency_hz, (int)m_profile.power_dbm,
-                          (unsigned)m_profile.sf, (unsigned)m_profile.bw_khz,
-                          (unsigned)(4U + m_profile.cr), (unsigned)m_profile.sync_word,
-                          (unsigned)m_profile.preamble_symbols);
+        ((void)0);
     }
     if (!nrfclaw_llcc68_rl_init(&m_profile)) {
-        SEGGER_RTT_WriteString(0, "LORA R3.8.18 ERROR: LLCC68 init failed\r\n");
+        ((void)0);
         return;
     }
     m_tx_active = m_cleanup_pending = m_rx_active = m_rx_ready = false;
     m_diag_stream = false;
+    memset(&m_rx_diag, 0, sizeof(m_rx_diag));
+    memset(&m_tx_diag, 0, sizeof(m_tx_diag));
+    m_tx_diag_current_len = 0U;
+    turn_timing_reset();
     m_irq_ready = false;
     m_initialized = true;
-    SEGGER_RTT_WriteString(0, "LORA R3.8.18: low-power persistent-profile LLCC68 backend ready\r\n");
+    ((void)0);
 }
 
 void nrfclaw_lora_irq_ready(void)
@@ -74,6 +115,9 @@ void nrfclaw_lora_irq_ready(void)
 
 void nrfclaw_lora_sleep(void)
 {
+    /* Boards without LoRa never initialize the radio. Do not touch their
+     * inherited placeholder pin map during minimum-power transitions. */
+    if (!m_initialized) return;
     rf_off();
     (void)nrfclaw_llcc68_rl_sleep();
 }
@@ -86,8 +130,14 @@ bool nrfclaw_lora_send_async(uint8_t const *data, uint8_t len)
 
     rf_tx();
     m_tx_active = true;
+    m_tx_diag_current_len = len;
+    m_tx_diag.last_len = len;
+    m_tx_diag.last_terminal = 0U;
+    m_tx_diag.last_irq = 0U;
     dio1_enable();
     if (!nrfclaw_llcc68_rl_start_tx(data, len)) {
+        sat_inc_u16(&m_tx_diag.start_fail);
+        m_tx_diag.last_terminal = 3U;
         m_tx_active = false;
         dio1_disable();
         rf_off();
@@ -95,7 +145,21 @@ bool nrfclaw_lora_send_async(uint8_t const *data, uint8_t len)
         (void)nrfclaw_llcc68_rl_sleep();
         return false;
     }
-    SEGGER_RTT_printf(0, "LORA R3.8.18: TX start len=%u\r\n", (unsigned)len);
+    {
+        uint32_t now = turn_tick_now();
+        if (len == 64U) {
+            m_turn_timing.tx64_start_tick = now;
+            m_turn_timing.valid_flags |= TURN_VALID_TX64_START;
+            sat_inc_u16(&m_turn_timing.tx64_count);
+            if ((m_turn_timing.valid_flags & TURN_VALID_RX18_DONE) != 0U)
+                m_turn_timing.rx18_to_tx64_ticks =
+                    turn_tick_diff(now, m_turn_timing.rx18_done_tick);
+        }
+    }
+    sat_inc_u16(&m_tx_diag.start_ok);
+    if (len == 30U) sat_inc_u16(&m_tx_diag.len30_start);
+    else if (len == 64U) sat_inc_u16(&m_tx_diag.len64_start);
+    ((void)0);
     return true;
 }
 
@@ -106,6 +170,7 @@ bool nrfclaw_lora_receive_async(void)
     m_rx_ready = false;
     m_rx_len = 0U;
     m_rx_active = true;
+    m_turn_timed_rx_active = false;
     rf_rx();
     dio1_enable();
     if (!nrfclaw_llcc68_rl_start_rx(true)) {
@@ -116,14 +181,66 @@ bool nrfclaw_lora_receive_async(void)
         (void)nrfclaw_llcc68_rl_sleep();
         return false;
     }
-    SEGGER_RTT_WriteString(0, "LORA R3.8.18: RX armed\r\n");
+    ((void)0);
     return true;
+}
+
+bool nrfclaw_lora_receive_window_async(uint32_t timeout_ms)
+{
+    if (timeout_ms == 0U)
+        return false;
+    if (!m_initialized)
+        nrfclaw_lora_init();
+    if (!m_initialized || m_tx_active || m_cleanup_pending || m_rx_active)
+        return false;
+
+    m_rx_ready = false;
+    m_rx_len = 0U;
+    m_rx_active = true;
+    m_turn_timed_rx_active = true;
+    rf_rx();
+    dio1_enable();
+
+    if (!nrfclaw_llcc68_rl_start_rx_ms(timeout_ms)) {
+        m_turn_timed_rx_active = false;
+        m_rx_active = false;
+        dio1_disable();
+        rf_off();
+        (void)nrfclaw_llcc68_rl_standby();
+        (void)nrfclaw_llcc68_rl_sleep();
+        return false;
+    }
+
+    {
+        uint32_t now = turn_tick_now();
+        m_turn_timing.timed_rx_start_tick = now;
+        m_turn_timing.timed_rx_requested_ms = timeout_ms;
+        m_turn_timing.timed_rx_terminal = 0U;
+        m_turn_timing.valid_flags |= TURN_VALID_TIMED_RX_START;
+        m_turn_timing.valid_flags &= (uint8_t)~TURN_VALID_TIMED_RX_TERM;
+        sat_inc_u16(&m_turn_timing.timed_rx_count);
+        if ((m_turn_timing.valid_flags & TURN_VALID_TX18_DONE) != 0U)
+            m_turn_timing.tx18_to_timed_rx_ticks =
+                turn_tick_diff(now, m_turn_timing.tx18_done_tick);
+    }
+
+    ((void)0);
+    return true;
+}
+
+bool nrfclaw_lora_idle(void)
+{
+    return m_initialized &&
+           !m_tx_active &&
+           !m_cleanup_pending &&
+           !m_rx_active;
 }
 
 bool nrfclaw_lora_cancel_receive(void)
 {
     m_diag_stream = false;
     m_rx_active = false;
+    m_turn_timed_rx_active = false;
     m_rx_ready = false;
     m_rx_len = 0U;
     dio1_disable();
@@ -139,7 +256,7 @@ bool nrfclaw_lora_diag_stream_start(void)
     m_diag_dropped = 0U;
     m_diag_stream = true;
     if (!nrfclaw_lora_receive_async()) { m_diag_stream = false; return false; }
-    SEGGER_RTT_WriteString(0, "LORA R3.8.18: diagnostic RX stream active\r\n");
+    ((void)0);
     return true;
 }
 
@@ -158,6 +275,40 @@ bool nrfclaw_lora_diag_stream_take(uint8_t *data, uint8_t *len, uint8_t max_len,
 
 bool nrfclaw_lora_diag_stream_active(void) { return m_diag_stream && m_rx_active; }
 uint16_t nrfclaw_lora_diag_stream_dropped(void) { return m_diag_dropped; }
+
+void nrfclaw_lora_rx_diag_get(nrfclaw_lora_rx_diag_t *out)
+{
+    if (out)
+        *out = m_rx_diag;
+}
+
+void nrfclaw_lora_rx_diag_clear(void)
+{
+    memset(&m_rx_diag, 0, sizeof(m_rx_diag));
+}
+
+void nrfclaw_lora_tx_diag_get(nrfclaw_lora_tx_diag_t *out)
+{
+    if (out) *out = m_tx_diag;
+}
+
+void nrfclaw_lora_tx_diag_clear(void)
+{
+    memset(&m_tx_diag, 0, sizeof(m_tx_diag));
+    m_tx_diag_current_len = 0U;
+}
+
+void nrfclaw_lora_turnaround_timing_get(nrfclaw_lora_turnaround_timing_t *out)
+{
+    if (out)
+        *out = m_turn_timing;
+}
+
+void nrfclaw_lora_turnaround_timing_clear(void)
+{
+    turn_timing_reset();
+}
+
 bool nrfclaw_lora_rx_active(void) { return m_rx_active; }
 bool nrfclaw_lora_rx_ready(void) { return m_rx_ready; }
 
@@ -188,20 +339,63 @@ static void queue_diag_packet(void)
 bool nrfclaw_lora_on_dio1_event(void)
 {
     uint16_t irq = 0U;
+    uint32_t event_tick;
     if (!nrfclaw_llcc68_rl_get_irq(&irq)) return false;
+    event_tick = turn_tick_now();
 
     if (m_rx_active) {
-        bool valid = (irq & NRFCLAW_LLCC68_IRQ_RX_DONE) != 0U &&
-                     (irq & (NRFCLAW_LLCC68_IRQ_CRC_ERR | NRFCLAW_LLCC68_IRQ_HEADER_ERR)) == 0U;
+        bool valid;
         bool packet_ok = false;
+
+        sat_inc_u16(&m_rx_diag.dio1_events);
+        if ((irq & NRFCLAW_LLCC68_IRQ_RX_DONE) != 0U)
+            sat_inc_u16(&m_rx_diag.irq_rx_done);
+        if ((irq & NRFCLAW_LLCC68_IRQ_CRC_ERR) != 0U)
+            sat_inc_u16(&m_rx_diag.irq_crc_err);
+        if ((irq & NRFCLAW_LLCC68_IRQ_HEADER_ERR) != 0U)
+            sat_inc_u16(&m_rx_diag.irq_header_err);
+        if ((irq & NRFCLAW_LLCC68_IRQ_TIMEOUT) != 0U)
+            sat_inc_u16(&m_rx_diag.irq_timeout);
+
+        valid = (irq & NRFCLAW_LLCC68_IRQ_RX_DONE) != 0U &&
+                (irq & (NRFCLAW_LLCC68_IRQ_CRC_ERR | NRFCLAW_LLCC68_IRQ_HEADER_ERR)) == 0U;
         if (valid) {
             uint8_t n = sizeof(m_rx_buffer);
             packet_ok = nrfclaw_llcc68_rl_read_packet(m_rx_buffer, &n, sizeof(m_rx_buffer),
                                                        &m_last_rssi_dbm_x2, &m_last_snr_db_x4);
             if (packet_ok) {
+                sat_inc_u16(&m_rx_diag.packet_read_ok);
+                m_rx_diag.last_len = n;
+                if (n == 18U) {
+                    m_turn_timing.rx18_done_tick = event_tick;
+                    m_turn_timing.valid_flags |= TURN_VALID_RX18_DONE;
+                    sat_inc_u16(&m_turn_timing.rx18_count);
+                }
                 m_rx_len = n; m_rx_ready = true; m_last_packet_status_valid = true;
-                SEGGER_RTT_printf(0, "LORA R3.8.18 RX_DONE len=%u RSSI_x2=%d SNR_x4=%d\r\n",
-                                  (unsigned)n, (int)m_last_rssi_dbm_x2, (int)m_last_snr_db_x4);
+                ((void)0);
+            } else {
+                sat_inc_u16(&m_rx_diag.packet_read_fail);
+                m_rx_diag.last_len = 0U;
+            }
+        }
+
+        if (m_turn_timed_rx_active) {
+            uint8_t terminal = 0U;
+            if ((irq & NRFCLAW_LLCC68_IRQ_RX_DONE) != 0U)
+                terminal = 1U;
+            else if ((irq & NRFCLAW_LLCC68_IRQ_TIMEOUT) != 0U)
+                terminal = 2U;
+            else if (irq != 0U)
+                terminal = 3U;
+
+            if (terminal != 0U) {
+                m_turn_timing.timed_rx_terminal_tick = event_tick;
+                m_turn_timing.timed_rx_terminal = terminal;
+                m_turn_timing.valid_flags |= TURN_VALID_TIMED_RX_TERM;
+                if ((m_turn_timing.valid_flags & TURN_VALID_TIMED_RX_START) != 0U)
+                    m_turn_timing.timed_rx_span_ticks =
+                        turn_tick_diff(event_tick, m_turn_timing.timed_rx_start_tick);
+                m_turn_timed_rx_active = false;
             }
         }
 
@@ -213,7 +407,7 @@ bool nrfclaw_lora_on_dio1_event(void)
              * every completion/error. This avoids the one-packet RX state that
              * was observed with the old driver. */
             if (!nrfclaw_llcc68_rl_rearm_rx()) {
-                SEGGER_RTT_WriteString(0, "LORA R3.8.18 ERROR: RX rearm failed\r\n");
+                ((void)0);
                 m_rx_active = false; m_diag_stream = false; dio1_disable(); rf_off();
             } else {
                 /* The GPIOTE ISR intentionally disables DIO1 before queuing the
@@ -221,7 +415,7 @@ bool nrfclaw_lora_on_dio1_event(void)
                  * after the LLCC68 IRQ has been cleared and SetRx() has been
                  * issued again, otherwise only the first packet is observable. */
                 dio1_enable();
-                SEGGER_RTT_WriteString(0, "LORA R3.8.18: RX rearmed, DIO1 enabled\r\n");
+                ((void)0);
             }
             return false;
         }
@@ -237,18 +431,41 @@ bool nrfclaw_lora_on_dio1_event(void)
         return false;
     }
     if ((irq & NRFCLAW_LLCC68_IRQ_TX_DONE) != 0U) {
+        if (m_tx_diag_current_len == 18U) {
+            m_turn_timing.tx18_done_tick = event_tick;
+            m_turn_timing.valid_flags |= TURN_VALID_TX18_DONE;
+            sat_inc_u16(&m_turn_timing.tx18_count);
+        } else if (m_tx_diag_current_len == 64U) {
+            m_turn_timing.tx64_done_tick = event_tick;
+            m_turn_timing.valid_flags |= TURN_VALID_TX64_DONE;
+            if ((m_turn_timing.valid_flags & TURN_VALID_TX64_START) != 0U)
+                m_turn_timing.tx64_air_ticks =
+                    turn_tick_diff(event_tick, m_turn_timing.tx64_start_tick);
+        }
+        sat_inc_u16(&m_tx_diag.tx_done);
+        if (m_tx_diag_current_len == 30U) sat_inc_u16(&m_tx_diag.len30_done);
+        else if (m_tx_diag_current_len == 64U) sat_inc_u16(&m_tx_diag.len64_done);
+        m_tx_diag.last_len = m_tx_diag_current_len;
+        m_tx_diag.last_terminal = 1U;
+        m_tx_diag.last_irq = irq;
         m_tx_active = false;
         rf_off();
         m_cleanup_pending = true;
-        SEGGER_RTT_WriteString(0, "LORA R3.8.18: TX_DONE\r\n");
+        ((void)0);
         return true;
     }
     if ((irq & NRFCLAW_LLCC68_IRQ_TIMEOUT) != 0U) {
+        sat_inc_u16(&m_tx_diag.tx_timeout);
+        if (m_tx_diag_current_len == 30U) sat_inc_u16(&m_tx_diag.len30_timeout);
+        else if (m_tx_diag_current_len == 64U) sat_inc_u16(&m_tx_diag.len64_timeout);
+        m_tx_diag.last_len = m_tx_diag_current_len;
+        m_tx_diag.last_terminal = 2U;
+        m_tx_diag.last_irq = irq;
         /* Terminal TX failure must follow the same ClearIRQ/Standby/Sleep path. */
         m_tx_active = false;
         rf_off();
         m_cleanup_pending = true;
-        SEGGER_RTT_WriteString(0, "LORA R3.8.18: TX timeout -> cleanup\r\n");
+        ((void)0);
     }
     return false;
 }

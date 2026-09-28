@@ -8,7 +8,6 @@
 #include "nrf_drv_gpiote.h"
 #include "app_error.h"
 #include "nrf_delay.h"
-#include <string.h>
 
 #define LIS_ADDR_LOW  0x18U
 #define LIS_ADDR_HIGH 0x19U
@@ -36,6 +35,12 @@
 #define LIS_TIME_LATENCY 0x3CU
 #define LIS_TIME_WINDOW 0x3DU
 
+/* CLICK_SRC (39h): IA bit6, SClick bit4, axis flags bits2..0. */
+#define LIS_CLICK_SRC_IA      0x40U
+#define LIS_CLICK_SRC_SCLICK  0x10U
+#define LIS_CLICK_SRC_AXIS    0x07U
+#define LIS_CLICK_THS_LIR     0x80U
+
 static bool m_present, m_irq_configured;
 static uint8_t m_i2c_addr = LIS_ADDR_LOW;
 static uint8_t m_last_whoami = 0x00U;
@@ -54,15 +59,9 @@ static uint32_t m_vib_seq;
 #define VIB_WATCHDOG_MAX_POLLS 3U
 APP_TIMER_DEF(m_vib_watchdog_timer);
 static bool m_vib_watchdog_due;
-static bool m_vib_watchdog_armed;
 static bool m_vib_watchdog_failed;
 static uint8_t m_vib_watchdog_polls;
-static uint16_t m_vib_watchdog_elapsed_ms;
 static uint8_t m_walk_phase;
-static nrfclaw_lis2dh12_diag_t m_diag;
-
-static void diag_inc(uint16_t *v){if(v&&*v<65535U)(*v)++;}
-
 static bool wait_event_or_error(volatile uint32_t *evt)
 {
     uint32_t t=120000UL;
@@ -101,15 +100,6 @@ static void twi_low_power_release(void)
     NRF_TWI1->PSELSDA = 0xFFFFFFFFUL;
     nrf_gpio_cfg_input(P_LIS_SCL, NRF_GPIO_PIN_PULLUP);
     nrf_gpio_cfg_input(P_LIS_SDA, NRF_GPIO_PIN_PULLUP);
-    diag_inc(&m_diag.twi_low_power_releases);
-
-    /* Snapshot the post-cleanup state without performing any bus access. */
-    m_diag.twi_last_psel_scl_disconnected = (NRF_TWI1->PSELSCL == 0xFFFFFFFFUL) ? 1U : 0U;
-    m_diag.twi_last_psel_sda_disconnected = (NRF_TWI1->PSELSDA == 0xFFFFFFFFUL) ? 1U : 0U;
-    m_diag.twi_last_scl_pin_cnf = NRF_P0->PIN_CNF[P_LIS_SCL];
-    m_diag.twi_last_sda_pin_cnf = NRF_P0->PIN_CNF[P_LIS_SDA];
-    m_diag.twi_last_errorsrc = NRF_TWI1->ERRORSRC;
-    m_diag.twi_last_hfclk_running = ((NRF_CLOCK->HFCLKSTAT & CLOCK_HFCLKSTAT_STATE_Msk) != 0U) ? 1U : 0U;
 }
 
 static void twi_clear_state(void)
@@ -261,9 +251,7 @@ static bool write_bytes(const uint8_t*d,uint8_t len)
 static bool reg_write(uint8_t r,uint8_t v)
 {
     uint8_t b[2]={r,v};
-    bool ok=write_bytes(b,2U);
-    if(!ok)diag_inc(&m_diag.reg_write_failures);
-    return ok;
+    return write_bytes(b,2U);
 }
 
 static bool reg_read_raw(uint8_t reg,uint8_t*d,uint8_t len)
@@ -321,15 +309,12 @@ static bool reg_read_raw(uint8_t reg,uint8_t*d,uint8_t len)
 
 static bool reg_read(uint8_t reg,uint8_t*d,uint8_t len)
 {
-    bool ok=reg_read_raw(reg,d,len);
-    if(!ok)diag_inc(&m_diag.reg_read_failures);
-    return ok;
+    return reg_read_raw(reg,d,len);
 }
 static void vib_watchdog_stop(void)
 {
     (void)app_timer_stop(m_vib_watchdog_timer);
     m_vib_watchdog_due=false;
-    m_vib_watchdog_armed=false;
 }
 
 static bool vib_watchdog_start_ms(uint16_t delay_ms)
@@ -338,13 +323,9 @@ static bool vib_watchdog_start_ms(uint16_t delay_ms)
     m_vib_watchdog_due=false;
     uint32_t rc=app_timer_start(m_vib_watchdog_timer,APP_TIMER_TICKS(delay_ms),NULL);
     if(rc!=NRF_SUCCESS){
-        m_vib_watchdog_armed=false;
         m_vib_watchdog_failed=true;
-        diag_inc(&m_diag.fifo_watchdog_aborts);
-        m_diag.fifo_last_completion_source=3U;
         return false;
     }
-    m_vib_watchdog_armed=true;
     return true;
 }
 
@@ -358,8 +339,7 @@ static void vib_watchdog_timer_handler(void *ctx)
 
 static bool vib_watchdog_arm_initial(void)
 {
-    m_vib_watchdog_polls=0U;m_vib_watchdog_elapsed_ms=0U;m_vib_watchdog_failed=false;
-    diag_inc(&m_diag.fifo_watchdog_arms);
+    m_vib_watchdog_polls=0U;m_vib_watchdog_failed=false;
     return vib_watchdog_start_ms(VIB_WATCHDOG_FIRST_MS);
 }
 
@@ -373,9 +353,8 @@ static uint16_t isqrt32(uint32_t x){uint32_t op=x,res=0,one=1UL<<30;while(one>op
 
 void nrfclaw_lis2dh12_init(void)
 {
-    nrfclaw_lis2dh12_diag_reset();
     APP_ERROR_CHECK(app_timer_create(&m_vib_watchdog_timer,APP_TIMER_MODE_SINGLE_SHOT,vib_watchdog_timer_handler));
-    m_vib_watchdog_due=false;m_vib_watchdog_armed=false;m_vib_watchdog_failed=false;m_vib_watchdog_polls=0U;m_vib_watchdog_elapsed_ms=0U;
+    m_vib_watchdog_due=false;m_vib_watchdog_failed=false;m_vib_watchdog_polls=0U;
     uint8_t who=0U;
     m_present=false;
     m_irq_configured=false;
@@ -512,6 +491,11 @@ bool nrfclaw_lis2dh12_configure(const nrfclaw_accel_config_t*c){if(!m_present||!
     uint16_t lsb=(uint16_t)(16U*c->full_scale_g/2U); if(lsb==0)lsb=16U;
     uint8_t th=(uint8_t)(c->threshold_mg/lsb);if(th==0)th=1;if(th>0x7F)th=0x7F;
     uint32_t ticks=((uint32_t)c->duration_ms*c->odr_hz+999U)/1000U;if(ticks>0x7F)ticks=0x7F;
+    /* TAP historically used a validated hard ceiling of four ODR samples.
+     * Keep that ceiling to avoid making explicit/legacy TAP configurations
+     * more permissive, while allowing shorter requested durations (e.g.
+     * Direct Low: 30 ms @ 100 Hz -> 3 samples). */
+    uint8_t tap_ticks=(uint8_t)((ticks>4U)?4U:ticks);
     uint8_t dummy;
     switch(c->mode){
       case NRFCLAW_ACCEL_MODE_MOTION:
@@ -521,7 +505,26 @@ bool nrfclaw_lis2dh12_configure(const nrfclaw_accel_config_t*c){if(!m_present||!
         /* AND of X/Y/Z low events = free-fall primitive. */
         (void)reg_read(LIS_INT1_SRC,&dummy,1);(void)reg_write(LIS_INT1_THS,th);(void)reg_write(LIS_INT1_DURATION,(uint8_t)ticks);(void)reg_write(LIS_INT1_CFG,0x95);(void)reg_write(LIS_CTRL3,0x40);break;
       case NRFCLAW_ACCEL_MODE_TAP:
-        (void)reg_read(LIS_CLICK_SRC,&dummy,1);(void)reg_write(LIS_CLICK_CFG,0x15);(void)reg_write(LIS_CLICK_THS,th&0x7F);(void)reg_write(LIS_TIME_LIMIT,0x08);(void)reg_write(LIS_TIME_LATENCY,0x10);(void)reg_write(LIS_TIME_WINDOW,0x20);(void)reg_write(LIS_CTRL3,0x80);break;
+        /* B7.6f2l6/l6a: CLICK should react to short dynamic impulses, not
+         * slow handling/tilt or the sensor start-up transient.  Configure the
+         * click engine while INT1 routing is still disabled, let several
+         * 100 Hz samples settle, then reset HPCLICK's reference and clear any
+         * pending CLICK_SRC before arming I1_CLICK.
+         *
+         * LIR_Click is enabled so INT1 remains asserted until main context
+         * reads CLICK_SRC.  The ISR never declares a TAP by itself anymore;
+         * l6a qualifies IA+SClick+axis from CLICK_SRC before publishing TAP. */
+        (void)reg_write(LIS_CTRL2,0x04U); /* HPCLICK */
+        (void)reg_write(LIS_CLICK_CFG,0x15U); /* XS | YS | ZS */
+        (void)reg_write(LIS_CLICK_THS,(uint8_t)(LIS_CLICK_THS_LIR|(th&0x7FU)));
+        (void)reg_write(LIS_TIME_LIMIT,tap_ticks);
+        (void)reg_write(LIS_TIME_LATENCY,0x10U);
+        (void)reg_write(LIS_TIME_WINDOW,0x20U);
+        nrf_delay_ms(50U); /* five samples @ Direct 100 Hz before arming */
+        (void)reg_read(LIS_REFERENCE,&dummy,1U);
+        (void)reg_read(LIS_CLICK_SRC,&dummy,1U);
+        (void)reg_write(LIS_CTRL3,0x80U); /* I1_CLICK -> INT1, armed last */
+        break;
       case NRFCLAW_ACCEL_MODE_VIBRATION:
         if(c->odr_hz<100U)return false;/* FIFO stream, watermark at 32 samples */
         (void)reg_write(LIS_CTRL5,0x40);(void)reg_write(LIS_FIFO_CTRL,0x9E);/* watermark after 31 samples */(void)reg_write(LIS_CTRL6,0x04);/* WTM -> INT2 */
@@ -529,24 +532,6 @@ bool nrfclaw_lis2dh12_configure(const nrfclaw_accel_config_t*c){if(!m_present||!
         break;
       default:return false;
     }
-    return true;
-}
-
-static bool diag_capture_motion_snapshot(void)
-{
-    /* Never read INT1_SRC here: that register is clear-on-read on the sensor
-     * interrupt path.  The control/configuration registers below are safe. */
-    uint8_t v[10];
-    const uint8_t regs[10]={LIS_CTRL1,LIS_CTRL2,LIS_CTRL3,LIS_CTRL4,LIS_CTRL5,LIS_CTRL6,LIS_FIFO_CTRL,LIS_INT1_CFG,LIS_INT1_THS,LIS_INT1_DURATION};
-    bool ok=true;
-    for(uint8_t i=0U;i<10U;i++){
-        if(!reg_read(regs[i],&v[i],1U)){ok=false;break;}
-    }
-    if(!ok){diag_inc(&m_diag.motion_snapshot_fail);return false;}
-    diag_inc(&m_diag.motion_snapshot_count);
-    m_diag.motion_ctrl1=v[0];m_diag.motion_ctrl2=v[1];m_diag.motion_ctrl3=v[2];m_diag.motion_ctrl4=v[3];
-    m_diag.motion_ctrl5=v[4];m_diag.motion_ctrl6=v[5];m_diag.motion_fifo_ctrl=v[6];m_diag.motion_int1_cfg=v[7];
-    m_diag.motion_int1_ths=v[8];m_diag.motion_int1_duration=v[9];
     return true;
 }
 
@@ -567,7 +552,6 @@ bool nrfclaw_lis2dh12_configure_motion_hp(uint16_t threshold_mg,uint16_t duratio
     if(!reg_write(LIS_INT1_DURATION,(uint8_t)ticks))return false;
     if(!reg_write(LIS_INT1_CFG,0x2AU))return false; /* XH/YH/ZH OR */
     if(!reg_write(LIS_CTRL3,0x40U))return false;    /* IA1 -> INT1 */
-    (void)diag_capture_motion_snapshot();
     return true;
 }
 
@@ -598,19 +582,16 @@ static void vibration_power_down_preserve_metrics(void)
 }
 
 static void vibration_capture(void){
-    diag_inc(&m_diag.capture_attempts);
     uint8_t src=0;
     if(!reg_read(LIS_FIFO_SRC,&src,1))return;
-    m_diag.last_fifo_src=src;
     uint8_t count=(uint8_t)(src&0x1FU);
-    m_diag.last_fifo_count=count;
-    if(count==0U){diag_inc(&m_diag.fifo_empty_polls);return;}
+    if(count==0U)return;
     if(count>31U)count=31U;
 
     int32_t sx=0,sy=0,sz=0;
     for(uint8_t i=0;i<count;i++){
         uint8_t raw[6];
-        if(!reg_read((uint8_t)(LIS_OUT_X_L|0x80U),raw,6)){diag_inc(&m_diag.sample_read_failures);count=i;break;}
+        if(!reg_read((uint8_t)(LIS_OUT_X_L|0x80U),raw,6)){count=i;break;}
         m_vib[i].x_mg=decode_sample(&raw[0],m_cfg.full_scale_g,m_cfg.low_power);
         m_vib[i].y_mg=decode_sample(&raw[2],m_cfg.full_scale_g,m_cfg.low_power);
         m_vib[i].z_mg=decode_sample(&raw[4],m_cfg.full_scale_g,m_cfg.low_power);
@@ -665,13 +646,11 @@ static void vibration_capture(void){
     m_vib_metrics.sequence=++m_vib_seq;
     m_vib_valid=true;
     vibration_power_down_preserve_metrics();
-    diag_inc(&m_diag.capture_success);
     nrfclaw_event_t e={.type=NRFCLAW_EVT_ACCEL_VIBRATION_READY,.arg0=m_vib_seq,.arg1=m_vib_metrics.rms_mg};
     (void)nrfclaw_event_push(&e);
 }
 
 bool nrfclaw_lis2dh12_vibration_service(void){
-    diag_inc(&m_diag.vibration_service_calls);
     if(!m_present || m_mode!=NRFCLAW_ACCEL_MODE_VIBRATION) return false;
     if(m_vib_valid) return true;
 
@@ -683,10 +662,9 @@ bool nrfclaw_lis2dh12_vibration_service(void){
      */
     uint8_t src=0U;
     if(!reg_read(LIS_FIFO_SRC,&src,1U)) return false;
-    m_diag.last_fifo_src=src;m_diag.last_fifo_count=(uint8_t)(src&0x1FU);
     /* r3.8.11: do not turn the watchdog fallback into a partial-window
      * sampler.  WTM=30 means 31 samples are expected before classification. */
-    if((src & 0x1FU)<31U){diag_inc(&m_diag.fifo_empty_polls);return false;}
+    if((src & 0x1FU)<31U)return false;
 
     vibration_capture();
     return m_vib_valid;
@@ -699,62 +677,47 @@ bool nrfclaw_lis2dh12_vibration_sample(uint8_t i,nrfclaw_lis2dh12_xyz_t*out){if(
 void nrfclaw_lis2dh12_on_event(const nrfclaw_event_t*e)
 {
     if(!e)return;
+
+    /* B7.6f2l6a: an INT1 edge is only a candidate TAP.  I2C is deliberately
+     * deferred out of the ISR.  Reading CLICK_SRC both acknowledges a latched
+     * click and proves that the LIS2DH12 itself reports IA + single-click on a
+     * physical axis.  GPIOTE/start-up/spurious edges are discarded here. */
+    if(e->type==NRFCLAW_EVT_ACCEL_INT1_RAW){
+        if(m_mode!=NRFCLAW_ACCEL_MODE_TAP)return;
+        uint8_t src=0U;
+        if(!reg_read(LIS_CLICK_SRC,&src,1U))return;
+        if((src&(LIS_CLICK_SRC_IA|LIS_CLICK_SRC_SCLICK)) !=
+           (LIS_CLICK_SRC_IA|LIS_CLICK_SRC_SCLICK) ||
+           (src&LIS_CLICK_SRC_AXIS)==0U)
+            return;
+        nrfclaw_event_t tap={.type=NRFCLAW_EVT_ACCEL_TAP,.arg0=0U,.arg1=0U};
+        (void)nrfclaw_event_push(&tap);
+        return;
+    }
+
     if(e->type==NRFCLAW_EVT_ACCEL_INT2&&m_mode==NRFCLAW_ACCEL_MODE_VIBRATION){
-        diag_inc(&m_diag.int2_event_captures);
         vibration_capture();
-        if(m_vib_valid){
-            vib_watchdog_stop();diag_inc(&m_diag.fifo_int2_completions);
-            m_diag.fifo_last_completion_source=1U;
-        }
+        if(m_vib_valid)
+            vib_watchdog_stop();
         return;
     }
     if(e->type==NRFCLAW_EVT_ACCEL_VIBRATION_POLL&&m_mode==NRFCLAW_ACCEL_MODE_VIBRATION){
         if(!m_vib_watchdog_due)return;
-        m_vib_watchdog_due=false;m_vib_watchdog_armed=false;
-        diag_inc(&m_diag.fifo_watchdog_expirations);m_vib_watchdog_polls++;
-        m_vib_watchdog_elapsed_ms=(uint16_t)(VIB_WATCHDOG_FIRST_MS + (uint16_t)(m_vib_watchdog_polls-1U)*VIB_WATCHDOG_RETRY_MS);
+        m_vib_watchdog_due=false;
+        m_vib_watchdog_polls++;
         if(nrfclaw_lis2dh12_vibration_service()){
-            diag_inc(&m_diag.fifo_timer_completions);m_diag.fifo_last_completion_source=2U;
-            m_diag.fifo_last_active_ms=m_vib_watchdog_elapsed_ms;vib_watchdog_stop();return;
+            vib_watchdog_stop();return;
         }
         if(m_vib_watchdog_polls<VIB_WATCHDOG_MAX_POLLS){
-            diag_inc(&m_diag.fifo_watchdog_retries);
             if(vib_watchdog_start_ms(VIB_WATCHDOG_RETRY_MS))return;
         }
         /* Fail safe: never leave 200 Hz/high-resolution mode powered forever. */
-        diag_inc(&m_diag.fifo_watchdog_aborts);m_diag.fifo_last_completion_source=3U;
-        m_diag.fifo_last_active_ms=m_vib_watchdog_elapsed_ms;m_vib_watchdog_failed=true;
+        m_vib_watchdog_failed=true;
         nrfclaw_lis2dh12_disable();
     }
 }
-void nrfclaw_lis2dh12_on_int1_isr(void){diag_inc(&m_diag.int1_isr_count);nrfclaw_event_t e={0};if(m_mode==NRFCLAW_ACCEL_MODE_TAP)e.type=NRFCLAW_EVT_ACCEL_TAP;else if(m_mode==NRFCLAW_ACCEL_MODE_FALL)e.type=NRFCLAW_EVT_ACCEL_FALL;else if(m_mode==NRFCLAW_ACCEL_MODE_WALK){e.type=NRFCLAW_EVT_ACCEL_WALK;e.arg0=++m_walk_phase;}else e.type=NRFCLAW_EVT_ACCEL_MOTION;e.arg0=1;(void)nrfclaw_event_push_isr(&e);}
-void nrfclaw_lis2dh12_on_int2_isr(void){diag_inc(&m_diag.int2_isr_count);nrfclaw_event_t e={.type=NRFCLAW_EVT_ACCEL_INT2,.arg0=1};(void)nrfclaw_event_push_isr(&e);}
+void nrfclaw_lis2dh12_on_int1_isr(void){nrfclaw_event_t e={0};if(m_mode==NRFCLAW_ACCEL_MODE_TAP)e.type=NRFCLAW_EVT_ACCEL_INT1_RAW;else if(m_mode==NRFCLAW_ACCEL_MODE_FALL)e.type=NRFCLAW_EVT_ACCEL_FALL;else if(m_mode==NRFCLAW_ACCEL_MODE_WALK){e.type=NRFCLAW_EVT_ACCEL_WALK;e.arg0=++m_walk_phase;}else e.type=NRFCLAW_EVT_ACCEL_MOTION;e.arg0=1;(void)nrfclaw_event_push_isr(&e);}
+void nrfclaw_lis2dh12_on_int2_isr(void){nrfclaw_event_t e={.type=NRFCLAW_EVT_ACCEL_INT2,.arg0=1};(void)nrfclaw_event_push_isr(&e);}
 
 bool nrfclaw_lis2dh12_vibration_watchdog_failed(void){return m_vib_watchdog_failed;}
 void nrfclaw_lis2dh12_vibration_watchdog_clear_failed(void){m_vib_watchdog_failed=false;}
-
-void nrfclaw_lis2dh12_diag_reset(void){memset(&m_diag,0,sizeof(m_diag));}
-void nrfclaw_lis2dh12_diag_get(nrfclaw_lis2dh12_diag_t *out){if(out)*out=m_diag;}
-void nrfclaw_lis2dh12_power_state_get(nrfclaw_lis2dh12_power_state_t *out)
-{
-    if(!out)return;
-    memset(out,0,sizeof(*out));
-    /* This function intentionally performs no I2C access and clears nothing. */
-    out->twi_enabled=(NRF_TWI1->ENABLE==TWI_ENABLE_ENABLE_Enabled)?1U:0U;
-    out->twi_psel_scl_disconnected=(NRF_TWI1->PSELSCL==0xFFFFFFFFUL)?1U:0U;
-    out->twi_psel_sda_disconnected=(NRF_TWI1->PSELSDA==0xFFFFFFFFUL)?1U:0U;
-    out->twi_errorsrc=(uint8_t)(NRF_TWI1->ERRORSRC & 0xFFU);
-    out->hfclk_running=((NRF_CLOCK->HFCLKSTAT & CLOCK_HFCLKSTAT_STATE_Msk)!=0U)?1U:0U;
-    out->scl_pin_cnf=NRF_P0->PIN_CNF[P_LIS_SCL];
-    out->sda_pin_cnf=NRF_P0->PIN_CNF[P_LIS_SDA];
-    out->int1_level=(uint8_t)nrf_gpio_pin_read(P_LIS_INT1);
-    out->int2_level=(uint8_t)nrf_gpio_pin_read(P_LIS_INT2);
-    out->scl_level=(uint8_t)nrf_gpio_pin_read(P_LIS_SCL);
-    out->sda_level=(uint8_t)nrf_gpio_pin_read(P_LIS_SDA);
-    out->gpiote_events_port=(NRF_GPIOTE->EVENTS_PORT!=0U)?1U:0U;
-    out->int1_latched=(NRF_P0->LATCH&(1UL<<P_LIS_INT1))?1U:0U;
-    out->int2_latched=(NRF_P0->LATCH&(1UL<<P_LIS_INT2))?1U:0U;
-    out->int1_sense=(uint8_t)((NRF_P0->PIN_CNF[P_LIS_INT1]&GPIO_PIN_CNF_SENSE_Msk)>>GPIO_PIN_CNF_SENSE_Pos);
-    out->int2_sense=(uint8_t)((NRF_P0->PIN_CNF[P_LIS_INT2]&GPIO_PIN_CNF_SENSE_Msk)>>GPIO_PIN_CNF_SENSE_Pos);
-    out->accel_mode=(uint8_t)m_mode;
-}

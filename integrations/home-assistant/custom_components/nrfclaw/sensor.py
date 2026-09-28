@@ -1,150 +1,114 @@
+"""nRFClaw sensor platform for Direct NDP and NinaLink nodes."""
+
 from __future__ import annotations
 
-from datetime import timedelta
+from homeassistant.helpers import entity_registry as er
 
-from homeassistant.components import bluetooth
-from homeassistant.components.sensor import SensorEntity, SensorDeviceClass
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import UnitOfElectricPotential, UnitOfTemperature
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.update_coordinator import (
-    DataUpdateCoordinator, CoordinatorEntity, UpdateFailed,
+from .const import DOMAIN, MODE_DIRECT, SEMCAP_VOLUME, SEMCAP_VOLUME_US_GALLON
+from .direct_entities import build_direct_sensor_entities
+from .ninalink_entities import build_sensor_entities
+from .platform_helpers import setup_dynamic_entities
+
+
+_DIRECT_DEPRECATED_SENSOR_SUFFIXES = (
+    "acceleration_x",
+    "acceleration_y",
+    "acceleration_z",
+    "position",
+    "vibration_frequency",
+    "vibration_peak_to_peak",
+    "vibration_peak",
+    "vibration_rms",
 )
-
-from .client import NrfClawClient
-from .const import DOMAIN, CAP_BATTERY, CAP_DS18B20, CAP_ACCEL, CAP_HALL
+_NINALINK_HIDDEN_SENSOR_CAPS = {0x0203, 0x0204, 0x0205, 0x0206, 0x0207, 0x0208, 0x0209, 0x0800, 0x0801, 0x0802, 0x0803, 0x0804}
 
 
-class NrfClawCoordinator(DataUpdateCoordinator):
-    def __init__(self, hass: HomeAssistant, address: str, access_key: str = ""):
-        super().__init__(
-            hass,
-            logger=__import__("logging").getLogger(__name__),
-            name=f"nRFClaw {address}",
-            update_interval=timedelta(seconds=30),
-        )
-        self.address = address
-        self.access_key = access_key
+def _cleanup_deprecated_sensor_registry(hass, entry, runtime) -> None:
+    """Remove sensor entities retired by B7.6f2m3.
 
-    async def _async_update_data(self):
-        device = bluetooth.async_ble_device_from_address(
-            self.hass, self.address, connectable=True
-        )
-        if device is None:
-            raise UpdateFailed("nRFClaw is not reachable by a connectable scanner")
+    Direct unique IDs are deterministic suffixes. NinaLink vibration IDs are
+    capability IDs 0x0206..0x0209. NinaLink 0x0303 remains supported, but an
+    old registry entry named Position is removed once so it can be recreated
+    as Counter with the same wire semantic.
+    """
+    registry = er.async_get(hass)
+    mode = runtime.mode
+
+    if mode == MODE_DIRECT:
+        if not entry.unique_id:
+            return
+        suffixes = list(_DIRECT_DEPRECATED_SENSOR_SUFFIXES)
+        data = getattr(runtime.coordinator, "data", None)
+        semantic_values = getattr(data, "semantic_values", {}) if data is not None else {}
+        if (SEMCAP_VOLUME, 0) in semantic_values or (SEMCAP_VOLUME_US_GALLON, 0) in semantic_values:
+            suffixes.append("counter")
+        for suffix in suffixes:
+            unique_id = f"{entry.unique_id}_{suffix}"
+            entity_id = registry.async_get_entity_id("sensor", DOMAIN, unique_id)
+            if entity_id is not None:
+                registry.async_remove(entity_id)
+        return
+
+    volume_nodes: set[int] = set()
+    data = getattr(runtime.coordinator, "data", None) or {}
+    for device in data.get("ha", {}).get("devices", []):
+        if any(int(entity.get("capability_id_raw", -1)) in (0x0601, 0x0606) for entity in device.get("entities", [])):
+            volume_nodes.add(int(device.get("node_id_raw", -1)))
+
+    for reg_entry in list(registry.entities.values()):
+        if reg_entry.platform != DOMAIN or not reg_entry.entity_id.startswith("sensor."):
+            continue
+        unique_id = str(reg_entry.unique_id or "")
+        if not unique_id.startswith("ninalink:"):
+            continue
+        parts = unique_id.split(":")
+        if len(parts) != 4:
+            continue
         try:
-            return await NrfClawClient(device, self.access_key).read()
-        except Exception as err:
-            raise UpdateFailed(str(err)) from err
+            cap_id = int(parts[2], 16)
+        except ValueError:
+            continue
+        if cap_id in _NINALINK_HIDDEN_SENSOR_CAPS:
+            registry.async_remove(reg_entry.entity_id)
+            continue
+        # B7.6f2m6c1b: raw Hall rows are replaced by one stable synthetic Counter.
+        if cap_id in (0x0302, 0x0303):
+            registry.async_remove(reg_entry.entity_id)
+            continue
+        try:
+            node_id = int(parts[1], 16)
+        except ValueError:
+            node_id = -1
+        if node_id in volume_nodes and cap_id in (0x0302, 0x0303):
+            registry.async_remove(reg_entry.entity_id)
+            continue
+        if cap_id == 0x0303 and getattr(reg_entry, "original_name", None) == "Position":
+            registry.async_remove(reg_entry.entity_id)
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities):
-    coordinator = NrfClawCoordinator(
-        hass, entry.data["address"], entry.data.get("access_key", "")
+async def async_setup_entry(hass, entry, async_add_entities) -> None:
+    runtime = entry.runtime_data
+    _cleanup_deprecated_sensor_registry(hass, entry, runtime)
+    if runtime.mode == MODE_DIRECT:
+        coordinator = runtime.coordinator
+        known: set[str] = set()
+
+        def _sync_direct() -> None:
+            fresh = []
+            for entity in build_direct_sensor_entities(coordinator, entry):
+                if entity.unique_id in known:
+                    continue
+                known.add(entity.unique_id)
+                fresh.append(entity)
+            if fresh:
+                async_add_entities(fresh)
+
+        entry.async_on_unload(coordinator.async_add_listener(_sync_direct))
+        _sync_direct()
+        return
+
+    setup_dynamic_entities(
+        entry,
+        async_add_entities,
+        build_sensor_entities,
     )
-    await coordinator.async_config_entry_first_refresh()
-
-    entities = []
-    d = coordinator.data
-    if d.has_capability(CAP_BATTERY):
-        entities.append(BatterySensor(coordinator, entry))
-    if d.has_capability(CAP_HALL):
-        entities.append(HallSensor(coordinator, entry))
-    if d.has_capability(CAP_DS18B20):
-        entities.append(TemperatureSensor(coordinator, entry))
-    if d.has_capability(CAP_ACCEL):
-        entities.extend([
-            VibrationRmsSensor(coordinator, entry),
-            VibrationPeakSensor(coordinator, entry),
-        ])
-
-    async_add_entities(entities)
-
-
-class BaseSensor(CoordinatorEntity, SensorEntity):
-    _attr_has_entity_name = True
-
-    def __init__(self, coordinator, entry, key):
-        super().__init__(coordinator)
-        self._entry = entry
-        self._attr_unique_id = f"{entry.unique_id}_{key}"
-
-    @property
-    def device_info(self):
-        d = self.coordinator.data
-        sw = d.firmware
-        if sw is not None and d.firmware_build is not None:
-            sw = f"{sw} build {d.firmware_build}"
-        return {
-            "identifiers": {(DOMAIN, self._entry.unique_id)},
-            "name": self._entry.title,
-            "manufacturer": "nRFClaw",
-            "model": d.board_name or "nRFClaw",
-            "hw_version": d.hw_rev,
-            "sw_version": sw,
-        }
-
-
-class BatterySensor(BaseSensor):
-    _attr_name = "Battery voltage"
-    _attr_device_class = SensorDeviceClass.VOLTAGE
-    _attr_native_unit_of_measurement = UnitOfElectricPotential.VOLT
-
-    def __init__(self, coordinator, entry):
-        super().__init__(coordinator, entry, "battery_voltage")
-
-    @property
-    def native_value(self):
-        return self.coordinator.data.battery_v
-
-
-class HallSensor(BaseSensor):
-    _attr_name = "Hall counter"
-
-    def __init__(self, coordinator, entry):
-        super().__init__(coordinator, entry, "hall")
-
-    @property
-    def available(self):
-        return super().available and bool(self.coordinator.data.hall_mode)
-
-    @property
-    def native_value(self):
-        return self.coordinator.data.hall_value
-
-
-class TemperatureSensor(BaseSensor):
-    _attr_name = "DS18B20 temperature"
-    _attr_device_class = SensorDeviceClass.TEMPERATURE
-    _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
-
-    def __init__(self, coordinator, entry):
-        super().__init__(coordinator, entry, "ds18b20_temperature")
-
-    @property
-    def native_value(self):
-        return self.coordinator.data.temperature_c
-
-
-class VibrationRmsSensor(BaseSensor):
-    _attr_name = "Vibration RMS"
-    _attr_native_unit_of_measurement = "mg"
-
-    def __init__(self, coordinator, entry):
-        super().__init__(coordinator, entry, "vibration_rms")
-
-    @property
-    def native_value(self):
-        return self.coordinator.data.vibration_rms_mg
-
-
-class VibrationPeakSensor(BaseSensor):
-    _attr_name = "Vibration peak"
-    _attr_native_unit_of_measurement = "mg"
-
-    def __init__(self, coordinator, entry):
-        super().__init__(coordinator, entry, "vibration_peak")
-
-    @property
-    def native_value(self):
-        return self.coordinator.data.vibration_peak_mg

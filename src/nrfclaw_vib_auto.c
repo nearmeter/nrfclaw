@@ -143,7 +143,6 @@ static void diagnostics_reset(void){
     m_status.diag_confirm_starts=0U;m_status.diag_confirm_ok=0U;m_status.diag_confirm_rejects=0U;
     m_status.diag_confirm_retries=0U;m_status.diag_confirm_retry_ok=0U;
     m_status.diag_confirm_delay_s=VA_ACTIVE_CONFIRM_DELAY_S;m_status.diag_confirm_retry_delay_ms=VA_ACTIVE_CONFIRM_RETRY_MS;m_status.diag_confirm_pending=false;
-    nrfclaw_lis2dh12_diag_reset();
     memset(m_trace,0,sizeof(m_trace));m_trace_head=0U;m_trace_count=0U;m_last_arm_reason=0U;m_need_active_confirm=false;m_active_confirm_pending=false;m_active_confirm_retry_count=0U;
 }
 

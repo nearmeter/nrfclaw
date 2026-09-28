@@ -48,7 +48,6 @@ nrfclaw_ble_app_status_t nrfclaw_ble_app_adv_start(void);
 nrfclaw_ble_app_status_t nrfclaw_ble_app_adv_stop(void);
 uint16_t nrfclaw_ble_app_adv_interval_ms(void);
 int8_t nrfclaw_ble_app_adv_tx_power_dbm(void);
-nrfclaw_ble_app_status_t nrfclaw_ble_app_beacon_config(uint16_t interval_ms,int8_t tx_power_dbm);
 
 /* Stage 8A: peripheral/advertiser are real. Central/scanner API is reserved. */
 nrfclaw_ble_app_status_t nrfclaw_ble_app_connect(const uint8_t addr[6]);
@@ -63,4 +62,15 @@ nrfclaw_ble_app_status_t nrfclaw_ble_app_send_raw(const uint8_t *data,
 void nrfclaw_ble_app_on_rx(const uint8_t *data, uint16_t len);
 bool nrfclaw_ble_app_last_frame(nrfclaw_app_frame_t *frame);
 
+
+uint32_t nrfclaw_ble_app_tx_generation(void);
+
+
+/* B7.6b: arm one connection-scoped, RAM-only low-power restart hint. */
+bool nrfclaw_ble_app_next_disconnect_low_power(void);
+
+
+/* B7.6d Direct Advertising Telemetry v1. */
+bool nrfclaw_ble_app_telemetry_can_publish_now(void);
+bool nrfclaw_ble_app_telemetry_set(const uint8_t *payload, uint8_t len);
 #endif

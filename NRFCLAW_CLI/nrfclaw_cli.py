@@ -17,6 +17,7 @@ import zlib
 import hashlib
 import hmac
 import os
+import secrets
 import asyncio
 import struct
 import sys
@@ -383,17 +384,127 @@ NDP_KEY_GENERATE        = 0x50  # physical NUS only
 NDP_KEY_GET             = 0x51  # physical NUS only
 NDP_KEY_STATUS          = 0x52  # physical NUS only
 NDP_BLE_BOOT_CONTROL    = 0x53  # r3.8.10 physical NUS only
-NDP_BLE_BEACON_CONTROL  = 0x54  # r3.8.14 physical NUS only
-NDP_LORA_DIAG_SEND       = 0x55  # r3.8.16b1l physical NUS only
-NDP_LORA_DIAG_RX         = 0x56  # r3.8.16b1l physical NUS only
+NDP_HA_ROLE_CONTROL      = 0x5D  # B7.6f physical NUS only
 NDP_RADIO_GET_EXT         = 0x57  # r3.8.18 extended persisted radio profile
 NDP_RADIO_SET_EXT         = 0x58  # r3.8.18 extended persisted radio profile
+NDP_NINALINK_BRIDGE       = 0x5A  # B4.2/B4.3 validated bridge RX
+NDP_DIRECT_SENSOR_CONTROL = 0x5E  # B7.6f2k2 persistent Direct event preset
+NDP_DIRECT_EVENT_SENSITIVITY = 0x5F  # B7.6f2k3 LOW/NORMAL/HIGH preset
+NDP_DIRECT_HALL_CONTROL = 0x60  # B7.6f2k3 persistent Hall behavior
+NDP_DIRECT_SEMANTIC_STATE = 0x61  # B7.6f2k4 current VM semantic state
+NDP_NINALINK_NETWORK = 0x62  # B7.6f2l1 physical-NUS persistent network ID
 
 NDP_SENSOR_BATTERY       = 1
 NDP_SENSOR_HALL          = 2
 NDP_SENSOR_ACCEL_XYZ     = 3
 NDP_SENSOR_DS18B20       = 4
 NDP_SENSOR_ACCEL_METRICS = 5
+NDP_SENSOR_TEMPERATURE   = 6
+
+
+NINALINK_MAGIC = 0x4E
+NINALINK_VERSION = 1
+NINALINK_TYPE_NAMES = {
+    0x01: "HELLO", 0x02: "CAPS_REQUEST", 0x03: "CAPS_RESPONSE",
+    0x10: "CAP_REPORT", 0x11: "CAP_EVENT", 0x20: "ACK", 0x21: "NACK",
+}
+NINALINK_VALUE_SIZES = {0x01:1,0x02:1,0x03:1,0x04:2,0x05:2,0x06:4,0x07:4,0x08:1}
+NINALINK_CAPS = {
+    0x0001: ("battery_voltage", -3, "V"),
+    0x0002: ("battery_percent", 0, "%"),
+    0x0100: ("temperature", -2, "C"),
+    0x0101: ("humidity", -2, "%"),
+    0x0102: ("illuminance", 0, "lux"),
+    0x0103: ("pressure", 0, "Pa"),
+    0x0104: ("co2", 0, "ppm"),
+    0x0105: ("tvoc", 0, "ppb"),
+    0x0106: ("leak", 0, ""),
+    0x0200: ("motion", 0, ""),
+    0x0201: ("tap", 0, ""),
+    0x0202: ("fall", 0, ""),
+    0x0203: ("acceleration_x", 0, "mg"),
+    0x0204: ("acceleration_y", 0, "mg"),
+    0x0205: ("acceleration_z", 0, "mg"),
+    0x0206: ("vibration_rms", 0, "mg"),
+    0x0207: ("vibration_peak", 0, "mg"),
+    0x0208: ("vibration_peak_to_peak", 0, "mg"),
+    0x0209: ("vibration_frequency", -3, "Hz"),
+    0x020A: ("vibration_alarm", 0, ""),
+    0x0300: ("digital_input", 0, ""),
+    0x0301: ("hall_state", 0, ""),
+    0x0302: ("counter", 0, "count"),
+    0x0303: ("quadrature_position", 0, "count"),
+    0x0304: ("pulse_frequency", -3, "Hz"),
+    0x0400: ("presence", 0, ""),
+    0x0401: ("tracking_active", 0, ""),
+    0x0503: ("energy", -3, "Wh"),
+}
+
+def ninalink_crc16(data: bytes) -> int:
+    crc = 0xFFFF
+    for octet in data:
+        crc ^= octet << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if (crc & 0x8000) else (crc << 1) & 0xFFFF
+    return crc
+
+def decode_ninalink(data: bytes) -> dict:
+    if len(data) < 15: raise ValueError("frame shorter than 15 bytes")
+    if len(data) > 64: raise ValueError("frame longer than 64 bytes")
+    if data[0] != NINALINK_MAGIC: raise ValueError(f"bad magic 0x{data[0]:02X}")
+    if data[1] != NINALINK_VERSION: raise ValueError(f"unsupported version {data[1]}")
+    payload_len = data[6]
+    if len(data) != 15 + payload_len:
+        raise ValueError(f"length mismatch physical={len(data)} payload={payload_len}")
+    got_crc = int.from_bytes(data[-2:], "little")
+    want_crc = ninalink_crc16(data[:-2])
+    if got_crc != want_crc:
+        raise ValueError(f"CRC mismatch got=0x{got_crc:04X} expected=0x{want_crc:04X}")
+    result = {
+        "flags": data[2], "type": data[3],
+        "network_id": int.from_bytes(data[4:6], "little"),
+        "node_id": int.from_bytes(data[7:11], "little"),
+        "sequence": int.from_bytes(data[11:13], "little"),
+        "payload": data[13:-2], "entries": [],
+    }
+    if result["type"] in (0x10, 0x11):
+        p = result["payload"]
+        if not p: raise ValueError("value message has empty payload")
+        count, off, entries = p[0], 1, []
+        for _ in range(count):
+            if off + 4 > len(p): raise ValueError("truncated value-entry header")
+            cap = int.from_bytes(p[off:off+2], "little")
+            ch, vt = p[off+2], p[off+3]
+            size = NINALINK_VALUE_SIZES.get(vt)
+            if size is None: raise ValueError(f"unknown value type 0x{vt:02X}")
+            if off + 4 + size > len(p): raise ValueError("truncated value")
+            rawb = p[off+4:off+4+size]
+            if vt == 0x01:
+                if rawb[0] not in (0,1): raise ValueError("invalid BOOL")
+                raw = bool(rawb[0])
+            elif vt in (0x03,0x05,0x07):
+                raw = int.from_bytes(rawb, "little", signed=True)
+            else:
+                raw = int.from_bytes(rawb, "little")
+            entries.append({"capability_id":cap,"channel":ch,"value_type":vt,"raw":raw})
+            off += 4 + size
+        if off != len(p): raise ValueError("trailing bytes after value entries")
+        result["entries"] = entries
+    return result
+
+def format_ninalink_value(entry: dict) -> str:
+    cap = entry["capability_id"]
+    name, scale, unit = NINALINK_CAPS.get(cap, (f"cap_0x{cap:04X}",0,""))
+    raw = entry["raw"]
+    if isinstance(raw, bool):
+        value_text = "true" if raw else "false"
+    elif scale == 0:
+        value_text = str(raw)
+    else:
+        value = raw * (10 ** scale)
+        value_text = f"{value:.{-scale}f}"
+    if unit: value_text += f" {unit}"
+    return f"{name}[{entry['channel']}] = {value_text} (raw={raw})"
 
 NDP_ACCESS_PUBLIC     = 0
 NDP_ACCESS_CONTROL    = 1
@@ -459,12 +570,10 @@ CMD_PING          = 0x16
 CMD_PROGRAM_AUTH = 0x17
 CMD_PROGRAM_SCHEDULE = 0x18
 CMD_RESET = 0x19
-CMD_EVENT_INJECT = 0x1A
 CMD_CAPABILITIES = 0x1B
 CMD_FACTORY_RESET = 0x1C
 CMD_TRACKING_IDENTITY = 0x1D
 CMD_TRACKING_INFO     = 0x1E
-CMD_TRACKING_DEBUG    = 0x1F
 CMD_DFU_ENTER         = 0x20
 
 DFU_CMD_INFO=0x01
@@ -518,7 +627,7 @@ FLASH_STATES = {
 }
 
 
-CAP_NAMES = {1:"GPIO",2:"BATTERY",3:"DS18B20",4:"ACCEL",5:"LORA",6:"BLE_APP",7:"RTC",8:"HALL",9:"STATE",10:"SERIAL",11:"TRACKING",12:"VIB_HEALTH",13:"VIB_AUTO"}
+CAP_NAMES = {1:"GPIO",2:"BATTERY",3:"DS18B20",4:"ACCEL",5:"LORA",6:"BLE_APP",7:"RTC",8:"HALL",9:"STATE",10:"SERIAL",11:"TRACKING",12:"VIB_HEALTH",13:"VIB_AUTO",14:"TEMPERATURE"}
 
 VM_EVENT_FRAME   = 0xE0
 VM_NOTIFY_U32    = 0x01
@@ -548,6 +657,9 @@ OP_TRACKING_START   = 0x79
 OP_TRACKING_STOP    = 0x7A
 OP_TRACKING_STATUS  = 0x7B
 OP_TRACKING_ROTATION_SET = 0x7C
+
+OP_NINALINK_TELEMETRY = 0x8E
+OP_NINALINK_TELEMETRY_SYNTH = 0x8F
 
 def crc16_ccitt(data: bytes) -> int:
     crc = 0xFFFF
@@ -1087,6 +1199,46 @@ def event_gpio_test(event_type: int, pin: int, value: int) -> bytes:
     ])
 
 
+def ninalink_power_test_boot_program(period_s=20, window_ms=600, attempts=3, backoff_ms=200, temperature_mC=25000):
+    if not 5 <= period_s <= 300: raise ValueError("--every must be 5..300 seconds")
+    if not 100 <= window_ms <= 4000: raise ValueError("--window must be 100..4000 ms")
+    if not 1 <= attempts <= 5: raise ValueError("--attempts must be 1..5")
+    if attempts > 1 and not 1 <= backoff_ms <= 4000: raise ValueError("--backoff must be 1..4000 ms")
+    if not -55000 <= temperature_mC <= 125000: raise ValueError("--temperature-mc must be -55000..125000")
+    backoff_ms = backoff_ms if attempts > 1 else 0
+    t=temperature_mC & 0xFFFFFFFF
+    return bytes([OP_NINALINK_TELEMETRY_SYNTH, period_s&0xff,(period_s>>8)&0xff, window_ms&0xff,(window_ms>>8)&0xff, attempts, backoff_ms&0xff,(backoff_ms>>8)&0xff, t&0xff,(t>>8)&0xff,(t>>16)&0xff,(t>>24)&0xff, OP_END])
+
+
+def ninalink_telemetry_boot_program(
+    period_s: int = 20,
+    window_ms: int = 600,
+    attempts: int = 3,
+    backoff_ms: int = 200,
+) -> bytes:
+    if not 5 <= period_s <= 3600:
+        raise ValueError("--every must be 5..300 seconds")
+    if not 100 <= window_ms <= 4000:
+        raise ValueError("--window must be 100..4000 ms")
+    if not 1 <= attempts <= 5:
+        raise ValueError("--attempts must be 1..5")
+    if attempts > 1 and not 1 <= backoff_ms <= 4000:
+        raise ValueError("--backoff must be 1..4000 ms")
+
+    effective_backoff = backoff_ms if attempts > 1 else 0
+    return bytes([
+        OP_NINALINK_TELEMETRY,
+        period_s & 0xFF,
+        (period_s >> 8) & 0xFF,
+        window_ms & 0xFF,
+        (window_ms >> 8) & 0xFF,
+        attempts,
+        effective_backoff & 0xFF,
+        (effective_backoff >> 8) & 0xFF,
+        OP_END,
+    ])
+
+
 async def scan_bleak_devices(timeout: float):
     """Return [(device, adv)] from an unfiltered Bleak scan, supporting
     both newer and older Bleak releases used by the nRFClaw CLI.
@@ -1165,8 +1317,13 @@ async def find_app_device(suffix: str, timeout: float, verbose: bool = False):
         if not identity_match:
             continue
 
-        # If BlueZ explicitly says this is NUS-only, do not steal the
-        # programming plane.  Missing UUIDs are accepted and proven by GATT.
+        # Plane name is authoritative. BlueZ may expose stale/cached GATT
+        # service UUIDs from the other plane for the same BLE address.
+        if name.upper().startswith("NRFCLAW(NUS)-"):
+            continue
+
+        # UUID-only fallback: reject a clearly NUS-only advertisement.
+        # If both UUIDs are present, the explicit advertised name above wins.
         if NUS_SERVICE.lower() in uuids and APP_SERVICE.lower() not in uuids:
             continue
 
@@ -1212,6 +1369,7 @@ class ApplicationNDPClient:
         self.access_key = access_key
         self.client = BleakClient(dev)
         self.response_queue = asyncio.Queue()
+        self.change_queue = asyncio.Queue()
         self._seq = 0
         self._notify_started = False
 
@@ -1279,7 +1437,107 @@ class ApplicationNDPClient:
             await asyncio.sleep(0.20)
 
     def _notify(self, _sender, data: bytearray):
-        self.response_queue.put_nowait(bytes(data))
+        raw = bytes(data)
+        if len(raw) == 20 and raw[0] == 0xE5 and raw[1] == 1:
+            self.change_queue.put_nowait(raw)
+            return
+        self.response_queue.put_nowait(raw)
+
+    @staticmethod
+    def _decode_b55_change(raw: bytes) -> dict:
+        if len(raw) != 20 or raw[0] != 0xE5 or raw[1] != 1:
+            raise RuntimeError("Invalid B5.5 change notification")
+        flags = raw[2]
+        return {
+            "schema": raw[1],
+            "flags": flags,
+            "state_changed": bool(flags & 0x01),
+            "event_changed": bool(flags & 0x02),
+            "mask": raw[3],
+            "state_revision": int.from_bytes(raw[4:8], "little"),
+            "event_revision": int.from_bytes(raw[8:12], "little"),
+            "newest_event_id": int.from_bytes(raw[12:16], "little"),
+            "change_revision": int.from_bytes(raw[16:20], "little"),
+        }
+
+    @staticmethod
+    def _decode_b55_status(p: bytes) -> dict:
+        if len(p) != 15:
+            raise RuntimeError(f"Invalid B5.5 status length: {len(p)}")
+        return {
+            "schema": p[0],
+            "mask": p[1],
+            "pending_flags": p[2],
+            "state_revision": int.from_bytes(p[3:7], "little"),
+            "event_revision": int.from_bytes(p[7:11], "little"),
+            "newest_event_id": int.from_bytes(p[11:15], "little"),
+        }
+
+    async def ninalink_change_status(self):
+        p = await self.ndp_command(NDP_NINALINK_BRIDGE, bytes([36]))
+        return self._decode_b55_status(p)
+
+    async def ninalink_query_queue(self, node_id, caps):
+        if not 1 <= len(caps) <= 2:
+            raise ValueError("query requires one or two capabilities")
+        req = bytearray([42])
+        req += int(node_id).to_bytes(4, "little")
+        req.append(len(caps))
+        parsed=[]
+        for spec in caps:
+            if isinstance(spec,str) and ":" in spec:
+                cap_s,ch_s=spec.split(":",1); cap=int(cap_s,0); ch=int(ch_s,0)
+            else:
+                cap=int(spec,0) if isinstance(spec,str) else int(spec); ch=0
+            if not 0<=cap<=0xFFFF or not 0<=ch<=0xFF:
+                raise ValueError(f"invalid capability endpoint: {spec}")
+            req += cap.to_bytes(2,"little"); req.append(ch); parsed.append((cap,ch))
+        p=await self.ndp_command(NDP_NINALINK_BRIDGE,bytes(req))
+        if len(p)!=2: raise RuntimeError(f"invalid B4.11b queue reply length: {len(p)}")
+        return {"node_id":int(node_id),"command_seq":int.from_bytes(p,"little"),
+                "capabilities":[{"capability_id":cap,"channel":ch} for cap,ch in parsed]}
+
+    async def ninalink_query_status(self):
+        p=await self.ndp_command(NDP_NINALINK_BRIDGE,bytes([43]))
+        if len(p)!=12: raise RuntimeError(f"invalid B4.11b query status length: {len(p)}")
+        states={0:"IDLE",1:"PENDING",2:"DONE",3:"ERROR"}
+        items={0:"OK",1:"UNKNOWN",2:"NOT_READABLE",3:"UNAVAILABLE",255:"NONE"}
+        return {"state":states.get(p[0],str(p[0])),"state_raw":p[0],"count":p[1],
+                "node_id":int.from_bytes(p[2:6],"little"),
+                "command_seq":int.from_bytes(p[6:8],"little"),
+                "command_result":p[8],"cached_count":p[9],
+                "item_status":[items.get(p[10],str(p[10])),items.get(p[11],str(p[11]))],
+                "item_status_raw":[p[10],p[11]]}
+
+    async def ninalink_change_subscribe(self, mask: int):
+        if mask < 0 or mask > 3:
+            raise ValueError("B5.5 subscription mask must be 0..3")
+        p = await self.ndp_command(
+            NDP_NINALINK_BRIDGE, bytes([37, mask])
+        )
+        return self._decode_b55_status(p)
+
+    async def ninalink_change_stats(self):
+        p = await self.ndp_command(NDP_NINALINK_BRIDGE, bytes([38]))
+        if len(p) != 14:
+            raise RuntimeError(f"Invalid B5.5 stats length: {len(p)}")
+        return {
+            "change_revision": int.from_bytes(p[0:4], "little"),
+            "notifications_sent": int.from_bytes(p[4:6], "little"),
+            "coalesced": int.from_bytes(p[6:8], "little"),
+            "busy_retries": int.from_bytes(p[8:10], "little"),
+            "disconnect_resets": int.from_bytes(p[10:12], "little"),
+            "send_errors": int.from_bytes(p[12:14], "little"),
+        }
+
+    async def ninalink_wait_change(self, timeout: float = 30.0):
+        try:
+            raw = await asyncio.wait_for(self.change_queue.get(), timeout)
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(
+                f"Timeout waiting B5.5 change notification ({timeout}s)"
+            ) from exc
+        return self._decode_b55_change(raw)
 
     async def ndp_command_raw(self, opcode: int, payload: bytes = b"", timeout: float = 5.0):
         if len(payload) > 16:
@@ -1532,11 +1790,15 @@ class ApplicationNDPClient:
             except Exception as exc:
                 print(f"  Battery:        unavailable ({exc})")
 
-        if caps['supported'].get(3, False):
+        if caps['supported'].get(14, False) or caps['supported'].get(3, False):
             try:
-                st, p = await self.sensor_read_raw(NDP_SENSOR_DS18B20, retries=3, delay=0.8)
-                if st == 0 and len(p) == 4:
-                    mc = struct.unpack("<i", p)[0]
+                if caps['supported'].get(14, False):
+                    st, p = await self.sensor_read_raw(NDP_SENSOR_TEMPERATURE, retries=3, delay=0.8)
+                    mc = struct.unpack("<i", p[1:5])[0] if st == 0 and len(p) == 5 else None
+                else:
+                    st, p = await self.sensor_read_raw(NDP_SENSOR_DS18B20, retries=3, delay=0.8)
+                    mc = struct.unpack("<i", p)[0] if st == 0 and len(p) == 4 else None
+                if mc is not None:
                     print(f"  Temperature:    {mc / 1000.0:.3f} C")
                 else:
                     print(f"  Temperature:    unavailable ({NDP_STATUS_NAMES.get(st, st)})")
@@ -1568,7 +1830,11 @@ class ApplicationNDPClient:
         else:
             result["accel"] = None
 
-        if st["ds18b20_present"]:
+        caps = await self.capabilities(quiet=True)
+        if caps["supported"].get(14, False):
+            status, p = await self.sensor_read_raw(NDP_SENSOR_TEMPERATURE, retries=3, delay=0.8)
+            result["temperature_mC"] = struct.unpack("<i", p[1:5])[0] if status == 0 and len(p) == 5 else None
+        elif st["ds18b20_present"]:
             status, p = await self.sensor_read_raw(NDP_SENSOR_DS18B20, retries=3, delay=0.8)
             result["temperature_mC"] = struct.unpack("<i", p)[0] if status == 0 and len(p) == 4 else None
         else:
@@ -1646,33 +1912,39 @@ async def find_device(suffix: str, timeout: float):
             for u in ((getattr(adv, "service_uuids", None) or []) if adv is not None else [])
         }
 
-        name_match = name.upper() == wanted.upper()
+        upper_name = name.upper()
+        name_match = upper_name == wanted.upper()
         address_match = bool(suffix) and address_compact.endswith(suffix)
         nus_match = nus_uuid in uuids
+        app_match = APP_SERVICE.lower() in uuids
 
-        # Another nearby nRFClaw can advertise NUS too, so UUID alone cannot
-        # select a board. Conversely MAC alone cannot distinguish NDP from NUS.
-        if not (name_match or address_match):
-            return
-        if not (name_match or nus_match):
+        # Plane name is authoritative. The same BLE address can expose both
+        # GATT services and BlueZ can retain UUIDs across a plane handoff.
+        if upper_name.startswith("NRFCLAW(NDP)-"):
             return
 
-        score = 0
-        if nus_match:
-            score += 16
+        # Exact NUS name is the strongest possible match, regardless of stale
+        # UUID metadata.
         if name_match:
-            score += 8
-        if address_match:
-            score += 4
+            score = 100
+            if address_match:
+                score += 4
+            if score > best["score"]:
+                best["score"] = score
+                best["dev"] = dev
+            loop.call_soon_threadsafe(found_event.set)
+            return
 
+        # UUID fallback is allowed only for the requested board and only when
+        # the advertisement does not simultaneously identify the APP plane.
+        if not address_match or not nus_match or app_match:
+            return
+
+        score = 20
         if score > best["score"]:
             best["score"] = score
             best["dev"] = dev
-
-        # Exact name is authoritative.  NUS UUID + requested BLE suffix is
-        # also strong enough and avoids waiting for a later scan-response name.
-        if name_match or (nus_match and address_match):
-            loop.call_soon_threadsafe(found_event.set)
+        loop.call_soon_threadsafe(found_event.set)
 
     scanner = BleakScanner(consider)
     try:
@@ -2204,36 +2476,379 @@ class NRFClawClient:
         print(f"Z:               {z} mg")
         return x, y, z
 
-    async def ds18b20_read(self, retries: int = 3):
-        last_status = None
+    async def direct_event_mode(self, action: str):
+        """Read or persist the B7.6f2k2 Direct event-detection preset."""
+        selectable = {"off": 0, "motion": 1, "tap": 2, "fall": 3}
+        mode_names = {
+            0: "OFF",
+            1: "MOTION",
+            2: "TAP",
+            3: "FALL",
+            4: "WALK",
+            5: "VIBRATION",
+        }
 
-        for attempt in range(retries):
-            status, p = await self.ndp_command_raw(
-                NDP_SENSOR_READ,
-                bytes([NDP_SENSOR_DS18B20]),
+        if action != "status":
+            mode = selectable[action]
+            deadline = asyncio.get_running_loop().time() + 6.0
+            while True:
+                status, _ = await self.ndp_command_raw(
+                    NDP_DIRECT_SENSOR_CONTROL, bytes([mode])
+                )
+                if status == 0:
+                    break
+                if status != 4 or asyncio.get_running_loop().time() >= deadline:
+                    raise RuntimeError(
+                        "DIRECT_SENSOR_CONTROL SET: "
+                        f"{NDP_STATUS_NAMES.get(status, status)}"
+                    )
+                await asyncio.sleep(0.05)
+
+        deadline = asyncio.get_running_loop().time() + 6.0
+        while True:
+            status, payload = await self.ndp_command_raw(NDP_DIRECT_SENSOR_CONTROL)
+            if status != 0:
+                raise RuntimeError(
+                    "DIRECT_SENSOR_CONTROL GET: "
+                    f"{NDP_STATUS_NAMES.get(status, status)}"
+                )
+            if len(payload) != 5 or payload[0] != 1:
+                raise RuntimeError(
+                    f"Invalid DIRECT_SENSOR_CONTROL payload: {payload.hex()}"
+                )
+
+            runtime, persisted, has_persisted, store_status = payload[1:]
+            if action == "status" or store_status == 0:
+                break
+            if store_status == 2:
+                raise RuntimeError("DIRECT_SENSOR_CONTROL persistence failed")
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError("DIRECT_SENSOR_CONTROL persistence timeout")
+            await asyncio.sleep(0.05)
+
+        if action != "status":
+            requested = selectable[action]
+            if runtime != requested or not has_persisted or persisted != requested:
+                raise RuntimeError(
+                    "DIRECT_SENSOR_CONTROL readback mismatch: "
+                    f"runtime={runtime} persisted={persisted} has={has_persisted}"
+                )
+
+        print("=== DIRECT EVENT MODE ===")
+        print(f"Runtime:         {mode_names.get(runtime, str(runtime))}")
+        if has_persisted:
+            print(f"Persisted:       {mode_names.get(persisted, str(persisted))}")
+        else:
+            print("Persisted:       not set")
+        print(f"Store:           {('idle', 'saving', 'error')[store_status] if store_status < 3 else store_status}")
+        return runtime, (persisted if has_persisted else None), store_status
+
+    async def direct_event_sensitivity(self, action: str):
+        """Read or persist the B7.6f2k3 event-sensitivity preset."""
+        selectable = {"low": 0, "normal": 1, "high": 2}
+        names = {0: "LOW", 1: "NORMAL", 2: "HIGH"}
+
+        if action != "status":
+            requested = selectable[action]
+            deadline = asyncio.get_running_loop().time() + 6.0
+            while True:
+                status, _ = await self.ndp_command_raw(
+                    NDP_DIRECT_EVENT_SENSITIVITY, bytes([requested])
+                )
+                if status == 0:
+                    break
+                if status != 4 or asyncio.get_running_loop().time() >= deadline:
+                    raise RuntimeError(
+                        "DIRECT_EVENT_SENSITIVITY SET: "
+                        f"{NDP_STATUS_NAMES.get(status, status)}"
+                    )
+                await asyncio.sleep(0.05)
+
+        deadline = asyncio.get_running_loop().time() + 6.0
+        while True:
+            status, payload = await self.ndp_command_raw(
+                NDP_DIRECT_EVENT_SENSITIVITY
             )
-            last_status = status
+            if status != 0:
+                raise RuntimeError(
+                    "DIRECT_EVENT_SENSITIVITY GET: "
+                    f"{NDP_STATUS_NAMES.get(status, status)}"
+                )
+            if len(payload) != 4 or payload[0] != 1:
+                raise RuntimeError(
+                    f"Invalid DIRECT_EVENT_SENSITIVITY payload: {payload.hex()}"
+                )
+            sensitivity, has_persisted, store_status = payload[1:]
+            if action == "status" or store_status == 0:
+                break
+            if store_status == 2:
+                raise RuntimeError("DIRECT_EVENT_SENSITIVITY persistence failed")
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError("DIRECT_EVENT_SENSITIVITY persistence timeout")
+            await asyncio.sleep(0.05)
 
+        if action != "status":
+            requested = selectable[action]
+            if sensitivity != requested or not has_persisted:
+                raise RuntimeError(
+                    "DIRECT_EVENT_SENSITIVITY readback mismatch: "
+                    f"sensitivity={sensitivity} persisted={has_persisted}"
+                )
+
+        print("=== DIRECT EVENT SENSITIVITY ===")
+        print(f"Preset:          {names.get(sensitivity, str(sensitivity))}")
+        print(f"Persisted:       {'yes' if has_persisted else 'default only'}")
+        print(f"Store:           {('idle', 'saving', 'error')[store_status] if store_status < 3 else store_status}")
+        return sensitivity, bool(has_persisted), store_status
+
+    async def ninalink_network(self, network_id=None, quiet=False):
+        """Read or persist the NinaLink v1 16-bit network ID."""
+        if network_id is not None:
+            if network_id < 0 or network_id > 0xFFFF:
+                raise ValueError("network_id must be in range 0x0000..0xFFFF")
+            status, payload = await self.ndp_command_raw(
+                NDP_NINALINK_NETWORK, struct.pack("<H", network_id)
+            )
+            if status != 0:
+                raise RuntimeError(
+                    f"NINALINK_NETWORK SET: {NDP_STATUS_NAMES.get(status, status)}"
+                )
+
+        deadline = time.monotonic() + 6.0
+        while True:
+            status, p = await self.ndp_command_raw(NDP_NINALINK_NETWORK)
+            if status != 0:
+                raise RuntimeError(
+                    f"NINALINK_NETWORK GET: {NDP_STATUS_NAMES.get(status, status)}"
+                )
+            if len(p) != 7 or p[0] != 1:
+                raise RuntimeError(f"Invalid NINALINK_NETWORK payload: {p.hex()}")
+            current = int.from_bytes(p[1:3], "little")
+            has_persisted = bool(p[3])
+            store_status = p[4]
+            foreign = int.from_bytes(p[5:7], "little")
+            if network_id is None or store_status == 0:
+                break
+            if store_status == 2:
+                raise RuntimeError("NinaLink network ID persistence failed")
+            if time.monotonic() >= deadline:
+                raise TimeoutError("NinaLink network ID persistence timeout")
+            await asyncio.sleep(0.05)
+
+        if network_id is not None and (current != network_id or not has_persisted):
+            raise RuntimeError(
+                "NinaLink network ID readback mismatch: "
+                f"requested=0x{network_id:04X} current=0x{current:04X} "
+                f"persisted={has_persisted}"
+            )
+
+        states = {0: "idle", 1: "saving", 2: "error"}
+        if not quiet:
+            print("=== NINALINK NETWORK B7.6f2l1 ===")
+            print(f"Network ID:       0x{current:04X}")
+            print(f"Persisted:        {'yes' if has_persisted else 'default only'}")
+            print(f"Store:            {states.get(store_status, store_status)}")
+            print(f"Foreign RX:       {foreign}")
+        return current, has_persisted, store_status, foreign
+
+    async def semantic_state(self):
+        status, p = await self.ndp_command_raw(NDP_DIRECT_SEMANTIC_STATE)
+        if status == 3:
+            print("=== VM SEMANTIC STATE ===")
+            print("State:           none")
+            return None
+        if status != 0:
+            raise RuntimeError(f"DIRECT_SEMANTIC_STATE: {NDP_STATUS_NAMES.get(status, status)}")
+        if len(p) != 13:
+            raise RuntimeError(f"Invalid DIRECT_SEMANTIC_STATE payload: {p.hex()}")
+        kind=p[0]; cap=int.from_bytes(p[1:3],"little"); channel=p[3]; typ=p[4]
+        scale=int.from_bytes(p[5:6],"little",signed=True); unit=p[6]
+        raw=int.from_bytes(p[7:11],"little"); generation=int.from_bytes(p[11:13],"little")
+        signed=typ in (3,5,7); bits={1:8,2:8,3:8,4:16,5:16,6:32,7:32,8:8}.get(typ,32)
+        value=raw & ((1<<bits)-1)
+        if signed and value & (1<<(bits-1)): value -= 1<<bits
+        scaled=value*(10**scale)
+        capname={0x0601:"VOLUME",0x0606:"VOLUME_US_GALLON"}.get(cap,f"0x{cap:04X}")
+        unitname={0x11:"L",0x15:"gal"}.get(unit,str(unit))
+        print("=== VM SEMANTIC STATE ===")
+        print(f"Capability:      {capname} (0x{cap:04X})")
+        print(f"Channel:         {channel}")
+        print(f"Raw:             {value}")
+        print(f"Scale10:         {scale}")
+        print(f"Value:           {scaled:g} {unitname}")
+        print(f"Generation:      {generation}")
+        return cap, channel, scaled
+
+    async def direct_hall(self, action: str):
+        """Read/set the persistent Direct Hall preset, or reset its value."""
+        profiles = {
+            "off": (0, 1),
+            "counter1": (1, 1),
+            "counter2": (1, 2),
+            "quadrature": (2, 1),
+        }
+
+        if action == "reset":
+            status, _ = await self.ndp_command_raw(
+                NDP_DIRECT_HALL_CONTROL, b"\xFF"
+            )
+            if status != 0:
+                raise RuntimeError(
+                    "DIRECT_HALL_CONTROL reset: "
+                    f"{NDP_STATUS_NAMES.get(status, status)}"
+                )
+        elif action != "status":
+            mode, channel = profiles[action]
+            deadline = asyncio.get_running_loop().time() + 6.0
+            while True:
+                status, _ = await self.ndp_command_raw(
+                    NDP_DIRECT_HALL_CONTROL, bytes([mode, channel])
+                )
+                if status == 0:
+                    break
+                if status != 4 or asyncio.get_running_loop().time() >= deadline:
+                    raise RuntimeError(
+                        "DIRECT_HALL_CONTROL SET: "
+                        f"{NDP_STATUS_NAMES.get(status, status)}"
+                    )
+                await asyncio.sleep(0.05)
+
+        deadline = asyncio.get_running_loop().time() + 6.0
+        while True:
+            status, payload = await self.ndp_command_raw(NDP_DIRECT_HALL_CONTROL)
+            if status != 0:
+                raise RuntimeError(
+                    "DIRECT_HALL_CONTROL GET: "
+                    f"{NDP_STATUS_NAMES.get(status, status)}"
+                )
+            if len(payload) != 7 or payload[0] != 1:
+                raise RuntimeError(
+                    f"Invalid DIRECT_HALL_CONTROL payload: {payload.hex()}"
+                )
+            runtime_mode, runtime_channel, persisted_mode, persisted_channel, has_persisted, store_status = payload[1:]
+            if action in ("status", "reset") or store_status == 0:
+                break
+            if store_status == 2:
+                raise RuntimeError("DIRECT_HALL_CONTROL persistence failed")
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError("DIRECT_HALL_CONTROL persistence timeout")
+            await asyncio.sleep(0.05)
+
+        if action not in ("status", "reset"):
+            expected_mode, expected_channel = profiles[action]
+            if expected_mode != 1:
+                expected_channel = 1
+            if (runtime_mode != expected_mode or runtime_channel != expected_channel
+                    or not has_persisted or persisted_mode != expected_mode
+                    or persisted_channel != expected_channel):
+                raise RuntimeError(
+                    "DIRECT_HALL_CONTROL readback mismatch: "
+                    f"runtime={runtime_mode}/{runtime_channel} "
+                    f"persisted={persisted_mode}/{persisted_channel} has={has_persisted}"
+                )
+
+        def label(mode, channel):
+            if mode == 0:
+                return "OFF"
+            if mode == 1:
+                return f"COUNTER HALL{channel}"
+            if mode == 2:
+                return "QUADRATURE"
+            return f"UNKNOWN({mode})"
+
+        print("=== DIRECT HALL ===")
+        print(f"Runtime:         {label(runtime_mode, runtime_channel)}")
+        if has_persisted:
+            print(f"Persisted:       {label(persisted_mode, persisted_channel)}")
+        else:
+            print("Persisted:       not set")
+        print(f"Store:           {('idle', 'saving', 'error')[store_status] if store_status < 3 else store_status}")
+        if action == "reset":
+            print("Value reset:     yes")
+        return runtime_mode, runtime_channel, (persisted_mode if has_persisted else None), store_status
+
+    async def _temperature_provider_read(self, retries: int = 3):
+        last_status = None
+        for attempt in range(retries):
+            status, p = await self.ndp_command_raw(NDP_SENSOR_READ, bytes([NDP_SENSOR_TEMPERATURE]))
+            last_status = status
+            if status == 0:
+                if len(p) != 5:
+                    raise RuntimeError(f"Invalid TEMPERATURE SENSOR_READ length: {len(p)}")
+                return p[0], struct.unpack("<i", p[1:5])[0]
+            if status != 4:
+                return status, None
+            if attempt + 1 < retries:
+                await asyncio.sleep(0.8)
+        raise RuntimeError(
+            "TEMPERATURE acquisition unavailable/busy after retries "
+            f"(last status={NDP_STATUS_NAMES.get(last_status, last_status)})"
+        )
+
+    async def temp_read(self, retries: int = 3):
+        source, milli_c = await self._temperature_provider_read(retries)
+        if milli_c is None:
+            if source != 3:
+                raise RuntimeError(f"TEMPERATURE SENSOR_READ: {NDP_STATUS_NAMES.get(source, source)}")
+            st = await self.ndp_status(quiet=True)
+            if not st["ds18b20_present"]:
+                raise RuntimeError("TEMPERATURE provider is not supported by this firmware")
+            last_status = None
+            p = b""
+            for attempt in range(retries):
+                last_status, p = await self.ndp_command_raw(
+                    NDP_SENSOR_READ, bytes([NDP_SENSOR_DS18B20])
+                )
+                if last_status == 0:
+                    break
+                if last_status != 4:
+                    raise RuntimeError(
+                        f"Legacy DS18B20 SENSOR_READ: "
+                        f"{NDP_STATUS_NAMES.get(last_status, last_status)}"
+                    )
+                if attempt + 1 < retries:
+                    await asyncio.sleep(0.8)
+            if last_status != 0 or len(p) != 4:
+                raise RuntimeError("Legacy DS18B20 conversion unavailable")
+            source, milli_c = 1, struct.unpack("<i", p)[0]
+        source_name = {1:"DS18B20", 2:"NRF52_INTERNAL"}.get(source, str(source))
+        print("=== TEMPERATURE ===")
+        print(f"Source:          {source_name}")
+        print(f"Temperature:     {milli_c / 1000.0:.3f} C")
+        return milli_c
+
+    async def ds18b20_read(self, retries: int = 3):
+        st = await self.ndp_status(quiet=True)
+        if not st["ds18b20_present"]:
+            source, milli_c = await self._temperature_provider_read(retries)
+            if milli_c is None:
+                raise RuntimeError(
+                    f"DS18B20 absent and TEMPERATURE fallback unavailable: {NDP_STATUS_NAMES.get(source, source)}"
+                )
+            source_name = {1:"DS18B20", 2:"NRF52_INTERNAL"}.get(source, str(source))
+            print("=== DS18B20 ===")
+            print("Present:         no")
+            print(f"Source:          {source_name}")
+            print(f"Temperature:     {milli_c / 1000.0:.3f} C")
+            return milli_c
+
+        last_status = None
+        for attempt in range(retries):
+            status, p = await self.ndp_command_raw(NDP_SENSOR_READ, bytes([NDP_SENSOR_DS18B20]))
+            last_status = status
             if status == 0:
                 if len(p) != 4:
-                    raise RuntimeError(
-                        f"Invalid DS18B20 SENSOR_READ length: {len(p)}"
-                    )
+                    raise RuntimeError(f"Invalid DS18B20 SENSOR_READ length: {len(p)}")
                 milli_c = struct.unpack("<i", p)[0]
                 print("=== DS18B20 ===")
                 print("Present:         yes")
+                print("Source:          DS18B20")
                 print(f"Temperature:     {milli_c / 1000.0:.3f} C")
                 return milli_c
-
-            if status != 4:  # BUSY
-                raise RuntimeError(
-                    f"DS18B20 SENSOR_READ: "
-                    f"{NDP_STATUS_NAMES.get(status, hex(status))}"
-                )
-
+            if status != 4:
+                raise RuntimeError(f"DS18B20 SENSOR_READ: {NDP_STATUS_NAMES.get(status, status)}")
             if attempt + 1 < retries:
                 await asyncio.sleep(0.8)
-
         raise RuntimeError(
             "DS18B20 conversion unavailable/busy after retries "
             f"(last status={NDP_STATUS_NAMES.get(last_status, last_status)})"
@@ -2434,28 +3049,8 @@ class NRFClawClient:
             print(f"Hall count:      {value}")
         return value
 
-    async def beacon_status(self):
-        p = await self.ndp_command(NDP_BLE_BEACON_CONTROL, b"\x00")
-        if len(p) != 4: raise RuntimeError(f"Invalid beacon status length: {len(p)}")
-        role=p[0]; interval=int.from_bytes(p[1:3],"little"); tx=int.from_bytes(p[3:4],"little",signed=True)
-        names={0:"off",1:"beacon/broadcaster",2:"peripheral",3:"central",4:"scanner"}
-        print(f"BLE role:        {names.get(role,role)}")
-        print(f"Interval:        {interval} ms")
-        print(f"TX power:        {tx:+d} dBm")
-        print(f"Connectable:     {'no' if role==1 else 'yes' if role==2 else '-'}")
-        return role,interval,tx
 
-    async def beacon_start(self, interval: int, tx_power: int):
-        if not (20 <= interval <= 10240): raise RuntimeError("Beacon interval must be 20..10240 ms")
-        if not (-40 <= tx_power <= 8): raise RuntimeError("Invalid BLE TX power")
-        payload=bytes([1,interval&0xff,(interval>>8)&0xff,tx_power&0xff])
-        await self.ndp_command(NDP_BLE_BEACON_CONTROL,payload)
-        print("Beacon configured. It starts after this NUS session disconnects.")
-        await self.beacon_status()
 
-    async def beacon_stop(self):
-        await self.ndp_command(NDP_BLE_BEACON_CONTROL,b"\x02")
-        print("Beacon disabled")
 
     async def lora_get(self, quiet: bool = False):
         p = await self.ndp_command(NDP_RADIO_GET)
@@ -2598,162 +3193,752 @@ class NRFClawClient:
         print("Transport:       physical NUS direct diagnostic")
         print("VM/compiler:     bypassed")
 
-    async def lora_send(self, text: str, quiet: bool = False):
-        data = text.encode("utf-8")
-        if not data or len(data) > 48:
-            raise ValueError("direct LoRa diagnostic payload must be 1..48 UTF-8 bytes")
-        await self.ndp_command(NDP_LORA_DIAG_SEND, data)
-        if not quiet:
-            print(f"LoRa TX accepted: {len(data)} bytes")
-            print("HEX:   " + " ".join(f"{b:02X}" for b in data))
-            print("ASCII: " + data.decode("utf-8", errors="replace"))
 
-    async def lora_send_continuous(self, base: str, every_s: float, count: int = 0):
-        import time
 
-        if every_s <= 0:
-            raise ValueError("--every must be > 0 seconds")
-        if count < 0:
-            raise ValueError("--count must be >= 0 (0 = unlimited)")
-        if not base:
-            raise ValueError("payload base must not be empty")
-
-        # Reserve at least '_01'.  The numeric field automatically grows after 99.
-        if len((base + "_01").encode("utf-8")) > 48:
-            raise ValueError("payload base is too long; base + '_01' must fit in 48 UTF-8 bytes")
-
-        print(f"LoRa TX: continuous every {every_s:g}s")
-        print(f"Payload sequence: {base}_01, {base}_02, {base}_03, ...")
-        if count:
-            print(f"Packet count: {count}")
-        else:
-            print("Packet count: unlimited (Ctrl-C or NUS disconnect to stop)")
-
-        started = time.monotonic()
-        seq = 1
-        next_tx = started
-
-        while count == 0 or seq <= count:
-            if not self.client.is_connected:
-                raise ConnectionError("NUS connection lost")
-
-            now = time.monotonic()
-            delay = next_tx - now
-            if delay > 0:
+    async def sensor_read_raw(self, sensor_id: int, retries=1, delay=0.2):
+        """Raw SENSOR_READ helper for the physical NUS NDP client."""
+        last = (None, b"")
+        for attempt in range(retries):
+            last = await self.ndp_command_raw(
+                NDP_SENSOR_READ,
+                bytes([sensor_id & 0xFF]),
+            )
+            if last[0] != 4:  # NDP_BUSY
+                return last
+            if attempt + 1 < retries:
                 await asyncio.sleep(delay)
+        return last
 
-            if not self.client.is_connected:
-                raise ConnectionError("NUS connection lost")
 
-            suffix = f"{seq:02d}"
-            payload = f"{base}_{suffix}"
-            data = payload.encode("utf-8")
-            if len(data) > 48:
-                raise ValueError(
-                    f"generated packet {seq} exceeds 48 UTF-8 bytes: {payload!r}"
-                )
 
-            await self.lora_send(payload, quiet=True)
-            elapsed = time.monotonic() - started
-            print(
-                f"[{seq:04d} +{elapsed:8.2f}s] TX len={len(data)} "
-                f"ASCII: {payload}"
-            )
 
-            seq += 1
-            next_tx += every_s
 
-        elapsed = time.monotonic() - started
-        print(f"LoRa TX complete: {seq - 1} packet(s) in {elapsed:.2f}s")
 
-    async def lora_rx_cancel(self, quiet: bool = False):
-        try:
-            await asyncio.wait_for(
-                self.ndp_command(NDP_LORA_DIAG_RX, b"\x02", timeout=2.0),
-                timeout=3.0,
-            )
-            if not quiet:
-                print("LoRa RX: cancelled")
-        except Exception as exc:
-            if not quiet:
-                print(f"LoRa RX cancel warning: {exc}")
 
-    async def lora_rx(self, timeout_s: float = 30.0):
-        import time
-        if timeout_s <= 0:
-            raise ValueError("timeout must be > 0 seconds")
 
-        # Clear a stale direct-RX session from a previous interrupted CLI run.
-        await self.lora_rx_cancel(quiet=True)
 
-        await asyncio.wait_for(
-            self.ndp_command(NDP_LORA_DIAG_RX, b"\x00", timeout=3.0),
-            timeout=4.0,
+
+
+
+
+    async def ninalink_bridge_app_status(self):
+        p = await self.ndp_command(NDP_NINALINK_BRIDGE, bytes([55]))
+        if len(p) != 15 or p[0] != 1:
+            raise RuntimeError(f"Invalid production CAP_SET status: {p.hex()}")
+        states = {0:"IDLE",1:"PENDING",2:"WAIT_RESULT",3:"DONE"}
+        results = {0:"OK",1:"UNSUPPORTED_CAP",2:"BAD_TYPE",3:"BAD_VALUE",4:"APPLY_FAILED",255:"NONE"}
+        s = {
+            "schema": p[0], "pending": bool(p[1]),
+            "target_node": int.from_bytes(p[2:6], "little"),
+            "command_seq": int.from_bytes(p[6:8], "little"),
+            "capability_id": int.from_bytes(p[8:10], "little"),
+            "channel": p[10], "value_type": p[11],
+            "requested_value": p[12], "state": p[13], "result": p[14],
+        }
+        type_names={1:"BOOL",2:"U8",3:"S8",8:"ENUM8"}
+        print("=== NINALINK CAP_SET DOWNLINK ===")
+        print(f"Pending:          {'yes' if s['pending'] else 'no'}")
+        print(f"Target node:      0x{s['target_node']:08X}")
+        print(f"Command seq:      {s['command_seq']}")
+        print(f"Capability:       0x{s['capability_id']:04X}[{s['channel']}]")
+        print(f"Value:            {type_names.get(s['value_type'],s['value_type'])} {s['requested_value']}")
+        print(f"State:            {states.get(s['state'],s['state'])}")
+        print(f"Result:           {results.get(s['result'],s['result'])}")
+        return s
+    async def ninalink_cap_set(self, node_id, capability_id, channel, value_type, value):
+        type_map = {"bool":1,"u8":2,"s8":3,"enum8":8}
+        if not (0 <= node_id <= 0xFFFFFFFF): raise ValueError("--node must be 0..0xFFFFFFFF")
+        if not (0 <= capability_id <= 0xFFFF): raise ValueError("--cap must be 0..0xFFFF")
+        if not (0 <= channel <= 0xFF): raise ValueError("--channel must be 0..255")
+        key=str(value_type).lower()
+        if key not in type_map: raise ValueError("--type must be bool, u8, s8 or enum8")
+        wire_type=type_map[key]
+        if wire_type==1:
+            v=str(value).lower()
+            if v in ("on","true","yes","1"): raw=1
+            elif v in ("off","false","no","0"): raw=0
+            else: raise ValueError("BOOL --value must be on/off, true/false or 0/1")
+        elif wire_type==3:
+            sv=int(str(value),0)
+            if not (-128 <= sv <= 127): raise ValueError("S8 --value must be -128..127")
+            raw=sv & 0xFF
+        else:
+            raw=int(str(value),0)
+            if not (0 <= raw <= 0xFF): raise ValueError("--value must be 0..255")
+        payload=(bytes([54])+struct.pack("<I",node_id)+struct.pack("<H",capability_id)+bytes([channel,wire_type,raw]))
+        reply=await self.ndp_command(NDP_NINALINK_BRIDGE,payload)
+        if len(reply)!=2: raise RuntimeError(f"Invalid CAP_SET queue response: {reply.hex()}")
+        print(f"Queued CAP_SET cap=0x{capability_id:04X}[{channel}] type={key} value={value} for node 0x{node_id:08X}; command_seq={int.from_bytes(reply,'little')}.")
+        return await self.ninalink_bridge_app_status()
+    async def ninalink_cap_set_tracking(self, node_id: int, value: str):
+        return await self.ninalink_cap_set(
+            node_id, 0x0401, 0, "bool", value
         )
-        print(f"LoRa RX: continuous listening ({timeout_s:g}s window)")
-        print("Press Ctrl-C to abort; otherwise exits only at timeout or NUS disconnect.")
-        deadline = time.monotonic() + timeout_s
-        packet_count = 0
 
+
+
+
+    async def ninalink_command_node_info(self, node_id):
+        return await self.ninalink_command(node_id, 0x0002, "")
+
+    async def ninalink_command_query_capabilities(
+        self, node_id, caps
+    ):
+        if not 1 <= len(caps) <= 2:
+            raise ValueError("B4.11 query requires one or two --cap items")
+
+        args = bytearray([len(caps)])
+        parsed = []
+        for spec in caps:
+            if ":" in spec:
+                cap_s, ch_s = spec.split(":", 1)
+                cap = int(cap_s, 0)
+                ch = int(ch_s, 0)
+            else:
+                cap = int(spec, 0)
+                ch = 0
+
+            if not 0 <= cap <= 0xFFFF:
+                raise ValueError(f"invalid capability id: {spec}")
+            if not 0 <= ch <= 0xFF:
+                raise ValueError(f"invalid capability channel: {spec}")
+
+            args += struct.pack("<HB", cap, ch)
+            parsed.append((cap, ch))
+
+        print(
+            "B4.11 query: "
+            + ", ".join(
+                f"0x{cap:04X}[{ch}]" for cap, ch in parsed
+            )
+        )
+        return await self.ninalink_command(
+            node_id,
+            0x0004,
+            bytes(args).hex(),
+        )
+
+    async def ninalink_command_tracking_state(self, node_id):
+        return await self.ninalink_command(node_id, 0x0003, "")
+
+    def _print_ninalink_known_command_result(self, command_id, data):
+        if command_id == 0x0001 and len(data) == 4:
+            print(
+                f"ECHO token:      "
+                f"0x{int.from_bytes(data, 'little'):08X}"
+            )
+            return
+
+        if command_id == 0x0002 and len(data) == 8:
+            flags = data[3]
+            node_id = int.from_bytes(data[4:8], "little")
+            print(f"NinaLink version: {data[0]}")
+            print(f"Max RF frame:     {data[1]} bytes")
+            print(f"Command count:    {data[2]}")
+            print(f"Feature flags:    0x{flags:02X}")
+            print(f"Reported node:    0x{node_id:08X}")
+            return
+
+        if command_id == 0x0003 and len(data) == 1:
+            print(
+                f"Tracking active:  "
+                f"{'yes' if data[0] else 'no'}"
+            )
+
+        if command_id == 0x0004 and len(data) >= 1:
+            count = data[0]
+            if count not in (1, 2) or len(data) != 1 + 6 * count:
+                print("QUERY result:    malformed")
+                return
+            status_names = {
+                0: "OK",
+                1: "UNKNOWN",
+                2: "NOT_READABLE",
+                3: "UNAVAILABLE",
+            }
+            print(f"QUERY items:     {count}")
+            for i in range(count):
+                off = 1 + 6 * i
+                st = data[off]
+                typ = data[off + 1]
+                raw = int.from_bytes(
+                    data[off + 2:off + 6], "little"
+                )
+                print(
+                    f"  item[{i}] status={status_names.get(st, st)} "
+                    f"type={typ} raw=0x{raw:08X} ({raw})"
+                )
+            return
+
+    async def _ninalink_command_result_chunks(self, opcode, action, total_len):
+        data = bytearray()
+        off = 0
+        while off < total_len:
+            p = await self.ndp_command(opcode, bytes([action, off]))
+            if len(p) < 2 or p[0] != total_len or p[1] != off:
+                raise RuntimeError(f"Invalid COMMAND result chunk: {p.hex()}")
+            chunk = p[2:]
+            if not chunk:
+                raise RuntimeError("Empty COMMAND result chunk")
+            data.extend(chunk)
+            off += len(chunk)
+        return bytes(data[:total_len])
+
+    async def ninalink_command(self, node_id, command_id, data_hex=""):
+        if not (0 <= command_id <= 0xFFFF):
+            raise ValueError("--id must be 0..0xFFFF")
+        clean = data_hex.replace(" ", "").replace(":", "")
+        if len(clean) % 2:
+            raise ValueError("--data must have an even number of hex digits")
         try:
-            while True:
-                remain = deadline - time.monotonic()
-                if remain <= 0:
-                    break
+            data = bytes.fromhex(clean)
+        except ValueError as exc:
+            raise ValueError("--data must be hexadecimal") from exc
+        if len(data) > 7:
+            raise ValueError("B4.7 NDP gate accepts at most 7 argument bytes")
+        req = (
+            b"\x08"
+            + struct.pack("<I", node_id)
+            + struct.pack("<H", command_id)
+            + bytes([len(data)])
+            + data
+        )
+        await self.ndp_command(NDP_NINALINK_BRIDGE, req)
+        print(
+            f"Queued COMMAND id=0x{command_id:04X} "
+            f"for node 0x{node_id:08X}, args={data.hex() or '-'}."
+        )
+        return await self.ninalink_command_status()
 
-                if not self.client.is_connected:
-                    raise ConnectionError("NUS connection lost")
+    async def ninalink_command_echo(self, node_id, token):
+        if not (0 <= token <= 0xFFFFFFFF):
+            raise ValueError("--token must be 0..0xFFFFFFFF")
+        return await self.ninalink_command(
+            node_id, 0x0001, struct.pack("<I", token).hex()
+        )
 
-                # Poll quickly only to drain the firmware queue.  RF reception is
-                # continuous in firmware, so BLE polling latency no longer opens
-                # a receive gap on the LLCC68.
-                await asyncio.sleep(min(0.05, remain))
-                remain = deadline - time.monotonic()
-                if remain <= 0:
-                    break
+    async def ninalink_command_status(self):
+        p = await self.ndp_command(NDP_NINALINK_BRIDGE, b"\x09")
+        if len(p) != 15:
+            raise RuntimeError(f"Invalid bridge COMMAND status length: {len(p)}")
+        states = {0:"IDLE",1:"PENDING",2:"WAIT_RESULT",3:"DONE"}
+        results = {0:"OK",1:"UNSUPPORTED",2:"BAD_ARGS",3:"EXEC_FAILED",255:"NONE"}
+        s = {
+            "pending": bool(p[0]),
+            "target_node": int.from_bytes(p[1:5], "little"),
+            "command_seq": int.from_bytes(p[5:7], "little"),
+            "command_id": int.from_bytes(p[7:9], "little"),
+            "state": p[9],
+            "result": p[10],
+            "sent_count": p[11],
+            "completed_count": p[12],
+            "timeout_count": p[13],
+            "result_len": p[14],
+        }
+        data = b""
+        if s["result_len"]:
+            data = await self._ninalink_command_result_chunks(
+                NDP_NINALINK_BRIDGE, 10, s["result_len"]
+            )
+        s["result_data"] = data
+        print("=== NINALINK COMMAND DOWNLINK ===")
+        print(f"Pending:         {'yes' if s['pending'] else 'no'}")
+        print(f"Target node:     0x{s['target_node']:08X}")
+        print(f"Command seq:     {s['command_seq']}")
+        print(f"Command ID:      0x{s['command_id']:04X}")
+        print(f"State:           {states.get(s['state'], s['state'])}")
+        print(f"Result:          {results.get(s['result'], s['result'])}")
+        print(f"Sent total:      {s['sent_count']}")
+        print(f"Completed total: {s['completed_count']}")
+        print(f"Result timeouts: {s['timeout_count']}")
+        print(f"Result length:   {s['result_len']}")
+        if data:
+            print(f"Result data:     {data.hex()}")
+            self._print_ninalink_known_command_result(
+                s["command_id"], data
+            )
+        return s
 
-                poll_timeout = min(1.0, max(0.20, remain))
-                try:
-                    p = await asyncio.wait_for(
-                        self.ndp_command(
-                            NDP_LORA_DIAG_RX, b"\x01", timeout=poll_timeout
-                        ),
-                        timeout=poll_timeout + 0.25,
-                    )
-                except (asyncio.TimeoutError, TimeoutError):
-                    if not self.client.is_connected:
-                        raise ConnectionError("NUS connection lost")
-                    continue
 
-                if not p or p[0] == 0:
-                    continue
-                if p[0] == 2:
-                    raise RuntimeError("LoRa continuous RX stopped unexpectedly")
-                if p[0] != 1 or len(p) < 6:
-                    raise RuntimeError(f"Invalid direct LoRa RX response: {p.hex()}")
 
-                n = p[1]
-                if len(p) != 6 + n:
-                    raise RuntimeError("Invalid direct LoRa RX payload length")
-                rssi_x2 = int.from_bytes(p[2:4], "little", signed=True)
-                snr_x4 = int.from_bytes(p[4:6], "little", signed=True)
-                data = p[6:]
-                packet_count += 1
-                elapsed = timeout_s - max(0.0, deadline - time.monotonic())
-                print(f"[{packet_count:04d} +{elapsed:7.2f}s] RX len={n} "
-                      f"RSSI={rssi_x2/2:.1f} dBm SNR={snr_x4/4:.2f} dB")
-                print("HEX:   " + " ".join(f"{b:02X}" for b in data))
-                print("ASCII: " + data.decode("utf-8", errors="replace"))
-                # Deliberately continue.  lora-rx is now a receive window, not
-                # a one-packet command.
-        finally:
-            # On normal expiry or Ctrl-C, stop continuous RX.  If NUS has
-            # already fallen this best-effort cancel simply cannot be delivered.
-            if self.client.is_connected:
-                await self.lora_rx_cancel(quiet=True)
+    async def ninalink_command_discover(self, node_id, start_index=0):
+        if not (0 <= start_index <= 0xFF):
+            raise ValueError("--start must be 0..255")
+        req = (
+            b"\x0b"
+            + struct.pack("<I", node_id)
+            + bytes([start_index])
+        )
+        await self.ndp_command(NDP_NINALINK_BRIDGE, req)
+        print(
+            f"Queued COMMAND registry discovery for node "
+            f"0x{node_id:08X}, start={start_index}."
+        )
+        return await self.ninalink_command_discovery_status()
 
-        print(f"LoRa RX window complete: {packet_count} packet(s) in {timeout_s:g}s")
-        return packet_count
+    async def ninalink_capability_discover(self, node_id, page=0):
+        if not (0 <= page <= 0xFF):
+            raise ValueError("--page must be 0..255")
+        req = b"\x0e" + struct.pack("<I", node_id) + bytes([page])
+        await self.ndp_command(NDP_NINALINK_BRIDGE, req)
+        print(
+            f"Queued capability discovery for node "
+            f"0x{node_id:08X}, page={page}."
+        )
+        return await self.ninalink_capability_discovery_status()
+
+    def _capability_name(self, cap_id):
+        names = {
+            0x0001:"BATTERY_VOLTAGE", 0x0002:"BATTERY_PERCENT",
+            0x0003:"SUPPLY_VOLTAGE", 0x0100:"TEMPERATURE",
+            0x0101:"HUMIDITY", 0x0102:"ILLUMINANCE",
+            0x0103:"PRESSURE", 0x0104:"CO2", 0x0105:"TVOC",
+            0x0106:"LEAK", 0x0200:"MOTION", 0x0201:"TAP",
+            0x0202:"FALL", 0x0203:"ACCELERATION_X",
+            0x0204:"ACCELERATION_Y", 0x0205:"ACCELERATION_Z",
+            0x0206:"VIBRATION_RMS", 0x0207:"VIBRATION_PEAK",
+            0x0208:"VIBRATION_P2P", 0x0209:"VIBRATION_FREQUENCY",
+            0x020A:"VIBRATION_ALARM", 0x020B:"WALK",
+            0x020C: "VIBRATION_EVENT",
+            0x0300:"DIGITAL_INPUT", 0x0301:"HALL_STATE",
+            0x0302:"COUNTER", 0x0303:"QUADRATURE_POSITION",
+            0x0304:"PULSE_FREQUENCY", 0x0400:"PRESENCE",
+            0x0401:"TRACKING_ACTIVE", 0x0500:"VOLTAGE",
+            0x0501:"CURRENT", 0x0502:"POWER", 0x0503:"ENERGY",
+            0x0504:"LINE_FREQUENCY", 0x0600:"FLOW_RATE",
+            0x0601:"VOLUME", 0x0602:"DISTANCE",
+            0x0603:"LEVEL_PERCENT", 0x0604:"RPM", 0x0605:"SPEED",
+        }
+        return names.get(cap_id, "UNKNOWN")
+
+    def _format_capability_descriptor(self, d):
+        kinds = {
+            1:"MEASUREMENT", 2:"STATE", 3:"EVENT",
+            4:"COUNTER", 5:"POSITION", 6:"STATUS",
+        }
+        types = {
+            1:"BOOL", 2:"U8", 3:"S8", 4:"U16",
+            5:"S16", 6:"U32", 7:"S32", 8:"ENUM8",
+        }
+        units = {
+            0x00:"-", 0x01:"BOOLEAN", 0x02:"%", 0x03:"V",
+            0x04:"A", 0x05:"W", 0x06:"Wh", 0x07:"C",
+            0x08:"Pa", 0x09:"lux", 0x0A:"ppm", 0x0B:"ppb",
+            0x0C:"mg", 0x0D:"Hz", 0x0E:"s", 0x0F:"m",
+            0x10:"m/s", 0x11:"L", 0x12:"L/min",
+            0x13:"rpm", 0x14:"count",
+        }
+        behavior = []
+        for bit, name in (
+            (0x01,"READABLE"), (0x02,"REPORTABLE"),
+            (0x04,"EVENT"), (0x08,"WRITABLE"), (0x10,"RETAINED"),
+        ):
+            if d["behavior"] & bit:
+                behavior.append(name)
+        state = []
+        for bit, name in (
+            (0x01,"SUPPORTED"), (0x02,"PRESENT"),
+            (0x04,"ENABLED"), (0x08,"FAULT"),
+        ):
+            if d["state"] & bit:
+                state.append(name)
+        return (
+            f"0x{d['capability_id']:04X} "
+            f"{self._capability_name(d['capability_id'])} "
+            f"ch={d['channel']} "
+            f"kind={kinds.get(d['kind'], d['kind'])} "
+            f"type={types.get(d['value_type'], d['value_type'])} "
+            f"scale={d['scale10']} "
+            f"unit={units.get(d['unit'], hex(d['unit']))} "
+            f"behavior={'|'.join(behavior) if behavior else '-'} "
+            f"state={'|'.join(state) if state else '-'}"
+        )
+
+    async def ninalink_capability_discovery_status(self):
+        p = await self.ndp_command(NDP_NINALINK_BRIDGE, b"\x0f")
+        if len(p) != 15:
+            raise RuntimeError(
+                f"Invalid capability discovery status length: {len(p)}"
+            )
+        states = {0:"IDLE",1:"PENDING",2:"WAIT_RESULT",3:"DONE"}
+        s = {
+            "pending": bool(p[0]),
+            "target_node": int.from_bytes(p[1:5], "little"),
+            "request_seq": int.from_bytes(p[5:7], "little"),
+            "page_index": p[7], "state": p[8],
+            "registry_version": p[9], "count": p[10],
+            "more": bool(p[11]), "sent_count": p[12],
+            "completed_count": p[13], "timeout_count": p[14],
+            "descriptors": [],
+        }
+        for index in range(s["count"]):
+            d = await self.ndp_command(
+                NDP_NINALINK_BRIDGE, bytes([16, index])
+            )
+            if len(d) != 9:
+                raise RuntimeError(
+                    f"Invalid capability descriptor length: {len(d)}"
+                )
+            scale10 = d[5] if d[5] < 128 else d[5] - 256
+            s["descriptors"].append({
+                "capability_id": int.from_bytes(d[0:2], "little"),
+                "channel": d[2], "kind": d[3], "value_type": d[4],
+                "scale10": scale10, "unit": d[6],
+                "behavior": d[7], "state": d[8],
+            })
+        print("=== NINALINK B4.10 CAPABILITY DISCOVERY ===")
+        print(f"Pending:          {'yes' if s['pending'] else 'no'}")
+        print(f"Target node:      0x{s['target_node']:08X}")
+        print(f"Request seq:      {s['request_seq']}")
+        print(f"Page index:       {s['page_index']}")
+        print(f"State:            {states.get(s['state'], s['state'])}")
+        print(f"Registry version: {s['registry_version']}")
+        print(f"Returned:         {s['count']}")
+        print(f"Sent total:       {s['sent_count']}")
+        print(f"Completed total:  {s['completed_count']}")
+        print(f"Result timeouts:  {s['timeout_count']}")
+        for i, d in enumerate(s["descriptors"]):
+            print(f"  [{i}] {self._format_capability_descriptor(d)}")
+        if s["more"]:
+            print(f"More:             yes (next page={s['page_index'] + 1})")
+        else:
+            print("More:             no")
+        return s
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    async def ninalink_command_discovery_status(self):
+        p = await self.ndp_command(NDP_NINALINK_BRIDGE, b"\x0c")
+        if len(p) != 15:
+            raise RuntimeError(
+                f"Invalid command discovery status length: {len(p)}"
+            )
+
+        states = {0:"IDLE",1:"PENDING",2:"WAIT_RESULT",3:"DONE"}
+        s = {
+            "pending": bool(p[0]),
+            "target_node": int.from_bytes(p[1:5], "little"),
+            "request_seq": int.from_bytes(p[5:7], "little"),
+            "start_index": p[7],
+            "state": p[8],
+            "registry_version": p[9],
+            "total_count": p[10],
+            "count": p[11],
+            "sent_count": p[12],
+            "completed_count": p[13],
+            "timeout_count": p[14],
+            "descriptors": [],
+        }
+
+        names = {
+            0x0001: "ECHO_U32",
+            0x0002: "GET_NODE_INFO",
+            0x0003: "GET_TRACKING_STATE",
+        }
+
+        for index in range(s["count"]):
+            d = await self.ndp_command(
+                NDP_NINALINK_BRIDGE,
+                bytes([13, index]),
+            )
+            if len(d) != 6:
+                raise RuntimeError(
+                    f"Invalid discovery descriptor length: {len(d)}"
+                )
+            desc = {
+                "command_id": int.from_bytes(d[0:2], "little"),
+                "min_args": d[2],
+                "max_args": d[3],
+                "max_result": d[4],
+                "flags": d[5],
+            }
+            s["descriptors"].append(desc)
+
+        print("=== NINALINK B4.9 COMMAND DISCOVERY ===")
+        print(f"Pending:          {'yes' if s['pending'] else 'no'}")
+        print(f"Target node:      0x{s['target_node']:08X}")
+        print(f"Request seq:      {s['request_seq']}")
+        print(f"Start index:      {s['start_index']}")
+        print(f"State:            {states.get(s['state'], s['state'])}")
+        print(f"Registry version: {s['registry_version']}")
+        print(f"Total commands:   {s['total_count']}")
+        print(f"Returned:         {s['count']}")
+        print(f"Sent total:       {s['sent_count']}")
+        print(f"Completed total:  {s['completed_count']}")
+        print(f"Result timeouts:  {s['timeout_count']}")
+
+        for i, d in enumerate(s["descriptors"]):
+            absolute_index = s["start_index"] + i
+            name = names.get(d["command_id"], "UNKNOWN")
+            flag_text = []
+            if d["flags"] & 0x01:
+                flag_text.append("READ_ONLY")
+            extra = "|".join(flag_text) if flag_text else "-"
+            print(
+                f"  [{absolute_index:02d}] "
+                f"0x{d['command_id']:04X} {name}: "
+                f"args={d['min_args']}..{d['max_args']} "
+                f"result<={d['max_result']} flags={extra}"
+            )
+
+        next_index = s["start_index"] + s["count"]
+        if next_index < s["total_count"]:
+            print(f"More:             yes (next start={next_index})")
+        else:
+            print("More:             no")
+
+        return s
+
+
+
+
+
+
+
+
+
+
+
+
+
+    @staticmethod
+    def _b54_unit_name(unit):
+        return {0:"NONE",1:"BOOLEAN",2:"PERCENT",3:"VOLT",4:"AMPERE",
+                5:"WATT",6:"WATT_HOUR",7:"CELSIUS",8:"PASCAL",9:"LUX",
+                10:"PPM",11:"PPB",12:"MILLI_G",13:"HERTZ",14:"SECOND",
+                15:"METER",16:"METER_PER_SECOND",17:"LITER",
+                18:"LITER_PER_MINUTE",19:"RPM",20:"COUNT"}.get(unit, f"UNIT_{unit}")
+
+    @staticmethod
+    def _b54_kind_name(kind):
+        return {1:"MEASUREMENT",2:"STATE",3:"EVENT",4:"COUNTER",
+                5:"POSITION",6:"STATUS"}.get(kind, f"KIND_{kind}")
+
+    async def _b54_external_info(self):
+        p = await self.ndp_command(NDP_NINALINK_BRIDGE, bytes([30]))
+        if len(p) != 12:
+            raise RuntimeError(f"Invalid B5.4 external INFO length: {len(p)}")
+        return {"schema":p[0],"node_count":p[1],"state_value_count":p[2],
+                "event_count":p[3],
+                "oldest_event_id":int.from_bytes(p[4:8],"little"),
+                "newest_event_id":int.from_bytes(p[8:12],"little")}
+
+    async def _b54_external_descriptor(self, capability_id, channel):
+        p = await self.ndp_command(
+            NDP_NINALINK_BRIDGE,
+            bytes([35])+struct.pack("<H",capability_id)+bytes([channel]))
+        if len(p) != 6:
+            raise RuntimeError(f"Invalid B5.4 descriptor length: {len(p)}")
+        scale10 = p[3]-256 if p[3]&0x80 else p[3]
+        return {"known":bool(p[0]),"kind_code":p[1],
+                "kind":self._b54_kind_name(p[1]),"value_type":p[2],
+                "scale10":scale10,"unit_code":p[4],
+                "unit":self._b54_unit_name(p[4]),"behavior_flags":p[5]}
+
+    def _b54_external_value(self, value_type, raw, descriptor):
+        typed = self._b53_cached_value(value_type, raw)
+        if not descriptor["known"]:
+            return typed, None
+        if value_type in (1,8):
+            return typed, typed
+        try:
+            return typed, typed * (10 ** descriptor["scale10"])
+        except TypeError:
+            return typed, None
+
+    async def ninalink_external_snapshot(self, as_json=False):
+        info = await self._b54_external_info()
+        out = {"schema":info["schema"],"node_count":info["node_count"],
+               "state_value_count":info["state_value_count"],
+               "event_window":{"count":info["event_count"],
+                   "oldest_id":info["oldest_event_id"],
+                   "newest_id":info["newest_event_id"]},"nodes":[]}
+        dstates={0:"NEW",1:"CAPS_PENDING",2:"CAPS_DONE",3:"COMMANDS_PENDING",
+                 4:"READY",5:"ERROR"}
+        for index in range(info["node_count"]):
+            p=await self.ndp_command(NDP_NINALINK_BRIDGE,bytes([31,index]))
+            if len(p)!=15: raise RuntimeError(f"Invalid B5.4 NODE length: {len(p)}")
+            node_id=int.from_bytes(p[0:4],"little"); flags=p[13]
+            node={"node_id":f"0x{node_id:08X}","node_id_raw":node_id,
+                  "state_count":p[4],"event_count":p[5],
+                  "discovery_state":dstates.get(p[6],f"STATE_{p[6]}"),
+                  "age_s":int.from_bytes(p[7:9],"little"),
+                  "rssi_dbm":int.from_bytes(p[9:11],"little",signed=True)/2.0,
+                  "snr_db":int.from_bytes(p[11:13],"little",signed=True)/4.0,
+                  "valid":bool(flags&1),"ready":bool(flags&2),
+                  "has_state":bool(flags&4),"session_valid":bool(flags&8),
+                  "last_message_type":p[14],"states":[]}
+            for si in range(node["state_count"]):
+                v=await self.ndp_command(NDP_NINALINK_BRIDGE,
+                    bytes([32])+struct.pack("<I",node_id)+bytes([si]))
+                if len(v)!=15: raise RuntimeError(f"Invalid B5.4 STATE length: {len(v)}")
+                cap=int.from_bytes(v[0:2],"little"); ch=v[2]; typ=v[3]
+                raw=int.from_bytes(v[4:8],"little")
+                desc=await self._b54_external_descriptor(cap,ch)
+                typed,eng=self._b54_external_value(typ,raw,desc)
+                node["states"].append({"capability_id":f"0x{cap:04X}",
+                    "capability_id_raw":cap,"name":self._capability_name(cap),
+                    "channel":ch,"value_type":typ,"raw":raw,
+                    "typed_value":typed,"engineering_value":eng,
+                    "descriptor":desc,"sequence":int.from_bytes(v[8:10],"little"),
+                    "age_s":int.from_bytes(v[10:12],"little"),
+                    "updates":int.from_bytes(v[12:14],"little"),
+                    "source_message_type":v[14]})
+            out["nodes"].append(node)
+        if as_json:
+            print(json.dumps(out,indent=2,sort_keys=True))
+        else:
+            print("=== NINALINK B5.4 EXTERNAL SNAPSHOT ===")
+            print(f"Schema:           {out['schema']}")
+            print(f"Nodes:            {out['node_count']}")
+            print(f"State values:     {out['state_value_count']}")
+            ew=out["event_window"]
+            print(f"Event window:     {ew['count']} (oldest={ew['oldest_id']} newest={ew['newest_id']})")
+            for node in out["nodes"]:
+                print(f"Node {node['node_id']} state={node['state_count']} events={node['event_count']} discovery={node['discovery_state']} age={node['age_s']}s")
+                for item in node["states"]:
+                    d=item["descriptor"]
+                    val=item["engineering_value"] if d["known"] else item["typed_value"]
+                    unit=d["unit"] if d["known"] else "RAW"
+                    print(f"  {item['capability_id']} {item['name']}[{item['channel']}] value={val} {unit} seq={item['sequence']} updates={item['updates']}")
+        return out
+
+    async def ninalink_external_events(self, cursor=0, limit=8, as_json=False):
+        if not 0<=cursor<=0xFFFFFFFF: raise ValueError("--cursor must be 0..0xFFFFFFFF")
+        if not 1<=limit<=64: raise ValueError("--limit must be 1..64")
+        info=await self._b54_external_info(); oldest=info["oldest_event_id"]; newest=info["newest_event_id"]
+        stream_reset=bool(cursor and (newest==0 or cursor>newest))
+        cur=0 if stream_reset else cursor
+        overrun=bool(cur and oldest and (cur+1)<oldest)
+        events=[]
+        for _ in range(limit):
+            p=await self.ndp_command(NDP_NINALINK_BRIDGE,bytes([33])+struct.pack("<I",cur))
+            if len(p)!=15: raise RuntimeError(f"Invalid B5.4 EVENT_NEXT_META length: {len(p)}")
+            if not p[0]: break
+            eid=int.from_bytes(p[1:5],"little"); node=int.from_bytes(p[5:9],"little")
+            cap=int.from_bytes(p[9:11],"little"); ch=p[11]; typ=p[12]
+            seq=int.from_bytes(p[13:15],"little")
+            vp=await self.ndp_command(NDP_NINALINK_BRIDGE,bytes([34])+struct.pack("<I",eid))
+            if len(vp)!=7 or not vp[0]: raise RuntimeError(f"B5.4 event {eid} disappeared during read")
+            raw=int.from_bytes(vp[1:5],"little"); age=int.from_bytes(vp[5:7],"little")
+            desc=await self._b54_external_descriptor(cap,ch)
+            typed,eng=self._b54_external_value(typ,raw,desc)
+            events.append({"event_id":eid,"node_id":f"0x{node:08X}","node_id_raw":node,
+                "capability_id":f"0x{cap:04X}","capability_id_raw":cap,
+                "name":self._capability_name(cap),"channel":ch,"value_type":typ,
+                "raw":raw,"typed_value":typed,"engineering_value":eng,
+                "descriptor":desc,"sequence":seq,"age_s":age})
+            cur=eid
+        out={"schema":info["schema"],"requested_cursor":cursor,"next_cursor":cur,
+             "overrun":overrun,"stream_reset":stream_reset,
+             "window":{"count":info["event_count"],"oldest_id":oldest,"newest_id":newest},
+             "events":events}
+        if as_json:
+            print(json.dumps(out,indent=2,sort_keys=True))
+        else:
+            print("=== NINALINK B5.4 EXTERNAL EVENTS ===")
+            print(f"Requested cursor: {cursor}");print(f"Next cursor:      {cur}")
+            print(f"Overrun:          {'yes' if overrun else 'no'}")
+            print(f"Stream reset:     {'yes' if stream_reset else 'no'}")
+            for e in events:
+                print(f"  id={e['event_id']} node={e['node_id']} {e['capability_id']} {e['name']}[{e['channel']}] value={e['typed_value']} seq={e['sequence']} age={e['age_s']}s")
+        return out
+
+
+    @staticmethod
+    def _b53_cached_value(value_type, raw):
+        if value_type == 1:
+            return bool(raw & 1)
+        if value_type in (2, 8):
+            return raw & 0xFF
+        if value_type == 3:
+            v = raw & 0xFF
+            return v - 0x100 if v & 0x80 else v
+        if value_type == 4:
+            return raw & 0xFFFF
+        if value_type == 5:
+            v = raw & 0xFFFF
+            return v - 0x10000 if v & 0x8000 else v
+        if value_type == 6:
+            return raw
+        if value_type == 7:
+            return raw - 0x100000000 if raw & 0x80000000 else raw
+        return raw
+
+
+
+
+    def _decode_ninalink_bridge_status(self, p: bytes) -> dict:
+        if len(p) != 15:
+            raise RuntimeError(
+                f"Invalid NINALINK_BRIDGE status length: {len(p)}"
+            )
+        return {
+            "active": bool(p[0]),
+            "queued": p[1],
+            "received": int.from_bytes(p[2:4], "little"),
+            "valid": int.from_bytes(p[4:6], "little"),
+            "invalid": int.from_bytes(p[6:8], "little"),
+            "dropped": int.from_bytes(p[8:10], "little"),
+            "radio_dropped": int.from_bytes(p[10:12], "little"),
+            "last_error": p[12],
+            "ack_sent": int.from_bytes(p[13:15], "little"),
+        }
+
+    async def ninalink_bridge_handoff(self):
+        await self.ndp_command(NDP_NINALINK_BRIDGE, bytes([39]))
+        print("NinaLink bridge preserved; programming/NUS released to Application plane.")
+
+    async def ninalink_bridge_status(self, quiet: bool = False):
+        p = await self.ndp_command(NDP_NINALINK_BRIDGE, b"\x00")
+        s = self._decode_ninalink_bridge_status(p)
+        if not quiet:
+            errors = {
+                0: "NONE",
+                1: "CORE",
+                2: "SEMANTIC",
+                3: "RADIO_STOPPED",
+            }
+            print("=== NINALINK B4.2 BRIDGE ===")
+            print(f"Active:          {'yes' if s['active'] else 'no'}")
+            print(f"Queued:          {s['queued']}")
+            print(f"RF received:     {s['received']}")
+            print(f"NinaLink valid:  {s['valid']}")
+            print(f"NinaLink invalid:{s['invalid']:>5}")
+            print(f"Bridge dropped:  {s['dropped']}")
+            print(f"Radio dropped:   {s['radio_dropped']}")
+            print(f"ACK sent:        {s['ack_sent']}")
+            print(
+                f"Last error:      "
+                f"{errors.get(s['last_error'], s['last_error'])}"
+            )
+        return s
+
+    async def ninalink_bridge_start(self):
+        await self.ndp_command(NDP_NINALINK_BRIDGE, b"\x01")
+        print("NinaLink B4.2 bridge RX started.")
+        print("Bridge remains active after this NUS connection closes.")
+        return await self.ninalink_bridge_status()
+
+    async def ninalink_bridge_stop(self):
+        await self.ndp_command(NDP_NINALINK_BRIDGE, b"\x02")
+        print("NinaLink B4.2 bridge RX stopped.")
+
+
+
+
 
     async def lora_patch(
         self,
@@ -2961,10 +4146,6 @@ class NRFClawClient:
         await self.command(CMD_DFU_ENTER)
         print("DFU accepted; device rebooting into nRFClaw bootloader.")
 
-    async def inject_event(self, event_type: int, arg0: int = 0, arg1: int = 0):
-        payload = bytes([event_type & 0xFF]) + struct.pack("<II", arg0 & 0xFFFFFFFF, arg1 & 0xFFFFFFFF)
-        await self.command(CMD_EVENT_INJECT, payload)
-        print(f"Event injected: type={event_type} arg0={arg0} arg1={arg1}")
 
     async def capabilities(self):
         p = await self.command(CMD_CAPABILITIES)
@@ -3636,40 +4817,6 @@ class NRFClawClient:
             "Keep that file secret."
         )
 
-    async def tracking_debug(self):
-        p = await self.command(CMD_TRACKING_DEBUG, timeout=5.0)
-
-        if len(p) != 16:
-            raise RuntimeError(
-                f"Invalid TRACKING_DEBUG response length: {len(p)}"
-            )
-
-        stages = {
-            0: "NONE",
-            1: "START_REQUESTED",
-            2: "JOURNAL_PENDING",
-            3: "INDEX_COMMITTED",
-            4: "KEY_DERIVED",
-            5: "ADV_STOP",
-            6: "ADDR_SET",
-            7: "ADV_CONFIGURE",
-            8: "TX_POWER",
-            9: "ADV_START",
-            10: "ACTIVE",
-        }
-
-        key_index = int.from_bytes(p[8:12], "little")
-        sd_error = int.from_bytes(p[12:16], "little")
-
-        print(f"Stage                : {stages.get(p[0], p[0])}")
-        print(f"start_pending        : {bool(p[1])}")
-        print(f"index_commit_pending : {bool(p[2])}")
-        print(f"apply_pending        : {bool(p[3])}")
-        print(f"active               : {bool(p[4])}")
-        print(f"commit_state         : {p[5]}")
-        print(f"journal_state        : {p[6]}")
-        print(f"key_index            : {key_index}")
-        print(f"last_sd_error        : 0x{sd_error:08X}")
 
 
 
@@ -3845,174 +4992,7 @@ class NRFClawClient:
         print(f"Next sample:         {next_s} s")
         print(f"Profile store:       {'busy' if store_busy else 'ready'}")
 
-    async def vib_auto_diagnostics(self):
-        pages = [await self.ndp_command(NDP_VIB_AUTO_STATUS, bytes([page])) for page in (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 32, 33)]
-        p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, p32, p33 = pages
-        if tuple(map(len,pages)) != (14,12,15,10,14,14,12,14,12,11,14,11,14,15,15):
-            raise RuntimeError("VIB_AUTO diagnostics unavailable or invalid: " + "/".join(str(len(x)) for x in pages))
-        total, quiet, active, starts, matches, resets, pmatches = struct.unpack("<HHHHHHH", p2)
-        rrms, rpeak, rp2p, rzc, last_score = struct.unpack_from("<HHHHH", p3, 0)
-        last_feature, reject_mask = p3[10], p3[11]
-        valid = bool(p4[0])
-        means = struct.unpack_from("<HHHH", p4, 1)
-        tol3 = struct.unpack_from("<HHH", p4, 9)
-        ztol = struct.unpack_from("<H", p5, 0)[0]
-        fs = struct.unpack_from("<HHHH", p5, 2)
-        names = {0:"none", 1:"RMS", 2:"Peak", 3:"P2P", 4:"Zero-cross"}
-        bits = ["RMS", "Peak", "P2P", "Zero-cross"]
-        mask_names = [bits[i] for i in range(4) if reject_mask & (1 << i)]
-        print("=== VIB_AUTO DISCOVERY DIAGNOSTICS ===")
-        print(f"Windows sampled:      {total} (quiet={quiet}, active={active})")
-        print(f"Candidate starts:     {starts}")
-        print(f"Candidate matches:    {matches}")
-        print(f"Candidate resets:     {resets}")
-        print(f"Existing-profile hits:{pmatches}")
-        if resets:
-            print(f"Reset dominant counts:RMS={rrms} Peak={rpeak} P2P={rp2p} ZC={rzc}")
-            print(f"Last reject dominant: {names.get(last_feature,last_feature)}")
-            print(f"Last reject mask:     {', '.join(mask_names) if mask_names else 'combined-score only'}")
-            print(f"Last candidate score: {last_score/256.0:.2f}")
-            print("Last feature scores:  " + " ".join(f"{n}={v/256.0:.2f}" for n,v in zip(bits,fs)))
-        if valid:
-            tols = (tol3[0], tol3[1], tol3[2], ztol)
-            print(f"Current candidate:    RMS={means[0]} Peak={means[1]} P2P={means[2]} mg ZC={means[3]} Hz")
-            print(f"Discovery tolerance:  RMS=+/-{tols[0]} Peak=+/-{tols[1]} P2P=+/-{tols[2]} mg ZC=+/-{tols[3]} Hz")
-        else:
-            print("Current candidate:    none")
-        if total:
-            print(f"Active ratio:         {100.0*active/total:.1f}%")
-        if active:
-            print(f"Reset/active ratio:   {100.0*resets/active:.1f}%")
 
-        timer_fires, discovery_due, probe_req, motion_rel, win_ok, win_fail, metrics_ready = struct.unpack("<HHHHHHH", p6)
-        probe_active, stage = p7[0], p7[1]
-        probe_age = struct.unpack_from("<H", p7, 2)[0]
-        purpose, accel_mode = p7[4], p7[5]
-        svc_calls, fifo_empty, captures, capture_ok = struct.unpack_from("<HHHH", p7, 6)
-        read_fail, write_fail, sample_fail, int2_isr, int2_evt = struct.unpack_from("<HHHHH", p8, 0)
-        fifo_src, fifo_count = p8[10], p8[11]
-        stages={0:"IDLE",1:"TIMER_DUE",2:"MOTION_RELEASED",3:"CONFIGURING",4:"FIFO_WAIT",5:"METRICS_READY",6:"CLASSIFIED",7:"ERROR"}
-        purposes={0:"NONE",1:"DISCOVERY",2:"MONITOR",3:"ARMING"}
-        modes={0:"OFF",1:"MOTION",2:"TAP",3:"FALL",4:"WALK",5:"VIBRATION"}
-        print("\n=== VIB_AUTO PROBE PIPELINE ===")
-        print(f"Timer expirations:    {timer_fires}")
-        print(f"Discovery due:        {discovery_due}")
-        print(f"Probe requests:       {probe_req}")
-        print(f"Motion releases:      {motion_rel}")
-        print(f"Window config OK:     {win_ok}")
-        print(f"Window config FAIL:   {win_fail}")
-        print(f"Metrics ready:        {metrics_ready}")
-        print(f"Current probe:        {'ACTIVE' if probe_active else 'idle'} stage={stages.get(stage,stage)} age={probe_age}s")
-        print(f"Purpose/accel mode:   {purposes.get(purpose,purpose)} / {modes.get(accel_mode,accel_mode)}")
-        print("\n=== LIS2DH12 PIPELINE ===")
-        print(f"Vibration services:   {svc_calls}")
-        print(f"FIFO empty polls:     {fifo_empty}")
-        print(f"Capture attempts/OK:  {captures}/{capture_ok}")
-        print(f"TWI read/write fail:  {read_fail}/{write_fail}")
-        print(f"Sample read failures: {sample_fail}")
-        print(f"INT2 ISR/events:      {int2_isr}/{int2_evt}")
-        print(f"Last FIFO src/count:  0x{fifo_src:02X}/{fifo_count}")
-        if probe_req:
-            print(f"VIB_AUTO completion:  {100.0*metrics_ready/probe_req:.1f}% ({metrics_ready}/{probe_req})")
-
-        sched, stops, start_ok, start_fail, motion_evt, motion_ok, motion_ignored = struct.unpack("<HHHHHHH", p9)
-        arm_calls, arm_ok, arm_fail, last_sched = struct.unpack_from("<HHHH", p10, 0)
-        last_purpose, last_trigger = p10[8], p10[9]
-        int1_isr = struct.unpack_from("<H", p10, 10)[0]
-        trigger_names={0:"NONE",1:"TIMER",2:"INT1"}
-        print("\n=== VIB_AUTO SCHEDULER / INT1 ===")
-        print(f"Schedule calls:       {sched}")
-        print(f"Timer stop calls:     {stops}")
-        print(f"Timer start OK/FAIL:  {start_ok}/{start_fail}")
-        print(f"INT1 ISR:             {int1_isr}")
-        print(f"Motion events:        {motion_evt}")
-        print(f"Motion accepted:      {motion_ok}")
-        print(f"Motion ignored state: {motion_ignored}")
-        print(f"Arm wake calls OK/FAIL:{arm_calls} {arm_ok}/{arm_fail}")
-        print(f"Last scheduled:       {last_sched}s {purposes.get(last_purpose,last_purpose)}")
-        print(f"Last sample trigger:  {trigger_names.get(last_trigger,last_trigger)}")
-        arming_starts, arming_done, ignored_arm, int_first, arm_rem = struct.unpack_from("<HHHHH", p11, 0)
-        arm_active = bool(p11[10])
-        print("\n=== VIB_AUTO INT-FIRST / ARMING ===")
-        print(f"Arming active:        {'yes' if arm_active else 'no'}")
-        print(f"Arming remaining:     {arm_rem}s")
-        print(f"Arming starts/done:   {arming_starts}/{arming_done}")
-        print(f"Motion ignored arming:{ignored_arm}")
-        print(f"INT-first windows:    {int_first}")
-
-        snap_count, snap_fail = struct.unpack_from("<HH", p12, 0)
-        ctrl1,ctrl2,ctrl3,ctrl4,ctrl5,ctrl6,fifo_ctrl,int1_cfg,int1_ths,int1_dur = p12[4:14]
-        twi_en,int1_lvl,int2_lvl,port_evt,int1_latch,int2_latch,int1_sense,int2_sense,pwr_mode,scl_lvl,sda_lvl = p13
-        print("\n=== LIS2DH12 LOW-POWER RETURN ===")
-        print(f"Motion snapshots OK/FAIL:{snap_count}/{snap_fail}")
-        print(f"CTRL1..6:            {ctrl1:02X} {ctrl2:02X} {ctrl3:02X} {ctrl4:02X} {ctrl5:02X} {ctrl6:02X}")
-        print(f"FIFO/INT1 CFG:       {fifo_ctrl:02X} / {int1_cfg:02X}")
-        print(f"INT1 THS/DURATION:   {int1_ths:02X} / {int1_dur:02X}")
-        print(f"TWI enabled:         {'yes' if twi_en else 'no'}")
-        print(f"GPIO INT1/INT2:      {int1_lvl}/{int2_lvl}")
-        print(f"GPIOTE PORT event:   {port_evt}")
-        print(f"GPIO LATCH INT1/2:   {int1_latch}/{int2_latch}")
-        print(f"GPIO SENSE INT1/2:   {int1_sense}/{int2_sense}")
-        print(f"SCL/SDA level:       {scl_lvl}/{sda_lvl}")
-        print(f"Driver accel mode:   {modes.get(pwr_mode,pwr_mode)}")
-        expected = (ctrl1 == 0x2F and ctrl2 == 0x01 and ctrl3 == 0x40 and ctrl4 == 0x00 and ctrl5 == 0x00 and ctrl6 == 0x00 and fifo_ctrl == 0x00 and int1_cfg == 0x2A)
-        print(f"Motion register set: {'EXPECTED' if expected else 'DIFFERS'}")
-
-        twi_rel = struct.unpack_from("<H", p14, 0)[0]
-        cur_pscl,cur_psda,cur_err,cur_hf,last_pscl,last_psda,last_err,last_hf,cur_scl_cnf,cur_sda_cnf,last_scl_cnf,last_sda_cnf = p14[2:14]
-        print("\n=== TWI GLOBAL LOW-POWER CLEANUP ===")
-        print(f"Low-power releases:  {twi_rel}")
-        print(f"PSEL SCL/SDA disc:   {cur_pscl}/{cur_psda} (last cleanup {last_pscl}/{last_psda})")
-        print(f"ERRORSRC current/last:{cur_err}/{last_err}")
-        print(f"HFCLK current/last:  {cur_hf}/{last_hf}")
-        print(f"PIN_CNF SCL/SDA:     0x{cur_scl_cnf:02X}/0x{cur_sda_cnf:02X} (last 0x{last_scl_cnf:02X}/0x{last_sda_cnf:02X})")
-        print(f"TWI cleanup state:   {'EXPECTED' if (not twi_en and cur_pscl and cur_psda) else 'CHECK'}")
-
-        wd_arms,wd_exp,wd_retry,wd_abort,wd_int2,wd_timer,wd_ms = struct.unpack_from("<HHHHHHH", p32, 0)
-        wd_src = p32[14]
-        wd_names={0:"NONE",1:"INT2",2:"TIMER",3:"ABORT"}
-        print("\n=== FIFO AUTONOMOUS WATCHDOG r3.8.11 ===")
-        print(f"Watchdog arms:        {wd_arms}")
-        print(f"Expirations/retries:  {wd_exp}/{wd_retry}")
-        print(f"INT2 completions:     {wd_int2}")
-        print(f"Timer completions:    {wd_timer}")
-        print(f"Watchdog aborts:      {wd_abort}")
-        print(f"Last active estimate: {wd_ms} ms")
-        print(f"Last completion:      {wd_names.get(wd_src,wd_src)}")
-        confirm_starts, confirm_ok, confirm_rejects, confirm_delay = struct.unpack_from("<HHHH", p33, 0)
-        confirm_pending = bool(p33[8])
-        confirm_retries = confirm_retry_ok = retry_delay_ms = 0
-        if len(p33) >= 15:
-            confirm_retries, confirm_retry_ok, retry_delay_ms = struct.unpack_from("<HHH", p33, 9)
-        print("\n=== ROBUST ACTIVE CONFIRMATION r3.8.13 ===")
-        print(f"Confirm starts:       {confirm_starts}")
-        print(f"Confirmed active:     {confirm_ok}")
-        print(f"Rejected transient:   {confirm_rejects}")
-        print(f"Confirm retries:      {confirm_retries}")
-        print(f"Confirmed on retry:   {confirm_retry_ok}")
-        print(f"Confirm delay:        {confirm_delay}s")
-        print(f"Retry delay:          {retry_delay_ms}ms")
-        print(f"Confirm pending:      {'yes' if confirm_pending else 'no'}")
-
-    async def vib_auto_trace(self):
-        summary = await self.ndp_command(NDP_VIB_AUTO_STATUS, b"\x0f")
-        if len(summary) != 2:
-            raise RuntimeError("VIB_AUTO trace unavailable")
-        count, last_reason = summary
-        events={1:"ARMING_DONE",2:"ARM_WAKE",3:"TIMER_SCHEDULE",4:"TIMER_DUE",5:"MOTION_ACCEPT",6:"MOTION_IGNORED",7:"INT_DISABLE",8:"FIFO_BEGIN",9:"FIFO_CONFIG_OK",10:"METRICS_ACTIVE",11:"METRICS_QUIET",12:"DISCOVERY_SCHEDULE",13:"FIFO_WATCHDOG_FAIL",14:"CONFIRM_SCHEDULE",15:"CONFIRM_OK",16:"CONFIRM_REJECT",17:"CONFIRM_RETRY",18:"CONFIRM_RETRY_OK"}
-        states={0:"DISABLED",1:"WAIT_MACHINE",2:"DISCOVERY",3:"MONITORING",4:"SUSPICIOUS",5:"ALARM",6:"ERROR",7:"ARMING",8:"ACTIVE_CONFIRM"}
-        purposes={0:"NONE",1:"DISCOVERY",2:"MONITOR",3:"ARMING"}
-        modes={0:"OFF",1:"MOTION",2:"TAP",3:"FALL",4:"WALK",5:"VIBRATION"}
-        reasons={0:"NONE",1:"ARMING_DONE",2:"DISCOVERY_QUIET",3:"MONITOR_QUIET",4:"DEADLINE_WAIT",5:"START_NO_DELAY",6:"CONFIG_REAPPLY",7:"RESET_LEARNING",8:"CONFIRM_REJECT"}
-        print("=== VIB_AUTO STATE TRACE r3.8.14 ===")
-        print(f"Entries:              {count}/16")
-        print(f"Last arm reason:      {reasons.get(last_reason,last_reason)}")
-        print("idx  time(s)     event               state         purpose     accel       arm-reason")
-        for i in range(count):
-            q=await self.ndp_command(NDP_VIB_AUTO_STATUS, bytes([16+i]))
-            if len(q)!=9: continue
-            ts=struct.unpack_from("<I",q,0)[0]; ev,state,purpose,mode,reason=q[4:9]
-            print(f"{i:>3}  {ts:<10} {events.get(ev,ev):<19} {states.get(state,state):<13} {purposes.get(purpose,purpose):<11} {modes.get(mode,mode):<11} {reasons.get(reason,reason)}")
 
     async def ble_boot_control(self, action: str):
         op={"status":0,"disable":1,"enable":2}[action]
@@ -4034,6 +5014,26 @@ class NRFClawClient:
         print(f"State journal:        {states.get(store_state,store_state)}")
         print("P0.21/NUS:            ALWAYS AVAILABLE")
         if action != "status": print("Setting applies on next reset/boot.")
+
+    async def ha_role_control(self, action: str):
+        actions={"status":0,"none":1,"direct":2,"lora":3,"bridge":4}
+        p=await self.ndp_command(NDP_HA_ROLE_CONTROL, bytes([actions[action]]))
+        if len(p)!=2:
+            raise RuntimeError("Invalid HA role response")
+        role,store_state=p
+        if action != "status":
+            deadline=time.monotonic()+5.0
+            while store_state==1 and time.monotonic()<deadline:
+                await asyncio.sleep(0.1)
+                p=await self.ndp_command(NDP_HA_ROLE_CONTROL,b"\x00")
+                role,store_state=p
+        names={0:"NONE",1:"DIRECT_BLE",2:"NINALINK_NODE",3:"BRIDGE"}
+        states={0:"IDLE",1:"SAVING",2:"ERROR"}
+        print("=== HA TRANSPORT ROLE B7.6f ===")
+        print(f"Role:                 {names.get(role,role)}")
+        print(f"State journal:        {states.get(store_state,store_state)}")
+        print("P0.21/NUS:            ALWAYS AVAILABLE")
+        if action != "status": print("Setting applies automatically on next boot.")
 
     async def vib_auto_baseline(self):
         st = await self.ndp_command(NDP_VIB_AUTO_STATUS)
@@ -4260,6 +5260,57 @@ async def run_ha_mode(args):
             raise RuntimeError(f"Unsupported HA action {args.ha_action}")
 
 
+async def _apply_prompt_network_provisioning(nrf, result):
+    """B7.6f2l2 apply compiler-requested NinaLink provisioning before upload.
+
+    This deliberately reuses the already validated physical-NUS NDP 0x62
+    network setter. No VM opcode, NinaLink frame byte, PHY setting, ACK timing
+    or discovery behavior is changed by l2.
+    """
+    spec = getattr(result, "provision", None)
+    if not isinstance(spec, dict) or spec.get("kind") != "ninalink-network":
+        return None
+
+    mode = spec.get("mode")
+    role = str(spec.get("role", "")).upper()
+    current, persisted, _store, _foreign = await nrf.ninalink_network(quiet=True)
+    action = "reused"
+    target = current
+
+    if mode == "set":
+        target = int(spec["network_id"])
+        if not 1 <= target <= 0xFFFF:
+            raise RuntimeError("prompt provisioning requires NinaLink network 0x0001..0xFFFF")
+        if current != target or not persisted:
+            await nrf.ninalink_network(target, quiet=True)
+            action = "set"
+    elif mode == "bridge-ensure":
+        if current == 0:
+            target = secrets.randbelow(0xFFFF) + 1
+            await nrf.ninalink_network(target, quiet=True)
+            action = "created"
+        elif not persisted:
+            await nrf.ninalink_network(current, quiet=True)
+            action = "persisted"
+    elif mode == "node-reuse":
+        if current == 0:
+            raise RuntimeError(
+                "NinaLink node has no provisioned network (0x0000). "
+                "Use a prompt such as: 'habilite HA em modo lora na rede 0x1234'"
+            )
+        if not persisted:
+            await nrf.ninalink_network(current, quiet=True)
+            action = "persisted"
+    else:
+        raise RuntimeError(f"unsupported prompt network provisioning mode: {mode}")
+
+    print("=== PROMPT NINALINK PROVISION B7.6f2l2 ===")
+    print(f"Role:             {role}")
+    print(f"Network ID:       0x{target:04X}")
+    print(f"Action:           {action}")
+    return target
+
+
 def _resolve_prompt_compilation(args, source):
     """R3.8.20: provider -> Semantic IR -> local deterministic compiler.
 
@@ -4272,6 +5323,25 @@ def _resolve_prompt_compilation(args, source):
     force_agent = bool(getattr(args, "agent", False))
     force_standalone = bool(getattr(args, "standalone", False))
     cfg = load_agent_config()
+
+    # B7.6f transport-role provisioning is a local system configuration
+    # semantic, not an open-ended application program. Resolve it before any
+    # external semantic agent so variants of "enable HA via ..." always map to
+    # the same deterministic/persistent role.
+    try:
+        local_result, local_meta = compile_hybrid(source, force_boot=True)
+    except (TextCompileError, UnsupportedSemantics):
+        local_result = None
+        local_meta = {}
+    if local_result is not None and (
+        str(getattr(local_result, "intent", "")).startswith("ha-transport-")
+        or str(getattr(local_result, "intent", "")).startswith("hall-semantic-volume")
+    ):
+        print(f"SEMANTIC: deterministic hybrid-v{SEMANTIC_ENGINE_VERSION} route={local_meta.get('route')} family={local_meta.get('family')}")
+        pseudo=pseudo_from_result(local_result)
+        print("PSEUDO-CODE:")
+        print(pseudo)
+        return local_result, local_meta, pseudo
 
     override_provider = getattr(args, "agent_provider", None)
     override_model = getattr(args, "agent_model", None)
@@ -4886,6 +5956,300 @@ async def firmware_upgrade(args):
     finally:
         await dfu.close()
 
+async def run_ninalink_app_query(args):
+    name,dev=await find_app_device(args.device,args.scan_timeout)
+    if not args.json: print(f"Connecting Application: {name} ({dev.address})")
+    async with ApplicationNDPClient(dev,ndp_access_key(args.ndp_key)) as app:
+        row=await app.ninalink_query_queue(args.node,args.cap)
+    if args.json: print(json.dumps(row,sort_keys=True))
+    else:
+        print("=== NINALINK B4.11b QUERY QUEUED ===")
+        print(f"Node:             0x{row['node_id']:08X}")
+        print(f"Command seq:      {row['command_seq']}")
+
+
+async def run_ninalink_ha_runtime_watch(args):
+    ha_path = (
+        Path(__file__).resolve().parents[1]
+        / "integrations/home-assistant/custom_components/nrfclaw"
+    )
+    if str(ha_path) not in sys.path:
+        sys.path.insert(0, str(ha_path))
+
+    from ninalink_runtime import NinaLinkCoordinatorRuntime
+
+    name, dev = await find_app_device(args.device, args.scan_timeout)
+    if not args.json:
+        print(f"Connecting Application: {name} ({dev.address})")
+
+    async with ApplicationNDPClient(
+        dev, ndp_access_key(args.ndp_key)
+    ) as app:
+        runtime = NinaLinkCoordinatorRuntime(
+            app,
+            NDP_NINALINK_BRIDGE,
+            f"bridge:{args.device.upper()}",
+        )
+        initial = await runtime.initialize()
+
+        if args.json:
+            print(json.dumps(initial, sort_keys=True), flush=True)
+        else:
+            print("=== NINALINK B7.3 HA COORDINATOR RUNTIME ===")
+            print(f"Generation:       {initial['generation']}")
+            print(f"Nodes:            {len(initial['ha']['devices'])}")
+            print(f"Event cursor:     {initial['event_cursor']}")
+
+        for _ in range(args.count):
+            row = await runtime.wait_and_reconcile(args.timeout)
+            if args.json:
+                print(json.dumps(row, sort_keys=True), flush=True)
+            else:
+                print(
+                    f"generation={row['generation']} "
+                    f"reason={row['reason']} "
+                    f"state_rev={row['state_revision']} "
+                    f"event_rev={row['event_revision']} "
+                    f"cursor={row['event_cursor']} "
+                    f"events={len(row['events'])}"
+                )
+
+async def run_ninalink_external_capabilities(args):
+    from nrfclaw_external import NinaLinkExternalModelBuilder
+
+    name, dev = await find_app_device(args.device, args.scan_timeout)
+    if not args.json:
+        print(f"Connecting Application: {name} ({dev.address})")
+
+    async with ApplicationNDPClient(
+        dev, ndp_access_key(args.ndp_key)
+    ) as app:
+        inventory = await NinaLinkExternalModelBuilder(
+            app, NDP_NINALINK_BRIDGE
+        ).read_inventory(args.node)
+
+    if args.json:
+        print(json.dumps(inventory, indent=2, sort_keys=True))
+        return
+
+    print("=== NINALINK B7.2 EXTERNAL CAPABILITY INVENTORY ===")
+    print(f"Node:             {inventory['node_id']}")
+    print(f"Valid:            {'yes' if inventory['valid'] else 'no'}")
+    print(f"Registry version: {inventory['registry_version']}")
+    print(f"Count:            {inventory['count']}/{inventory['capacity']}")
+    print(f"Complete:         {'yes' if inventory['complete'] else 'no'}")
+    print(f"Overflow:         {'yes' if inventory['overflow'] else 'no'}")
+    for cap in inventory["capabilities"]:
+        print(
+            f"  {cap['capability_id']} {cap['name']}[{cap['channel']}] "
+            f"kind={cap['kind']} type={cap['value_type']} "
+            f"scale={cap['scale10']} unit={cap['unit']} "
+            f"state=0x{cap['state_flags']:02X}"
+        )
+
+async def run_ninalink_ha_preview(args):
+    from nrfclaw_external import (
+        NinaLinkExternalModelBuilder,
+        NinaLinkExternalReconciler,
+    )
+
+    ha_path = (
+        Path(__file__).resolve().parents[1]
+        / "integrations/home-assistant/custom_components/nrfclaw"
+    )
+    if str(ha_path) not in sys.path:
+        sys.path.insert(0, str(ha_path))
+    from ninalink_semantics import project_model
+
+    name, dev = await find_app_device(args.device, args.scan_timeout)
+    if not args.json:
+        print(f"Connecting Application: {name} ({dev.address})")
+
+    async with ApplicationNDPClient(
+        dev, ndp_access_key(args.ndp_key)
+    ) as app:
+        builder = NinaLinkExternalModelBuilder(
+            app, NDP_NINALINK_BRIDGE
+        )
+        model = await builder.read()
+        for node in model["nodes"]:
+            inventory = await builder.read_inventory(node["node_id_raw"])
+            node["inventory_valid"] = inventory["valid"]
+            node["inventory_complete"] = inventory["complete"]
+            node["inventory_overflow"] = inventory["overflow"]
+            node["inventory_registry_version"] = inventory["registry_version"]
+            node["inventory"] = inventory["capabilities"]
+
+        # B7.1 can project event capabilities already observed in the B5.4
+        # journal. B7.2 will address full per-node capability inventory so
+        # EVENT entities can exist before their first event.
+        rec = NinaLinkExternalReconciler(app, NDP_NINALINK_BRIDGE)
+        events = await rec.read_events(0, 64)
+
+    bridge_key = f"bridge:{args.device.upper()}"
+    ha_model = project_model(
+        model,
+        bridge_key,
+        events["events"],
+    )
+
+    if args.json:
+        print(json.dumps(ha_model, indent=2, sort_keys=True))
+        return
+
+    print("=== NINALINK B7.1 HA PREVIEW ===")
+    print(f"Topology: {ha_model['device_topology']}")
+    for device in ha_model["devices"]:
+        print(
+            f"Device {device['device_key']} "
+            f"via={device['via_bridge_key']} "
+            f"entities={len(device['entities'])}"
+        )
+        for ent in device["entities"]:
+            print(
+                f"  {ent['platform']:13s} {ent['unique_key']} "
+                f"{ent['name']} class={ent.get('device_class')} "
+                f"value={ent.get('value')}"
+            )
+
+async def run_ninalink_external_reconcile(args):
+    from nrfclaw_external import NinaLinkExternalReconciler
+
+    name, dev = await find_app_device(args.device, args.scan_timeout)
+    if not args.json:
+        print(f"Connecting Application: {name} ({dev.address})")
+
+    async with ApplicationNDPClient(
+        dev, ndp_access_key(args.ndp_key)
+    ) as app:
+        baseline = await app.ninalink_change_subscribe(3)
+        reconciler = NinaLinkExternalReconciler(
+            app, NDP_NINALINK_BRIDGE
+        )
+        initial = await reconciler.initialize(baseline)
+
+        if args.json:
+            print(json.dumps(initial, sort_keys=True), flush=True)
+        else:
+            print("=== NINALINK B6.1b LIVE RECONCILIATION ===")
+            print(f"State revision:   {initial['state_revision']}")
+            print(f"Event revision:   {initial['event_revision']}")
+            print(f"Event cursor:     {initial['event_cursor']}")
+            print(f"Nodes:            {initial['model']['node_count']}")
+
+        for _ in range(args.count):
+            change = await app.ninalink_wait_change(args.timeout)
+            row = await reconciler.reconcile(change)
+
+            if args.json:
+                print(json.dumps(row, sort_keys=True), flush=True)
+            else:
+                names = []
+                if row["state_changed"]:
+                    names.append("STATE")
+                if row["event_changed"]:
+                    names.append("EVENT")
+                print(
+                    f"RECONCILE flags={'+'.join(names) or 'NONE'} "
+                    f"state_rev={row['state_revision']} "
+                    f"event_rev={row['event_revision']} "
+                    f"cursor={row['event_cursor']} "
+                    f"events={len(row['events'])} "
+                    f"overrun={'yes' if row['overrun'] else 'no'} "
+                    f"reset={'yes' if row['stream_reset'] else 'no'}",
+                    flush=True,
+                )
+
+async def run_ninalink_external_model(args):
+    from nrfclaw_external import NinaLinkExternalModelBuilder
+
+    name, dev = await find_app_device(args.device, args.scan_timeout)
+    if not args.json:
+        print(f"Connecting Application: {name} ({dev.address})")
+
+    async with ApplicationNDPClient(
+        dev, ndp_access_key(args.ndp_key)
+    ) as app:
+        model = await NinaLinkExternalModelBuilder(
+            app, NDP_NINALINK_BRIDGE
+        ).read()
+
+    if args.json:
+        print(json.dumps(model, indent=2, sort_keys=True))
+        return
+
+    print("=== NINALINK B6.1a EXTERNAL MODEL ===")
+    print(f"Model schema:      {model['model_schema']}")
+    print(f"External schema:   {model['external_schema']}")
+    print(f"Nodes:             {model['node_count']}")
+    print(f"State values:      {model['state_value_count']}")
+    print(f"Event cursor:      {model['event_cursor']}")
+    for node in model["nodes"]:
+        print(
+            f"Node {node['node_id']} discovery={node['discovery_state']} "
+            f"ready={'yes' if node['ready'] else 'no'} "
+            f"caps={len(node['capabilities'])}"
+        )
+        for cap in node["capabilities"]:
+            d = cap["descriptor"]
+            unit = d["unit"] if d["known"] else "RAW"
+            print(
+                f"  {cap['key']} {cap['name']} "
+                f"value={cap['value']} {unit} "
+                f"seq={cap['sequence']} updates={cap['updates']}"
+            )
+
+async def run_ninalink_external_watch(args):
+    masks = {"state": 1, "event": 2, "all": 3}
+    mask = masks[args.change_mask]
+    name, dev = await find_app_device(args.device, args.scan_timeout)
+    print(f"Connecting Application: {name} ({dev.address})", flush=True)
+    async with ApplicationNDPClient(dev, ndp_access_key(args.ndp_key)) as app:
+        baseline = await app.ninalink_change_subscribe(mask)
+        ready = {
+            "type": "subscription",
+            "schema": baseline["schema"],
+            "mask": baseline["mask"],
+            "state_revision": baseline["state_revision"],
+            "event_revision": baseline["event_revision"],
+            "newest_event_id": baseline["newest_event_id"],
+        }
+        if args.json:
+            print(json.dumps(ready, sort_keys=True), flush=True)
+        else:
+            print("=== NINALINK B5.5 SUBSCRIPTION ===", flush=True)
+            print(f"Mask:             {args.change_mask}", flush=True)
+            print(f"State revision:   {baseline['state_revision']}", flush=True)
+            print(f"Event revision:   {baseline['event_revision']}", flush=True)
+            print(f"Newest event ID:  {baseline['newest_event_id']}", flush=True)
+            print("Subscribed:       yes", flush=True)
+
+        for _ in range(args.count):
+            change = await app.ninalink_wait_change(args.timeout)
+            if args.json:
+                row = {"type": "change", **change}
+                print(json.dumps(row, sort_keys=True), flush=True)
+            else:
+                names=[]
+                if change["state_changed"]: names.append("STATE")
+                if change["event_changed"]: names.append("EVENT")
+                print(
+                    f"CHANGE flags={'+'.join(names) or 'NONE'} "
+                    f"state_rev={change['state_revision']} "
+                    f"event_rev={change['event_revision']} "
+                    f"newest_event={change['newest_event_id']} "
+                    f"change_rev={change['change_revision']}",
+                    flush=True,
+                )
+
+        stats = await app.ninalink_change_stats()
+        if args.json:
+            print(json.dumps({"type":"stats", **stats}, sort_keys=True), flush=True)
+        else:
+            print("=== B5.5 STATS ===")
+            for k,v in stats.items():
+                print(f"{k}: {v}")
+
 async def main_async(args):
     # R3.8.16 local semantic/agent configuration commands never touch BLE.
     if _handle_semantic_admin(args) or _handle_agent_admin(args):
@@ -4914,6 +6278,35 @@ async def main_async(args):
     if not args.device:
         raise RuntimeError("--device is required for commands that access BLE hardware")
 
+    if args.action == "ninalink-app-query":
+        await run_ninalink_app_query(args)
+        return
+
+
+    if args.action == "ninalink-ha-runtime-watch":
+        await run_ninalink_ha_runtime_watch(args)
+        return
+
+    if args.action == "ninalink-external-capabilities":
+        await run_ninalink_external_capabilities(args)
+        return
+
+    if args.action == "ninalink-ha-preview":
+        await run_ninalink_ha_preview(args)
+        return
+
+    if args.action == "ninalink-external-reconcile":
+        await run_ninalink_external_reconcile(args)
+        return
+
+    if args.action == "ninalink-external-model":
+        await run_ninalink_external_model(args)
+        return
+
+    if args.action == "ninalink-external-watch":
+        await run_ninalink_external_watch(args)
+        return
+
     # 'ha' is the reference client for the normal Application BLE plane.
     # All pre-existing commands below remain on the validated NUS plane.
     if args.action == "ha":
@@ -4940,8 +6333,23 @@ async def main_async(args):
         elif args.action == "accel":
             await nrf.accel_read()
 
+        elif args.action == "event-mode":
+            await nrf.direct_event_mode(args.event_mode_action)
+
+        elif args.action == "event-sensitivity":
+            await nrf.direct_event_sensitivity(args.event_sensitivity_action)
+
+        elif args.action == "direct-hall":
+            await nrf.direct_hall(args.direct_hall_action)
+
+        elif args.action == "semantic-state":
+            await nrf.semantic_state()
+
         elif args.action == "ds18b20":
             await nrf.ds18b20_read()
+
+        elif args.action == "temp":
+            await nrf.temp_read()
 
         elif args.action == "accel-config":
             await nrf.accel_config(
@@ -4976,14 +6384,11 @@ async def main_async(args):
         elif args.action == "vib-auto-status":
             await nrf.vib_auto_status()
 
-        elif args.action == "vib-auto-diagnostics":
-            await nrf.vib_auto_diagnostics()
-
-        elif args.action == "vib-auto-trace":
-            await nrf.vib_auto_trace()
-
         elif args.action == "ble-boot":
             await nrf.ble_boot_control(args.ble_boot_action)
+
+        elif args.action == "ha-role":
+            await nrf.ha_role_control(args.ha_role_action)
 
         elif args.action == "vib-auto-baseline":
             await nrf.vib_auto_baseline()
@@ -5045,15 +6450,6 @@ async def main_async(args):
         elif args.action == "hall-read":
             await nrf.hall_read()
 
-        elif args.action == "beacon-status":
-            await nrf.beacon_status()
-
-        elif args.action == "beacon-start":
-            await nrf.beacon_start(args.interval,args.tx_power)
-
-        elif args.action == "beacon-stop":
-            await nrf.beacon_stop()
-
         elif args.action == "lora-get":
             try:
                 await nrf.lora_get_ext()
@@ -5063,49 +6459,93 @@ async def main_async(args):
         elif args.action == "lora-info":
             await nrf.lora_info()
 
-        elif args.action == "lora-send":
-            if args.every is not None:
-                await nrf.lora_send_continuous(args.payload, args.every, args.count)
-            else:
-                await nrf.lora_send(args.payload)
-
-        elif args.action == "lora-tx-boot":
-            base = args.payload
-            raw_base = base.encode("utf-8")
-            if not raw_base or len(raw_base) > 32:
-                raise ValueError("payload base must be 1..32 UTF-8 bytes")
-            if '"' in base or "\\" in base:
-                raise ValueError("payload base cannot contain quote or backslash characters")
-            prefix = base + "-"
-            period = int(args.every)
-            if period < 1 or period > 604800:
-                raise ValueError("--every must be between 1 and 604800 seconds")
-            pseudo = (
-                "PROGRAM BOOT\n"
-                "MOV R0 = 1\n"
-                "MOV R1 = 1\n"
-                "LABEL LOOP\n"
-                f'FORMAT BUFFER "{prefix}" + R0 AS U32_02\n'
-                "LORA SEND BUFFER\n"
-                "ADD R0 = R0 + R1\n"
-                f"WAIT {period}s\n"
-                "JMP LOOP\n"
-                "END\n"
+        elif args.action == "ninalink-telemetry-boot":
+            code = ninalink_telemetry_boot_program(
+                args.every,
+                args.window,
+                args.attempts,
+                args.backoff,
             )
-            result = compile_pseudo(pseudo, force_boot=True)
-            print(pseudo_from_result(result))
-            print(f"BYTECODE ({len(result.bytecode)} bytes): {natural_bytecode_hex(result.bytecode)}")
-            if getattr(result, "schedule", None):
-                _s=result.schedule; print(f"SCHEDULE ABI: {schedule_mode_name(_s['mode'])} dow_mask=0x{_s['dow_mask']:02x} arg0={_s['arg0']} arg1={_s['arg1']}")
-            await nrf.upload(result.bytecode, persist=True, schedule=schedule_boot())
-            print(f"Autonomous LoRa TX persisted: {base}-01, {base}-02, ... every {period}s")
-            print("Uses the persisted LoRa RF profile. Power-cycle or reset; NUS is not required after boot.")
+            await nrf.upload(
+                code,
+                persist=True,
+                schedule=schedule_boot(),
+            )
+            print(
+                "NinaLink TEMPERATURE telemetry persisted as BOOT: "
+                f"every={args.every}s window={args.window}ms "
+                f"attempts={args.attempts} backoff={args.backoff}ms"
+            )
+            print(
+                "Reset/power-cycle the node. NUS is not required after boot; "
+                "the first telemetry cycle starts after one full period."
+            )
 
-        elif args.action == "lora-rx":
-            await nrf.lora_rx(args.timeout)
+        elif args.action == "ninalink-external-snapshot":
+            await nrf.ninalink_external_snapshot(args.json)
 
-        elif args.action == "lora-rx-cancel":
-            await nrf.lora_rx_cancel()
+        elif args.action == "ninalink-external-events":
+            await nrf.ninalink_external_events(args.cursor, args.limit, args.json)
+
+        elif args.action == "ninalink-network-status":
+            await nrf.ninalink_network()
+        elif args.action == "ninalink-network-set":
+            await nrf.ninalink_network(args.network_id)
+        elif args.action == "ninalink-bridge-start":
+            await nrf.ninalink_bridge_start()
+
+        elif args.action == "ninalink-bridge-handoff":
+            await nrf.ninalink_bridge_handoff()
+
+        elif args.action == "ninalink-bridge-status":
+            await nrf.ninalink_bridge_status()
+
+        elif args.action == "ninalink-bridge-stop":
+            await nrf.ninalink_bridge_stop()
+
+        elif args.action == "ninalink-cap-set":
+            await nrf.ninalink_cap_set(
+                args.node, args.capability_id, args.channel,
+                args.value_type, args.value
+            )
+
+        elif args.action == "ninalink-cap-set-tracking":
+            await nrf.ninalink_cap_set_tracking(args.node, args.value)
+
+        elif args.action == "ninalink-app-status":
+            await nrf.ninalink_bridge_app_status()
+
+        elif args.action == "ninalink-command":
+            await nrf.ninalink_command(args.node, args.command_id, args.data)
+
+        elif args.action == "ninalink-command-echo":
+            await nrf.ninalink_command_echo(args.node, args.token)
+
+        elif args.action == "ninalink-command-status":
+            await nrf.ninalink_command_status()
+
+        elif args.action == "ninalink-command-node-info":
+            await nrf.ninalink_command_node_info(args.node)
+
+        elif args.action == "ninalink-command-tracking-state":
+            await nrf.ninalink_command_tracking_state(args.node)
+
+        elif args.action == "ninalink-command-query":
+            await nrf.ninalink_command_query_capabilities(
+                args.node, args.cap
+            )
+
+        elif args.action == "ninalink-command-discover":
+            await nrf.ninalink_command_discover(args.node, args.start)
+
+        elif args.action == "ninalink-command-discovery-status":
+            await nrf.ninalink_command_discovery_status()
+
+        elif args.action == "ninalink-capability-discover":
+            await nrf.ninalink_capability_discover(args.node, args.page)
+
+        elif args.action == "ninalink-capability-discovery-status":
+            await nrf.ninalink_capability_discovery_status()
 
         elif args.action == "lora-set":
             if args.sync is not None or args.preamble is not None:
@@ -5186,6 +6626,7 @@ async def main_async(args):
                 raise ValueError("--run requires --upload")
             if args.upload:
                 schedule = getattr(result, "schedule", None) or (schedule_boot() if result.schedule_mode == SCHED_BOOT else schedule_manual())
+                await _apply_prompt_network_provisioning(nrf, result)
                 await nrf.upload(result.bytecode, persist=True, schedule=schedule)
                 print(f"Text program uploaded and persisted with schedule={result.schedule_name}.")
                 if args.run:
@@ -5273,9 +6714,6 @@ async def main_async(args):
                 args.wait
             )
 
-        elif args.action == "inject-event":
-            await nrf.inject_event(args.type, args.arg0, args.arg1)
-
         elif args.action == "caps":
             await nrf.capabilities()
 
@@ -5353,9 +6791,6 @@ async def main_async(args):
                 no_qr=args.no_qr,
             )
 
-        elif args.action == "tracking-debug":
-            await nrf.tracking_debug()
-
         else:
             raise RuntimeError(
                 f"Unsupported action {args.action}"
@@ -5418,9 +6853,46 @@ def build_parser():
         help="Read LIS2DH12 XYZ acceleration in mg via NDP over NUS",
     )
 
+    event_mode = sub.add_parser(
+        "event-mode",
+        help="Read/set persistent Direct event detection preset",
+    )
+    event_mode.add_argument(
+        "event_mode_action",
+        choices=["status", "off", "motion", "tap", "fall"],
+        help="status or the exclusive Motion/Tap/Fall preset to persist",
+    )
+
+    event_sensitivity = sub.add_parser(
+        "event-sensitivity",
+        help="Read/set persistent Direct event sensitivity preset",
+    )
+    event_sensitivity.add_argument(
+        "event_sensitivity_action",
+        choices=["status", "low", "normal", "high"],
+        help="status or LOW/NORMAL/HIGH classifier sensitivity",
+    )
+
+    sub.add_parser("semantic-state", help="Show current B7.6f2k4 VM semantic state")
+
+    direct_hall = sub.add_parser(
+        "direct-hall",
+        help="Read/set persistent Direct Hall mode or reset the active value",
+    )
+    direct_hall.add_argument(
+        "direct_hall_action",
+        choices=["status", "off", "counter1", "counter2", "quadrature", "reset"],
+        help="Direct Hall behavior preset or reset action",
+    )
+
     sub.add_parser(
         "ds18b20",
-        help="Read DS18B20 temperature via NDP over NUS",
+        help="Legacy temperature command: DS18B20 when present, nRF52 internal fallback",
+    )
+
+    sub.add_parser(
+        "temp",
+        help="Read logical temperature (DS18B20 preferred, nRF52 internal fallback)",
     )
 
     ac = sub.add_parser(
@@ -5495,8 +6967,6 @@ def build_parser():
 
     sub.add_parser("vib-auto-stop", help="EXPERIMENTAL: stop autonomous vibration monitoring")
     sub.add_parser("vib-auto-status", help="EXPERIMENTAL: show autonomous learner/monitor state")
-    sub.add_parser("vib-auto-diagnostics", help="EXPERIMENTAL: show discovery clustering instrumentation")
-    sub.add_parser("vib-auto-trace", help="r3.8.13: show RAM-only VIB_AUTO transition/arm/robust-confirmation trace")
     sub.add_parser("vib-auto-baseline", help="EXPERIMENTAL: show locally learned baseline")
     sub.add_parser("vib-auto-reset-learning", help="EXPERIMENTAL: clear baseline and relearn on next machine start")
 
@@ -5534,8 +7004,11 @@ def build_parser():
     sub.add_parser("ndp-key-get", help="Read the stored 256-bit NDP key (physical NUS only)")
     sub.add_parser("ndp-key-generate", help="Generate/replace and persist a 256-bit NDP key (physical NUS only)")
 
-    bb = sub.add_parser("ble-boot", help="r3.8.10: persistent Application/NDP boot advertising control; NUS remains on P0.21")
+    bb = sub.add_parser("ble-boot", help="legacy alias for HA Direct/NONE boot role; NUS remains on P0.21")
     bb.add_argument("ble_boot_action", choices=["status","disable","enable"])
+
+    har = sub.add_parser("ha-role", help="B7.6f persistent Home Assistant transport role")
+    har.add_argument("ha_role_action", choices=["status","none","direct","lora","bridge"])
 
     sub.add_parser("hall-status", help="Show current Hall ownership/mode")
 
@@ -5553,29 +7026,215 @@ def build_parser():
     sub.add_parser("hall-disable", help="Release Hall ownership of HALL1/HALL2")
     sub.add_parser("hall-read", help="Read Hall count or quadrature position via NDP SENSOR_READ")
 
-    sub.add_parser("beacon-status", help="Show BLE Beacon/Broadcaster test mode")
-    bs = sub.add_parser("beacon-start", help="Configure non-connectable BLE Beacon/Broadcaster mode")
-    bs.add_argument("--interval", type=int, default=2000, help="advertising interval in ms (20..10240)")
-    bs.add_argument("--tx-power", type=int, default=4, help="BLE advertising TX power in dBm")
-    sub.add_parser("beacon-stop", help="Disable BLE Beacon/Broadcaster mode")
-
     sub.add_parser("lora-get", help="Show current LLCC68 LoRa profile")
     sub.add_parser("lora-info", help="Show LLCC68 profile for direct RF diagnostics")
-    ltx = sub.add_parser("lora-send", help="Direct LLCC68 TX diagnostic; bypass VM/compiler")
-    ltx.add_argument("payload", help="UTF-8 payload base, 1..48 bytes")
-    ltx.add_argument("--every", type=float, default=None, metavar="SECONDS",
-                     help="continuous TX interval; payload becomes BASE_01, BASE_02, ...")
-    ltx.add_argument("--count", type=int, default=0, metavar="N",
-                     help="number of packets with --every (default: unlimited until Ctrl-C/NUS disconnect)")
+    ntboot = sub.add_parser(
+        "ninalink-telemetry-boot",
+        help="B4.12 persist fixed-phase TEMPERATURE telemetry over reliable NinaLink",
+    )
+    ntboot.add_argument(
+        "--every", type=int, default=20, metavar="SECONDS",
+        help="fixed telemetry period, 5..300 s (default: 20)",
+    )
+    ntboot.add_argument(
+        "--window", type=int, default=600, metavar="MS",
+        help="ACK/downlink RX window, 100..4000 ms (default: 600)",
+    )
+    ntboot.add_argument(
+        "--attempts", type=int, default=3,
+        help="maximum attempts per logical report, 1..5 (default: 3)",
+    )
+    ntboot.add_argument(
+        "--backoff", type=int, default=200, metavar="MS",
+        help="base exponential retry backoff, 1..4000 ms (default: 200)",
+    )
 
-    lboot = sub.add_parser("lora-tx-boot", help="Persist autonomous BOOT LoRa TX counter sequence")
-    lboot.add_argument("payload", help="UTF-8 payload base; packets become BASE-01, BASE-02, ...")
-    lboot.add_argument("--every", type=int, default=30, metavar="SECONDS",
-                       help="autonomous TX period in seconds (default: 30); uses persisted RF profile")
-    lrx = sub.add_parser("lora-rx", help="Direct LLCC68 RX diagnostic; bypass VM/compiler")
-    lrx.add_argument("--timeout", type=float, default=30.0, help="receive-window duration in seconds; prints every packet until expiry")
-    sub.add_parser("lora-rx-cancel", help="Cancel a stale direct LLCC68 RX diagnostic")
+    nextsnap = sub.add_parser(
+        "ninalink-external-snapshot",
+        help="B5.4 read-only external node/state snapshot",
+    )
+    nextsnap.add_argument("--json", action="store_true", help="emit stable machine-readable JSON")
 
+    nextev = sub.add_parser(
+        "ninalink-external-events",
+        help="B5.4 read external events after a monotonic cursor",
+    )
+    nextev.add_argument("--cursor", type=lambda x: int(x, 0), default=0, help="last consumed event_id")
+    nextev.add_argument("--limit", type=int, default=8, help="maximum events to return (1..64)")
+    nextev.add_argument("--json", action="store_true", help="emit stable machine-readable JSON")
+
+    sub.add_parser(
+        "ninalink-network-status",
+        help="B7.6f2l1 show persistent NinaLink 16-bit network ID and foreign RX count",
+    )
+    nnset = sub.add_parser(
+        "ninalink-network-set",
+        help="B7.6f2l1 persist NinaLink network ID (0x0000..0xFFFF)",
+    )
+    nnset.add_argument("network_id", type=lambda x: int(x, 0))
+    sub.add_parser("ninalink-bridge-start", help="B4.2 start continuous on-device validated NinaLink bridge RX")
+    sub.add_parser(
+        "ninalink-bridge-handoff",
+        help="B5.5 NUS-only: preserve bridge RX and return BLE ownership to Application plane",
+    )
+
+    nappq=sub.add_parser("ninalink-app-query",help="B4.11b queue capability query over Application/NDP")
+    nappq.add_argument("--node",type=lambda x:int(x,0),required=True)
+    nappq.add_argument("--cap",action="append",required=True,metavar="ID[:CHANNEL]")
+    nappq.add_argument("--json",action="store_true")
+    nhar = sub.add_parser(
+        "ninalink-ha-runtime-watch",
+        help="B7.3 run HA coordinator runtime over Application BLE",
+    )
+    nhar.add_argument(
+        "--count", type=int, default=2,
+        help="number of B5.5 notifications to reconcile (default: 2)",
+    )
+    nhar.add_argument(
+        "--timeout", type=float, default=50.0,
+        help="timeout per notification in seconds (default: 50)",
+    )
+    nhar.add_argument(
+        "--json", action="store_true",
+        help="emit JSON-lines coordinator publications",
+    )
+
+    ncapi = sub.add_parser(
+        "ninalink-external-capabilities",
+        help="B7.2 read complete per-node capability inventory over Application BLE",
+    )
+    ncapi.add_argument(
+        "--node", type=lambda x: int(x, 0), required=True,
+        help="NinaLink node id, e.g. 0xAD64D423",
+    )
+    ncapi.add_argument(
+        "--json", action="store_true",
+        help="emit machine-readable inventory JSON",
+    )
+
+    nhap = sub.add_parser(
+        "ninalink-ha-preview",
+        help="B7.1 preview Home Assistant device/entity projection",
+    )
+    nhap.add_argument(
+        "--json", action="store_true",
+        help="emit HA semantic projection JSON",
+    )
+
+    nreconcile = sub.add_parser(
+        "ninalink-external-reconcile",
+        help="B6.1b live B5.4 reconciliation driven by B5.5 notifications",
+    )
+    nreconcile.add_argument(
+        "--count", type=int, default=2,
+        help="number of B5.5 change notifications to reconcile (default: 2)",
+    )
+    nreconcile.add_argument(
+        "--timeout", type=float, default=45.0,
+        help="timeout per B5.5 notification in seconds (default: 45)",
+    )
+    nreconcile.add_argument(
+        "--json", action="store_true",
+        help="emit JSON-lines initial/reconcile records",
+    )
+
+    nmodel = sub.add_parser(
+        "ninalink-external-model",
+        help="B6.1a build one-shot external logical model over Application BLE",
+    )
+    nmodel.add_argument(
+        "--json", action="store_true",
+        help="emit stable machine-readable model JSON",
+    )
+
+    nw = sub.add_parser(
+        "ninalink-external-watch",
+        help="B5.5 watch state/event change notifications on Application BLE",
+    )
+    nw.add_argument(
+        "--mask", dest="change_mask", choices=["state","event","all"],
+        default="all", help="change classes to subscribe (default: all)",
+    )
+    nw.add_argument(
+        "--count", type=int, default=1,
+        help="number of change notifications before exit (default: 1)",
+    )
+    nw.add_argument(
+        "--timeout", type=float, default=30.0,
+        help="timeout per notification in seconds (default: 30)",
+    )
+    nw.add_argument(
+        "--json", action="store_true",
+        help="emit JSON-lines subscription/change/stats records",
+    )
+
+    sub.add_parser("ninalink-bridge-status", help="Show B4.2 NinaLink bridge counters/status")
+    sub.add_parser("ninalink-bridge-stop", help="Stop B4.2/B4.3 NinaLink bridge RX")
+    ncap = sub.add_parser(
+        "ninalink-cap-set",
+        help="B7.6f2m6b queue a generic one-byte NinaLink CAP_SET",
+    )
+    ncap.add_argument(
+        "--node", type=lambda x: int(x, 0), required=True,
+        help="target node id",
+    )
+    ncap.add_argument(
+        "--cap", dest="capability_id", type=lambda x: int(x, 0),
+        required=True, help="semantic capability id",
+    )
+    ncap.add_argument(
+        "--channel", type=lambda x: int(x, 0), default=0,
+        help="capability channel, default 0",
+    )
+    ncap.add_argument(
+        "--type", dest="value_type",
+        choices=("bool", "u8", "s8", "enum8"),
+        required=True, help="one-byte capability value type",
+    )
+    ncap.add_argument(
+        "--value", required=True,
+        help="value; bool accepts on/off, others accept Python-style integers",
+    )
+    nset = sub.add_parser("ninalink-cap-set-tracking", help="B4.5 queue tracking_active CAP_SET on the bridge")
+    nset.add_argument("--node", type=lambda x: int(x, 0), required=True, help="target node id, e.g. 0xAD64D423")
+    nset.add_argument("--value", choices=("on","off"), required=True, help="requested tracking_active value")
+    sub.add_parser("ninalink-app-status", help="Show B4.5 bridge application-downlink state")
+    ncmd = sub.add_parser("ninalink-command", help="B4.7 queue a generic NinaLink COMMAND")
+    ncmd.add_argument("--node", type=lambda x: int(x, 0), required=True, help="target node id")
+    ncmd.add_argument("--id", dest="command_id", type=lambda x: int(x, 0), required=True, help="command id")
+    ncmd.add_argument("--data", default="", help="hex arguments, max 7 bytes in B4.7 NDP gate")
+    necho = sub.add_parser("ninalink-command-echo", help="B4.7 queue ECHO_U32 COMMAND")
+    necho.add_argument("--node", type=lambda x: int(x, 0), required=True, help="target node id")
+    necho.add_argument("--token", type=lambda x: int(x, 0), required=True, help="u32 echo token")
+    sub.add_parser("ninalink-command-status", help="Show B4.7 bridge COMMAND state/result")
+    ninfo = sub.add_parser("ninalink-command-node-info", help="B4.8 queue GET_NODE_INFO")
+    ninfo.add_argument("--node", type=lambda x: int(x, 0), required=True, help="target node id")
+    ntrack = sub.add_parser("ninalink-command-tracking-state", help="B4.8 queue GET_TRACKING_STATE")
+    ntrack.add_argument("--node", type=lambda x: int(x, 0), required=True, help="target node id")
+    ndisc = sub.add_parser("ninalink-command-discover", help="B4.9 discover node command registry")
+    ndisc.add_argument("--node", type=lambda x: int(x, 0), required=True, help="target node id")
+    ndisc.add_argument("--start", type=lambda x: int(x, 0), default=0, help="registry start index")
+    sub.add_parser("ninalink-command-discovery-status", help="Show B4.9 bridge discovery page")
+    ncaps = sub.add_parser(
+        "ninalink-capability-discover",
+        help="B4.10 discover node capability metadata",
+    )
+    ncaps.add_argument(
+        "--node",
+        type=lambda x: int(x, 0),
+        required=True,
+        help="target node id",
+    )
+    ncaps.add_argument(
+        "--page",
+        type=lambda x: int(x, 0),
+        default=0,
+        help="CAPS page index",
+    )
+    sub.add_parser(
+        "ninalink-capability-discovery-status",
+        help="Show B4.10 bridge capability page",
+    )
     ls = sub.add_parser("lora-set", help="Set the complete LLCC68 LoRa profile")
     ls.add_argument("--freq", type=int, required=True, help="RF frequency in Hz")
     ls.add_argument("--power", type=int, required=True, help="TX power in dBm (-9..22)")
@@ -5787,11 +7446,6 @@ def build_parser():
         default=5,
     )
 
-    ie = sub.add_parser("inject-event")
-    ie.add_argument("type", type=int)
-    ie.add_argument("--arg0", type=int, default=0)
-    ie.add_argument("--arg1", type=int, default=0)
-
     eg = sub.add_parser("test-event-gpio")
     eg.add_argument("--event", type=int, default=18, help="APP_COMMAND=18")
     eg.add_argument("--pin", type=int, default=15)
@@ -5946,11 +7600,6 @@ def build_parser():
         "--no-qr",
         action="store_true",
         help="print provisioning URL only; suppress the terminal Unicode QR",
-    )
-
-    sub.add_parser(
-        "tracking-debug",
-        help="Show Stage 8.3 tracking/radio diagnostic state",
     )
 
     ha = sub.add_parser(

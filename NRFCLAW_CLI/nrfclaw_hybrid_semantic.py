@@ -19,6 +19,7 @@ import difflib
 import json
 import math
 import re
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import struct
 import unicodedata
 from typing import Any
@@ -79,6 +80,12 @@ OP_PARSE_BUF_FIXED = 0x8A
 OP_FORMAT_REG_FIXED = 0x8B
 OP_BUFFER_PREPEND = 0x8C
 OP_BUFFER_SET = 0x8D
+OP_LORA_LAST_RSSI = 0x90
+OP_HA_ROLE_CONFIG = 0x91
+OP_LORA_PROFILE_PERSIST = 0x92
+OP_HA_NINALINK_NODE_CONFIG = 0x93
+OP_SEMANTIC_PUBLISH = 0x94
+OP_PERSIST_LOAD_DEFAULT = 0x95
 OP_GPIO_READ = 0x52
 OP_MOV = 0x01
 EVENT_VIB_MACHINE_ON = 0x40
@@ -93,10 +100,14 @@ FMT_CENTIVOLTS = 2
 FMT_MILLICELSIUS = 3
 FMT_U32_02 = 4
 
-SEMANTIC_ENGINE_VERSION = 32
+SEMANTIC_ENGINE_VERSION = 35
 DEFAULT_CONFIG = Path.home() / ".config" / "nrfclaw" / "semantic.json"
 BUILTIN_EXAMPLES = Path(__file__).resolve().parent / "nrfclaw_semantic_examples.json"
 USER_EXAMPLES = Path.home() / ".config" / "nrfclaw" / "semantic_examples.json"
+
+HA_NINALINK_DEFAULT_PERIOD_S = 20
+HA_NINALINK_MIN_PERIOD_S = 5
+HA_NINALINK_MAX_PERIOD_S = 3600
 
 DEFAULTS = {
     "battery_low_cv": None,      # deliberately unset: product/user must define it
@@ -327,7 +338,10 @@ def _lora_profile(t: str) -> tuple[int, int, int, int, int]:
     m = re.search(r"(?:tx\s*power|potencia(?:\s+tx)?|power)\s*(?:de\s*)?([+-]?\d+)\s*dbm", t)
     if not m:
         m = re.search(r"(?:lora[^;.]{0,100}?)\b([+-]?\d+)\s*dbm\b", t)
-    power = int(m.group(1)) if m else 14
+    if re.search(r"potencia maxima|potência máxima|maximum power|max power|potencia max|potência max", t):
+        power = 22
+    else:
+        power = int(m.group(1)) if m else 14
     m = re.search(r"\bsf\s*(\d{1,2})\b", t)
     sf = int(m.group(1)) if m else 7
     m = re.search(r"(?:bw|bandwidth|largura[^;.]{0,15})\s*(\d+)\s*khz", t)
@@ -355,6 +369,7 @@ def _lora_rf_config_requested(t: str) -> bool:
         r"\b\d+(?:[\.,]\d+)?\s*mhz\b",
         r"(?:tx\s*power|txpower|potencia(?:\s+tx)?|potência(?:\s+tx)?|power)[^;.]{0,20}[+-]?\d+\s*dbm\b",
         r"\b[+-]?\d+\s*dbm\b",
+        r"potencia maxima|potência máxima|maximum power|max power|potencia max|potência max",
         r"\bsf\s*\d{1,2}\b",
         r"(?:\bbw\b|bandwidth|largura(?:\s+de)?\s+banda)[^;.]{0,20}\d+\s*khz\b",
         r"(?:\bcr\b|coding\s*rate|taxa(?:\s+de)?\s+codifica)[^;.]{0,20}(?:4/)?[1-8]\b",
@@ -786,6 +801,118 @@ def _compile_battery_to_beacon(source: str, t: str, schedule: int, cfg: dict[str
     a.label('loop'); ir += ["LABEL LOOP","BAT READ -> R0",f'FORMAT BUFFER "{prefix}" + R0 as VOLTS',"BLE ADV BUFFER",f"WAIT {bat_s}s","JMP LOOP","END"]
     a.emit(OP_BAT_READ,0); a.emit(OP_FORMAT_REG,len(raw)); a.code+=raw; a.emit(0,FMT_CENTIVOLTS); a.emit(OP_BLE_ADV_BUF); a.wait_s(bat_s); a.jmp('loop'); a.emit(OP_END)
     return CompileResult(source,'battery-to-beacon',schedule,ir,a.finish(),[f'Battery is sampled every {bat_s}s; BLE advertises the last formatted value every {beacon_s}s.', 'prefix/payload is applied only to the formatted dynamic value.'])
+
+def _counter_format_prefix(source: str, default: str = "COUNT=") -> str:
+    """Return a compact prefix from forms such as ``formato C=<contador>``.
+
+    Quoted prefixes remain the highest-priority legacy spelling.  This helper
+    intentionally recognizes only the counter placeholder and does not try to
+    become a general template engine.
+    """
+    q = re.search(r'["\']([^"\']*)["\']', source)
+    if q and 0 < len(q.group(1).encode("utf-8")) <= 48:
+        return q.group(1)
+    m = re.search(
+        r'(?:formato|format)\s+([^\s<]{1,16})\s*<\s*(?:contador|counter)\s*>',
+        source, re.I,
+    )
+    if m:
+        prefix = m.group(1)
+        if len(prefix.encode("utf-8")) <= 48:
+            return prefix
+    return default
+
+
+def _counter_rssi_beacon_format(source: str) -> tuple[str, str]:
+    """Extract ``C=`` and `` R=`` from a requested counter/RSSI beacon format."""
+    matches = list(re.finditer(
+        r'(?:formato|format)\s+([^\s<]{1,16})\s*<\s*(?:contador|counter)\s*>'
+        r'\s*([^<]{0,16}?)<\s*rssi\s*>',
+        source, re.I,
+    ))
+    if not matches:
+        return "C=", " R="
+    m = matches[-1]
+    p1 = m.group(1)
+    p2 = m.group(2)
+    # Keep the human-readable separator but strip trailing prose punctuation.
+    p2 = re.sub(r'[.;,]+\s*$', '', p2)
+    if not p2.strip():
+        p2 = " R="
+    elif not p2.startswith((" ", ",", ";", "|", "/")):
+        p2 = " " + p2
+    if len(p1.encode("utf-8")) > 32 or len(p2.encode("utf-8")) > 32:
+        raise TextCompileError("counter/RSSI beacon format prefix is too long")
+    return p1, p2
+
+
+def _compile_lora_counter_rssi_beacon(source: str, t: str, schedule: int, cfg: dict[str, Any]) -> CompileResult | None:
+    """LoRa ``C=<counter>`` RX -> BLE ``C=<counter> R=<rssi>`` relay.
+
+    This restores the validated diagnostic composition using the already frozen
+    VM primitives OP_PARSE_BUF_I32, OP_LORA_LAST_RSSI and OP_FORMAT_2REG.  No
+    firmware or radio-protocol ABI extension is needed.
+    """
+    has_lora_rx = (
+        "lora" in t and
+        bool(re.search(r"\b(?:receba|recebe|receber|receb|receive|listen|listening|escute|escutar)\w*\b", t))
+    )
+    has_beacon = bool(re.search(r"\bbeacon\b|\banunc\w*\b|\badvertis\w*\b", t))
+    has_counter = bool(re.search(r"contador|counter", t))
+    has_rssi = "rssi" in t
+    if not (has_lora_rx and has_beacon and has_counter and has_rssi):
+        return None
+
+    # Default BLE cadence is the same as the established LoRa-RX -> beacon path.
+    m = re.search(
+        r"(?:a cada|cada|em intervalos? de|once every|every|intervalo(?: de)?|interval(?: of)?)"
+        r"\s*(\d+)\s*(segundos?|seconds?|secs?|s|minutos?|minutes?|mins?|m)\b",
+        t,
+    )
+    interval_s = _parse_seconds_fragment(m.group(1) + m.group(2)) if m else 2
+    interval_ms = interval_s * 1000
+    if not 20 <= interval_ms <= 10240:
+        raise TextCompileError("Beacon interval must be 20..10240 ms on the current backend")
+
+    p1, p2 = _counter_rssi_beacon_format(source)
+    raw1 = p1.encode("utf-8")
+    raw2 = p2.encode("utf-8")
+
+    a = Assembler(); ir = []
+    if _ndp_off_requested(t):
+        ir.append("BLE NDP OFF"); a.emit(OP_BLE_APP_ROLE, BLE_ROLE_OFF)
+    _emit_lora_config_if_requested(a, ir, t)
+    ir += ["BLE ADVERTISER", f"BLE ADV INTERVAL={interval_ms}ms"]
+    a.emit(OP_BLE_APP_ROLE, BLE_ROLE_ADVERTISER)
+    a.emit(OP_BLE_ADV_CONFIG); a.u16(interval_ms); a.emit(4, 0)
+
+    a.label("rx_loop")
+    ir += [
+        "LABEL RX_LOOP",
+        "LORA RX -> BUFFER",
+        "PARSE BUFFER INT -> R0",
+        "LORA LAST RSSI -> R1",
+        f'FORMAT BUFFER "{p1}" + R0 AS U32 + "{p2}" + R1 AS I32',
+        "BLE ADV BUFFER",
+        "JMP RX_LOOP",
+        "END",
+    ]
+    a.emit(OP_LORA_RX_START, 1)
+    a.emit(OP_PARSE_BUF_I32, 0)
+    a.emit(OP_LORA_LAST_RSSI, 1)
+    a.emit(OP_FORMAT_2REG, len(raw1)); a.code += raw1
+    a.emit(0, FMT_U32, len(raw2)); a.code += raw2
+    a.emit(1, FMT_I32)
+    a.emit(OP_BLE_ADV_BUF)
+    a.jmp("rx_loop"); a.emit(OP_END)
+
+    return CompileResult(source, "lora-counter-rssi-beacon", schedule, ir, a.finish(), [
+        "The received counter is parsed from the first signed integer token in the LoRa payload.",
+        "RSSI is the last LoRa packet RSSI measured by the receiver and is advertised as whole signed dBm.",
+        f"BLE advertising interval is {interval_ms} ms; LoRa RX is rearmed after each packet.",
+        "This is a raw LoRa diagnostic relay; NinaLink network-ID admission is not applied to the raw payload path.",
+    ])
+
 
 def _compile_lora_rx_to_beacon(source: str, t: str, schedule: int, cfg: dict[str, Any]) -> CompileResult | None:
     """Continuously receive LoRa packets and advertise the latest packet as BLE beacon data.
@@ -1260,6 +1387,433 @@ def _compile_lora_temperature_stream(source: str, t: str, schedule: int, cfg: di
     ]
     return CompileResult(source, "lora-temperature-stream", schedule, ir, a.finish(), warnings)
 
+
+def _ha_transport_role(t: str) -> int | None:
+    if not re.search(r"home assistant|\bha\b", t):
+        return None
+    if not re.search(r"ative|ativar|habilite|habilitar|ligue|ligar|configure|configurar|conecte|conectar|integre|integrar|use|usar|enable|activate|turn on|start|connect|integrate", t):
+        return None
+
+    # Bridge wins over the generic LoRa-node interpretation because natural
+    # bridge phrases often also specify a LoRa frequency.
+    if re.search(r"modo ponte|ponte|bridge|gateway|concentrador|escravo|slave", t):
+        return 3
+    if re.search(r"\blora\b|\bninalink\b", t):
+        return 2
+    return 1
+
+
+def _ha_network_id_request(t: str) -> int | None:
+    """Return an explicitly requested NinaLink network ID, if any.
+
+    Network IDs are intentionally parsed only when attached to an explicit
+    `rede`/`network` phrase so unrelated LoRa numbers (915 MHz, SF7, etc.)
+    cannot be mistaken for provisioning data.
+    """
+    pattern = (
+        r"\b(?:"
+        r"(?:rede|network)(?:\s+ninalink)?(?:\s+(?:id|identifier|identificador))?"
+        r"|(?:id|identifier|identificador)\s+(?:da\s+|de\s+|of\s+)?(?:rede|network)"
+        r")\s*(?:=|:|#)?\s*(0x[0-9a-f]+|\d+)\b"
+    )
+    raw = re.findall(pattern, t, re.I)
+    if not raw:
+        return None
+    values = []
+    for token in raw:
+        try:
+            value = int(token, 0)
+        except ValueError as exc:
+            raise TextCompileError(f"invalid NinaLink network ID: {token}") from exc
+        if not 0 <= value <= 0xFFFF:
+            raise TextCompileError("NinaLink network ID must be 0x0000..0xFFFF")
+        values.append(value)
+    if len(set(values)) != 1:
+        raise TextCompileError("ambiguous NinaLink network IDs in prompt")
+    value = values[0]
+    if value == 0:
+        raise TextCompileError(
+            "network ID 0x0000 is the legacy/unprovisioned value; "
+            "prompt provisioning requires 0x0001..0xFFFF"
+        )
+    return value
+
+
+def _ha_network_provision_spec(t: str, role: int) -> dict[str, Any] | None:
+    """Describe the l2 host provisioning action for a role-only HA prompt."""
+    requested = _ha_network_id_request(t)
+    if role == 1:
+        if requested is not None:
+            raise TextCompileError(
+                "NinaLink network ID is only valid for HA bridge or LoRa/NinaLink node mode"
+            )
+        return None
+    if requested is not None:
+        return {
+            "kind": "ninalink-network",
+            "mode": "set",
+            "network_id": requested,
+            "role": "bridge" if role == 3 else "node",
+        }
+    if role == 3:
+        return {
+            "kind": "ninalink-network",
+            "mode": "bridge-ensure",
+            "role": "bridge",
+        }
+    return {
+        "kind": "ninalink-network",
+        "mode": "node-reuse",
+        "role": "node",
+    }
+
+
+def _ha_lora_persist_fields(t: str) -> tuple[int, tuple[int,int,int,int,int]] | None:
+    mask = 0
+    freq = 915_000_000
+    power = 14
+    sf = 7
+    bw = 125
+    cr = 1
+
+    if re.search(r"\d+(?:[\.,]\d+)?\s*mhz\b", t):
+        freq = _lora_frequency_hz(t)
+        mask |= 0x01
+
+    mp = re.search(r"(?:tx\s*power|txpower|potencia(?:\s+tx)?|potência(?:\s+tx)?|power)[^;.]{0,20}?([+-]?\d+)\s*dbm\b", t)
+    if not mp:
+        mp = re.search(r"\b([+-]?\d+)\s*dbm\b", t)
+    if re.search(r"potencia maxima|potência máxima|maximum power|max power|potencia max|potência max", t):
+        power = 22
+        mask |= 0x02
+    elif mp:
+        power = int(mp.group(1))
+        if not -9 <= power <= 22:
+            raise TextCompileError("LoRa TX power must be -9..+22 dBm")
+        mask |= 0x02
+
+    msf = re.search(r"\bsf\s*(\d{1,2})\b", t)
+    if msf:
+        sf = int(msf.group(1)); mask |= 0x04
+    mbw = re.search(r"(?:\bbw\b|bandwidth|largura(?:\s+de)?\s+banda)[^;.]{0,20}?(\d+)\s*khz\b", t)
+    if mbw:
+        bw = int(mbw.group(1)); mask |= 0x08
+    mcr = re.search(r"(?:\bcr\b|coding\s*rate|taxa(?:\s+de)?\s+codifica)[^;.]{0,20}?(?:4/)?([5-8]|[1-4])\b", t)
+    if mcr:
+        raw = int(mcr.group(1)); cr = raw - 4 if raw >= 5 else raw; mask |= 0x10
+
+    if mask == 0:
+        return None
+    if not 5 <= sf <= 11: raise TextCompileError("LoRa SF must be 5..11")
+    if bw not in (125,250,500): raise TextCompileError("LoRa BW must be 125, 250 or 500 kHz")
+    if not 1 <= cr <= 4: raise TextCompileError("LoRa CR must be 1..4 (4/5..4/8)")
+    return mask, (freq,power,sf,bw,cr)
+
+
+def _ha_node_report_period_s(t: str) -> tuple[int, bool]:
+    patterns = (
+        r"(?:a cada|cada|every)\s+((?:\d+\s*)?(?:segundos?|secs?|seconds?|s|minutos?|mins?|minutes?|m|horas?|hours?|h))\b",
+        r"(?:intervalo|interval|periodicidade|periodo|period)[^;.]{0,24}?(?:de|of|=)?\s*((?:\d+\s*)?(?:segundos?|secs?|seconds?|s|minutos?|mins?|minutes?|m|horas?|hours?|h))\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, t)
+        if not match:
+            continue
+        period_s = _parse_seconds_fragment(match.group(1))
+        if period_s is None:
+            continue
+        if not HA_NINALINK_MIN_PERIOD_S <= period_s <= HA_NINALINK_MAX_PERIOD_S:
+            raise TextCompileError(
+                f"HA NinaLink report interval must be "
+                f"{HA_NINALINK_MIN_PERIOD_S}..{HA_NINALINK_MAX_PERIOD_S} seconds"
+            )
+        return period_s, True
+    return HA_NINALINK_DEFAULT_PERIOD_S, False
+
+
+
+
+# B7.6f2k6 — Hall pulse -> persistent semantic volume -> routed HA transport.
+_US_GALLON_L = Decimal("3.785411784")
+_HALL_VOLUME_STATE_KEY = 15
+_SEMCAP_VOLUME_LITER = 0x0601
+_SEMCAP_VOLUME_US_GALLON = 0x0606
+
+
+def _hall_volume_transport(t: str) -> str:
+    """Resolve the HA transport for the Hall-volume family.
+
+    Default remains Direct BLE for backward compatibility.  Explicit LoRa or
+    NinaLink wording selects a NinaLink node.  Ambiguous prompts fail rather
+    than silently selecting the wrong transport.
+    """
+    lora = bool(re.search(r"\b(?:lora|ninalink)\b", t))
+    direct = bool(re.search(r"\b(?:direct|directo|direto|bluetooth|ble)\b", t))
+    bridge = bool(re.search(r"\b(?:bridge|gateway|ponte|concentrador)\b", t))
+
+    if bridge:
+        raise TextCompileError(
+            "Hall volume is a sensor-node program; use NinaLink/LoRa for the "
+            "sensor and configure a separate bridge device"
+        )
+    if lora and direct:
+        raise TextCompileError(
+            "Hall volume transport is ambiguous: request either Direct BLE or NinaLink/LoRa"
+        )
+    return "NINALINK" if lora else "DIRECT"
+
+def _hall_volume_unit(token: str) -> str | None:
+    u = _fold(token)
+    if re.search(r"\b(?:litro|litros|liter|liters|litre|litres)\b", u):
+        return "L"
+    if re.search(r"\b(?:galao|galoes|gallon|gallons|us\s*gal|us\s*gallon|us\s*gallons)\b", u):
+        return "US_GAL"
+    return None
+
+def _hall_volume_amount_and_unit(t: str) -> tuple[Decimal, str] | None:
+    unit_pat = r"(?:litros?|liters?|litres?|galao(?:es)?(?:\s+americano(?:s)?)?|gallons?|us\s*gal(?:lons?)?)"
+    m = re.search(
+        rf"(?:representa|represents?|represent|equivale(?:\s+a)?|equals?)\s+"
+        rf"(?:(\d+(?:[.,]\d+)?)|(um|uma|one))\s*({unit_pat})\b",
+        t, re.I)
+    if not m:
+        return None
+    raw = m.group(1) or "1"
+    try:
+        amount = Decimal(raw.replace(',', '.'))
+    except InvalidOperation as exc:
+        raise TextCompileError("invalid Hall volume amount") from exc
+    unit = _hall_volume_unit(m.group(3))
+    if unit is None or amount <= 0:
+        raise TextCompileError("Hall pulse volume must be a positive liter or US-gallon quantity")
+    return amount, unit
+
+def _hall_volume_output_unit(t: str, fallback: str) -> str:
+    unit_pat = r"(?:litros?|liters?|litres?|galao(?:es)?(?:\s+americano(?:s)?)?|gallons?|us\s*gal(?:lons?)?)"
+    patterns = (
+        rf"(?:mostre|mostrar|exiba|exibir|show|display)[^.;]{{0,140}}?(?:em|in|en)\s+(?:o\s+|os\s+|the\s+)?({unit_pat})\b",
+        rf"(?:volume|consumo|consumption)[^.;]{{0,100}}?(?:em|in|en)\s+(?:o\s+|os\s+|the\s+)?({unit_pat})\b",
+    )
+    for pat in patterns:
+        m = re.search(pat, t, re.I)
+        if m:
+            unit = _hall_volume_unit(m.group(1))
+            if unit is not None:
+                return unit
+    return fallback
+
+def _compile_hall_semantic_volume(source: str, t: str, schedule: int, cfg: dict[str, Any]) -> CompileResult | None:
+    """Persistent Hall pulse volume total routed to HA through Direct or NinaLink.
+
+    Examples:
+      Cada pulso do HALL1 representa 1 litro. Acumule o consumo total e
+      mostre no Home Assistant.
+
+      Cada pulso do HALL1 representa 3,78541 litros. Acumule o consumo total
+      e mostre no Home Assistant via LoRa.
+    """
+    if not re.search(r"home assistant|\bha\b", t):
+        return None
+    if not re.search(r"\b(?:hall\s*[12]|hall1|hall2)\b", t):
+        return None
+    if not re.search(r"\b(?:pulso|pulsos|pulse|pulses)\b", t):
+        return None
+    if not re.search(r"\b(?:volume|consumo|consumption|litro|liter|litre|galao|gallon)\b", t):
+        return None
+
+    parsed = _hall_volume_amount_and_unit(t)
+    if parsed is None:
+        return None
+    amount, source_unit = parsed
+    target_unit = _hall_volume_output_unit(t, source_unit)
+    transport = _hall_volume_transport(t)
+
+    channel = 2 if re.search(r"\b(?:hall\s*2|hall2)\b", t) else 1
+    if source_unit == "L" and target_unit == "L":
+        target_amount = amount
+    elif source_unit == "US_GAL" and target_unit == "US_GAL":
+        target_amount = amount
+    elif source_unit == "L" and target_unit == "US_GAL":
+        target_amount = amount / _US_GALLON_L
+    elif source_unit == "US_GAL" and target_unit == "L":
+        target_amount = amount * _US_GALLON_L
+    else:
+        raise UnsupportedSemantics("unsupported Hall volume unit conversion")
+
+    increment_raw = int((target_amount * Decimal(1000)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    if increment_raw <= 0:
+        raise TextCompileError("Hall pulse volume rounds to zero at 0.001-unit semantic resolution")
+    if increment_raw > 0xFFFFFFFF:
+        raise TextCompileError("Hall pulse volume is too large for U32 semantic state")
+
+    if target_unit == "L":
+        semantic_cap = _SEMCAP_VOLUME_LITER
+        semantic_name = "VOLUME"
+        unit_name = "L"
+    else:
+        semantic_cap = _SEMCAP_VOLUME_US_GALLON
+        semantic_name = "VOLUME_US_GALLON"
+        unit_name = "gal"
+
+    a = Assembler(); ir: list[str] = []
+
+    if transport == "DIRECT":
+        a.emit(OP_HA_ROLE_CONFIG, 1); ir.append("HA ROLE DIRECT_BLE PERSIST")
+        a.wait_s(1); ir.append("WAIT 1s")
+
+    # state[15] is compiler-owned for this family. Missing state becomes zero
+    # without requiring a manual state-save command.
+    a.emit(OP_PERSIST_LOAD_DEFAULT, _HALL_VOLUME_STATE_KEY, 1); a.u32(0)
+    ir.append("PERSIST LOAD DEFAULT state[15] -> R1 default=0")
+    a.movi(2, increment_raw); ir.append(f"MOV R2 = {increment_raw}")
+    a.movi(3, 1); ir.append("MOV R3 = 1")
+
+    # GPIOTE is toggle-based. Keep the native edge counter off and count only
+    # the HIGH state in VM so a complete LOW/HIGH pulse increments once.
+    a.emit(OP_HALL_CONFIG, 1, channel, 0, 0, 1)
+    ir.append(f"HALL CONFIG SINGLE HALL{channel} count=0 events=1")
+
+    def publish():
+        a.emit(OP_SEMANTIC_PUBLISH); a.u16(semantic_cap); a.emit(0, 1)
+        ir.append(f"SEMANTIC PUBLISH {semantic_name} ch=0 value=R1 scale=-3 unit={unit_name}")
+
+    # Publish before arming a NinaLink node so its immediate first contact can
+    # carry the retained semantic value on the very first CAP_REPORT.
+    publish()
+
+    period_s = None
+    if transport == "NINALINK":
+        rf = _ha_lora_persist_fields(t)
+        if rf is not None:
+            mask, (freq, power, sf, bw, cr) = rf
+            a.emit(OP_LORA_PROFILE_PERSIST, mask)
+            a.u32(freq); a.emit(power, sf); a.u16(bw); a.emit(cr)
+            parts = []
+            if mask & 1: parts.append(f"freq={freq/1_000_000:g}MHz")
+            if mask & 2: parts.append(f"tx={power:+d}dBm")
+            if mask & 4: parts.append(f"SF{sf}")
+            if mask & 8: parts.append(f"BW{bw}")
+            if mask & 16: parts.append(f"CR4/{cr+4}")
+            ir.append("LORA PERSIST " + " ".join(parts))
+
+        period_s, _ = _ha_node_report_period_s(t)
+        a.emit(OP_HA_NINALINK_NODE_CONFIG); a.u16(period_s)
+        ir.append(f"HA ROLE NINALINK_NODE PERSIST interval={period_s}s")
+        # The role/profile commit is asynchronous Flash work. Avoid racing the
+        # first Hall pulse's persistent accumulator write.
+        a.wait_s(1); ir.append("WAIT 1s")
+
+    a.label("hall_volume_loop"); ir.append("LABEL HALL_VOLUME_LOOP")
+    a.emit(OP_WAIT_HALL, 0); ir.append("WAIT_HALL -> R0")
+    a.emit(OP_CMP_EQ, 4, 0, 3); ir.append("CMP R4 = R0 EQ R3")
+    a.jz(4, "hall_volume_loop"); ir.append("IF R4 == 0 GOTO HALL_VOLUME_LOOP")
+    a.emit(OP_ADD, 1, 1, 2); ir.append("ADD R1 = R1 + R2")
+    a.emit(OP_PERSIST_SAVE, _HALL_VOLUME_STATE_KEY, 1); ir.append("PERSIST SAVE state[15] = R1")
+    publish()
+    a.jmp("hall_volume_loop"); ir.append("JMP HALL_VOLUME_LOOP")
+    a.emit(OP_END); ir.append("END")
+
+    warnings = [
+        f"HALL{channel} pulse total is compiler-persistent in user state[15]; no manual state-save initialization is required.",
+        f"Each accepted pulse adds {increment_raw / 1000:g} {unit_name}; semantic state is published with 0.001 {unit_name} resolution.",
+        "The generated program is BOOT/autonomous and reserves state[15] for this accumulator.",
+        "A full factory reset clears the accumulated total.",
+    ]
+    if transport == "NINALINK":
+        warnings.append(
+            f"HA transport is NinaLink/LoRa; the node reports retained semantic state every {period_s}s through a separate bridge."
+        )
+        warnings.append(
+            "Local Direct BLE is not the HA transport for this program; P0.21 remains the maintenance/programming path."
+        )
+        intent = "hall-semantic-volume-ninalink"
+    else:
+        warnings.append("HA transport is Direct BLE.")
+        intent = "hall-semantic-volume"
+
+    if target_unit == "US_GAL" and source_unit == "L":
+        warnings.append("Liter-to-gallon conversion uses 1 US gal = 3.785411784 L.")
+    return CompileResult(source, intent, SCHED_BOOT, ir, a.finish(), warnings)
+
+
+def _compile_ha_transport_role(source: str, t: str, schedule: int, cfg: dict[str, Any]) -> CompileResult | None:
+    role = _ha_transport_role(t)
+    if role is None:
+        return None
+
+    names = {1:"DIRECT_BLE", 2:"NINALINK_NODE", 3:"BRIDGE"}
+    intents = {1:"ha-transport-direct", 2:"ha-transport-lora-node", 3:"ha-transport-bridge"}
+    provision = _ha_network_provision_spec(t, role)
+    a = Assembler(); ir = []
+
+    # B7.6f2l2 provisioning is intentionally a host action. The existing NDP
+    # network setter is applied atomically before program upload, so the VM ABI
+    # and NinaLink packet size remain frozen.
+    if provision is not None:
+        if provision["mode"] == "set":
+            ir.append(f"HOST NINALINK NETWORK SET 0x{provision['network_id']:04X} PERSIST")
+        elif provision["mode"] == "bridge-ensure":
+            ir.append("HOST NINALINK NETWORK ENSURE_NONZERO reuse-or-generate PERSIST")
+        else:
+            ir.append("HOST NINALINK NETWORK REQUIRE_NONZERO reuse PERSIST")
+
+    # RF parameters are meaningful for the two LoRa roles. Direct BLE phrases
+    # never rewrite the persisted LoRa profile accidentally.
+    if role in (2,3):
+        rf = _ha_lora_persist_fields(t)
+        if rf is not None:
+            mask,(freq,power,sf,bw,cr)=rf
+            a.emit(OP_LORA_PROFILE_PERSIST, mask)
+            a.u32(freq); a.emit(power,sf); a.u16(bw); a.emit(cr)
+            parts=[]
+            if mask&1: parts.append(f"freq={freq/1_000_000:g}MHz")
+            if mask&2: parts.append(f"tx={power:+d}dBm")
+            if mask&4: parts.append(f"SF{sf}")
+            if mask&8: parts.append(f"BW{bw}")
+            if mask&16: parts.append(f"CR4/{cr+4}")
+            ir.append("LORA PERSIST " + " ".join(parts))
+
+    period_s, period_explicit = _ha_node_report_period_s(t)
+    if role == 2:
+        a.emit(OP_HA_NINALINK_NODE_CONFIG); a.u16(period_s)
+        ir.append(f"HA ROLE NINALINK_NODE PERSIST interval={period_s}s")
+    else:
+        if role == 3 and period_explicit:
+            raise TextCompileError(
+                "HA bridge listens continuously; the report interval applies "
+                "to the NinaLink LoRa node, not to HA bridge mode"
+            )
+        a.emit(OP_HA_ROLE_CONFIG, role)
+        ir.append(f"HA ROLE {names[role]} PERSIST")
+    a.emit(OP_END); ir.append("END")
+
+    warnings = [
+        "HA transport role is persistent and mutually exclusive.",
+        "P0.21/NUS remains available in every HA role.",
+    ]
+    if role == 2:
+        warnings.append(f"Application/NDP stays OFF; NinaLink HA contact/report interval is {period_s} s.")
+        if provision and provision["mode"] == "node-reuse":
+            warnings.append("At upload, the node reuses its persisted non-zero NinaLink network ID; upload fails if it is still 0x0000.")
+        elif provision and provision["mode"] == "set":
+            warnings.append(f"At upload, the node is provisioned into NinaLink network 0x{provision['network_id']:04X} before the BOOT program is stored.")
+    elif role == 3:
+        warnings.append("Bridge mode keeps Application/NDP available and starts continuous NinaLink LoRa RX.")
+        if provision and provision["mode"] == "bridge-ensure":
+            warnings.append("At upload, a bridge reuses its persisted non-zero network ID or creates a random non-zero 16-bit ID if unprovisioned.")
+        elif provision and provision["mode"] == "set":
+            warnings.append(f"At upload, the bridge is provisioned into NinaLink network 0x{provision['network_id']:04X} before the BOOT program is stored.")
+    else:
+        warnings.append("Direct mode enables Application/NDP boot advertising and B7.6d/e passive telemetry/events.")
+
+    if provision is not None:
+        warnings.append("Network provisioning is a host action of `prompt --upload`; raw bytecode alone does not change the network ID.")
+
+    # These provisioning phrases always become BOOT programs even if the user
+    # did not explicitly say "at boot"; persistence is the requested semantic.
+    return CompileResult(source, intents[role], SCHED_BOOT, ir, a.finish(), warnings, provision=provision)
+
+
 def _compile_ndp_role_only(source: str, t: str, schedule: int, cfg: dict[str, Any]) -> CompileResult | None:
     """Lower a standalone NDP/BLE role control request.
 
@@ -1457,6 +2011,136 @@ class SemanticAST:
         }
 
 
+# B7.6f2m4 — natural machine-state/anomaly semantics.
+def _vib_machine_semantic_event(t: str) -> tuple[str, int, int] | None:
+    vibration_context = bool(re.search(
+        r"\b(?:vibracao|vibration|vibrat\w*)\b", t
+    ))
+    machine_context = bool(re.search(
+        r"\b(?:"
+        r"maquina|machine|equipamento|equipment|"
+        r"batedeira|mixer|lavadora|washer|washing\s+machine|"
+        r"motor|bomba|pump|compressor|ventilador|fan"
+        r")\b", t
+    ))
+
+    if vibration_context and re.search(
+        r"\b(?:anormal|anomalia|alarme|abnormal|anomaly|fault)\w*\b", t
+    ):
+        return ("VIB_AUTO.ALARM", EVENT_VIB_ALARM, 4)
+
+    if vibration_context and re.search(
+        r"\b(?:estranh\w*|suspeit\w*|irregular\w*|unusual|suspicious|odd)\b", t
+    ):
+        return ("VIB_AUTO.WARNING", EVENT_VIB_WARNING, 3)
+
+    if not machine_context:
+        return None
+
+    if re.search(
+        r"(?:"
+        r"(?:pare|parar|desative|desabilite|stop|disable|turn\s+off)"
+        r"[^.;]{0,48}(?:monitoramento|monitoring|vib[_ ]?auto|vibration\s+monitoring)"
+        r"|"
+        r"(?:monitoramento|monitoring|vib[_ ]?auto|vibration\s+monitoring)"
+        r"[^.;]{0,48}(?:pare|parar|desative|desabilite|stop|disable|turn\s+off)"
+        r")", t
+    ):
+        return None
+
+    machine_on = bool(
+        re.search(
+            r"(?:inici\w*|comec\w*|entr\w*)[^.;]{0,40}"
+            r"(?:funcion\w*|oper\w*|rodar|rodando|trabalhar|trabalhando)", t
+        )
+        or re.search(
+            r"\b(?:start|starts|started|begin|begins|began)[^.;]{0,24}"
+            r"(?:running|operating|working)\b", t
+        )
+        or re.search(r"\b(?:ligar|ligou|liga|turns?\s+on|turned\s+on)\b", t)
+    )
+    if machine_on:
+        return ("VIB_AUTO.MACHINE_ON", EVENT_VIB_MACHINE_ON, 1)
+
+    machine_off = bool(
+        re.search(
+            r"(?:par\w*|termin\w*|finaliz\w*|deslig\w*)[^.;]{0,40}"
+            r"(?:funcion\w*|oper\w*|rodar|rodando|trabalhar|trabalhando)?", t
+        )
+        or re.search(
+            r"\b(?:stop|stops|stopped|finish|finishes|finished|end|ends|ended)"
+            r"[^.;]{0,24}(?:running|operating|working)?\b", t
+        )
+        or re.search(r"\b(?:turns?\s+off|turned\s+off|shuts?\s+down|shut\s+down)\b", t)
+    )
+    if machine_off:
+        return ("VIB_AUTO.MACHINE_OFF", EVENT_VIB_MACHINE_OFF, 5)
+
+    return None
+
+
+def _compile_vib_machine_ha_event(
+    source: str,
+    t: str,
+    schedule: int,
+    cfg: dict[str, Any],
+) -> CompileResult | None:
+    semantic = _vib_machine_semantic_event(t)
+    if semantic is None:
+        return None
+
+    if not re.search(r"\b(?:home\s+assistant|ha)\b", t):
+        return None
+    if re.search(r"\b(?:lora|ninalink|bridge|gateway|ponte)\b", t):
+        return None
+    if not re.search(
+        r"\b(?:avise|avisar|notifique|notificar|alerta|alerte|"
+        r"notify|notification|message|mensagem|telegram|evento|event)\b", t
+    ):
+        return None
+
+    event_name, event_code, app_operation = semantic
+
+    a = Assembler()
+    ir: list[str] = []
+
+    a.emit(OP_HA_ROLE_CONFIG, 1)
+    ir.append("HA ROLE DIRECT_BLE PERSIST")
+    a.wait_s(1)
+    ir.append("WAIT 1s")
+
+    a.emit(OP_VIB_AUTO_START, 0)
+    ir.append("VIB_AUTO START")
+
+    a.label("vib_monitor")
+    ir.append("LABEL VIB_MONITOR")
+
+    a.emit(OP_WAIT_EVENT, event_code, 6, 7)
+    ir.append(f"WAIT_EVENT {event_name}")
+
+    a.emit(OP_APP_EVENT_SEND, 13, app_operation, 7)
+    ir.append(f"HA EVENT cap=13 op={app_operation} value=R7")
+
+    a.jmp("vib_monitor")
+    ir.append("JMP VIB_MONITOR")
+
+    a.emit(OP_END)
+    ir.append("END")
+
+    return CompileResult(
+        source,
+        "vib-auto-machine-ha-event",
+        schedule,
+        ir,
+        a.finish(),
+        [
+            "VIB_AUTO remains enabled and waits for the next semantic vibration event.",
+            "Telegram is HA-side intent only; the device emits an HA event.",
+            f"Natural wording mapped deterministically to {event_name}.",
+        ],
+    )
+
+
 def parse_semantic_ast(source: str, force_boot: bool = False) -> SemanticAST:
     """R3.8.16b generic clause/entity pass.
 
@@ -1494,6 +2178,17 @@ def parse_semantic_ast(source: str, force_boot: bool = False) -> SemanticAST:
         if re.search(r"warning|aviso", t): events.append("VIB_AUTO.WARNING")
         if re.search(r"comec(?:ar|ou)|começar|entrou em funcionamento|maquina ligar|máquina ligar", t): events.append("VIB_AUTO.MACHINE_ON")
         if re.search(r"maquina (?:deslig|par)|máquina (?:deslig|par)|quando ela parar", t): events.append("VIB_AUTO.MACHINE_OFF")
+
+
+    # B7.6f2m4: infer VIB_AUTO semantics from product language even when the
+    # user never names VIB_AUTO explicitly.
+    _natural_vib = _vib_machine_semantic_event(t)
+    if _natural_vib is not None:
+        if not any(a.get("op") == "vib_auto.start" for a in actions):
+            actions.append({"op":"vib_auto.start"})
+        caps.add("VIB_AUTO")
+        if _natural_vib[0] not in events:
+            events.append(_natural_vib[0])
 
     if re.search(r"movimento|movimentacao|movimentação|motion", t):
         caps.add("ACCEL_MOTION")
@@ -1666,11 +2361,7 @@ def _compile_lora_counter_stream(source: str, t: str, schedule: int, cfg: dict[s
         if m: period=_parse_seconds_fragment((m.group(1) or "1")+m.group(2))
     if period is None or period <= 0:
         raise UnsupportedSemantics("periodic LoRa counter needs a cadence, e.g. 'a cada 20 segundos'")
-    prefix = "COUNT="
-    # Respect a quoted prefix when supplied, e.g. mensagem "CONTADOR=" com contador.
-    q=re.search(r'["\']([^"\']*)["\']', source)
-    if q and len(q.group(1).encode("utf-8")) <= 48:
-        prefix=q.group(1)
+    prefix = _counter_format_prefix(source, "COUNT=")
     raw=prefix.encode("utf-8")
     a=Assembler(); ir=[]
     if _ndp_off_requested(t):
@@ -2301,6 +2992,76 @@ def _certify_standalone_result(source: str, result: CompileResult, meta: dict[st
     meta["semantic_certified"]=True
     return result,meta
 
+
+# B7.6f2g4a-v2 native HA cadence certification wrapper
+_certify_standalone_result_b76f2g4_base = _certify_standalone_result
+
+
+def _b76f2g4_certificate_source_without_native_ha_cadence(source: str) -> str:
+    """Remove only the native HA-node cadence from certificate input."""
+    patterns = (
+        r"\b(?:a\s+cada|cada|every)\s+\d+\s*"
+        r"(?:segundos?|secs?|seconds?|s|minutos?|mins?|minutes?|m|horas?|hours?|h)\b",
+        r"\b(?:intervalo|interval|periodicidade|periodo|period)\b"
+        r"[^;,.]{0,24}?(?:\bde\b|\bof\b|=)?\s*\d+\s*"
+        r"(?:segundos?|secs?|seconds?|s|minutos?|mins?|minutes?|m|horas?|hours?|h)\b",
+    )
+    out = source
+    for pattern in patterns:
+        out = re.sub(pattern, " ", out, flags=re.I)
+    return re.sub(r"\s+", " ", out).strip()
+
+
+def _certify_standalone_result(source, result, meta):
+    """Certify native HA cadence without pretending it is a VM WAIT loop."""
+    native_ha = (
+        (
+            getattr(result, "intent", None) == "ha-transport-lora-node"
+            or str(getattr(result, "intent", "")).startswith("hall-semantic-volume-ninalink")
+        )
+        and any(
+            str(item).startswith("HA ROLE NINALINK_NODE PERSIST interval=")
+            for item in getattr(result, "ir", ())
+        )
+    )
+
+    if not native_ha:
+        return _certify_standalone_result_b76f2g4_base(source, result, meta)
+
+    try:
+        return _certify_standalone_result_b76f2g4_base(source, result, meta)
+    except UnsupportedSemantics as exc:
+        message = str(exc)
+        if (
+            "STANDALONE_SEMANTIC_CERTIFICATION_FAILED" not in message
+            or "periodic loop/wait" not in message
+        ):
+            raise
+
+        cert_source = _b76f2g4_certificate_source_without_native_ha_cadence(
+            source
+        )
+        cert_meta = dict(meta) if isinstance(meta, dict) else meta
+
+        if isinstance(cert_meta, dict):
+            try:
+                cert_ast = parse_semantic_ast(
+                    cert_source,
+                    force_boot=(
+                        getattr(result, "schedule_name", "") == "BOOT"
+                    ),
+                )
+                cert_meta["ast"] = cert_ast.to_dict()
+            except Exception:
+                pass
+
+        return _certify_standalone_result_b76f2g4_base(
+            cert_source,
+            result,
+            cert_meta,
+        )
+
+
 def compile_hybrid(source: str, force_boot: bool = False) -> tuple[CompileResult, dict[str, Any]]:
     if not source or not source.strip(): raise TextCompileError("empty prompt")
     lang=canonicalize_to_english(source)
@@ -2321,6 +3082,23 @@ def compile_hybrid(source: str, force_boot: bool = False) -> tuple[CompileResult
         meta["route"]="semantic-goal"; meta["language_route"]="goal-resolver"; meta["family"]=power_result.intent
         meta["semantic_goal"]={"goal":"MINIMUM_POWER_TEST","schedule":"BOOT","preserve":["P0.21"]}
         return _certify_standalone_result(source,power_result,meta)
+
+    # B7.6f2l5: protect the counter+RSSI relay from the generic beacon/action
+    # fallbacks.  This composition was already supported by the VM ABI and must
+    # be resolved before a long natural-language sentence can be mistaken for a
+    # static BLE local name.
+    relay_candidates=[source]
+    if _fold(canonical_source) != _fold(source):
+        relay_candidates.append(canonical_source)
+    for relay_source in relay_candidates:
+        relay_t=_fold(relay_source)
+        relay_schedule=SCHED_BOOT if (force_boot or _is_boot(relay_t)) else SCHED_MANUAL
+        relay_result=_compile_lora_counter_rssi_beacon(relay_source,relay_t,relay_schedule,cfg)
+        if relay_result is not None:
+            relay_result.source=source
+            meta["route"]="semantic-goal"; meta["language_route"]="counter-rssi-relay"; meta["family"]=relay_result.intent
+            return _certify_standalone_result(source,relay_result,meta)
+
     action_plan=parse_action_plan(canonical_source)
     meta["action_plan"]=action_plan.to_dict()
     action_schedule=SCHED_BOOT if (force_boot or _is_boot(_fold(canonical_source))) else SCHED_MANUAL
@@ -2328,7 +3106,7 @@ def compile_hybrid(source: str, force_boot: bool = False) -> tuple[CompileResult
     if action_result is not None:
         meta["route"]="action-graph"; meta["language_route"]="canonical-en"; meta["family"]=action_result.intent
         return _certify_standalone_result(source,action_result,meta)
-    lowerers=(_compile_landing_motion_tracking,_compile_landing_motion_beacon,_compile_landing_vibration_ha,_compile_temperature_ble_beacon,_compile_vib_auto_lora_beacon,_compile_vib_auto_event_cfg,_compile_fall_event_cfg,_compile_gpio_change_counter_threshold,_compile_hall_counter_ble_lora,_compile_serial_parse_compare_gpio,_compile_gpio_compare_app_else_wait,_compile_battery_to_beacon,_compile_lora_rx_to_beacon,_compile_beacon_temp_lora_tracking,_compile_lora_test_boot,_compile_lora_counter_stream,_compile_minpower_hall_battery_lora,_compile_temp_battery_periodic_lora,_compile_gpio_high_temp_battery_lora,_compile_lora_temperature_stream,
+    lowerers=(_compile_vib_machine_ha_event,_compile_hall_semantic_volume,_compile_ha_transport_role,_compile_landing_motion_tracking,_compile_landing_motion_beacon,_compile_landing_vibration_ha,_compile_temperature_ble_beacon,_compile_vib_auto_lora_beacon,_compile_vib_auto_event_cfg,_compile_fall_event_cfg,_compile_gpio_change_counter_threshold,_compile_hall_counter_ble_lora,_compile_serial_parse_compare_gpio,_compile_gpio_compare_app_else_wait,_compile_battery_to_beacon,_compile_lora_counter_rssi_beacon,_compile_lora_rx_to_beacon,_compile_beacon_temp_lora_tracking,_compile_lora_test_boot,_compile_lora_counter_stream,_compile_minpower_hall_battery_lora,_compile_temp_battery_periodic_lora,_compile_gpio_high_temp_battery_lora,_compile_lora_temperature_stream,
               _compile_vib_config_alarm_lora,_compile_vib_auto_config_start,_compile_vib_alarm_battery_lora,
               _compile_vib_alarm_lora_alert,_compile_lora_battery_stream,
               _compile_lora_rx_serial_bridge,_compile_ndp_motion_ha,

@@ -1,4 +1,5 @@
 #include "nrfclaw_vm.h"
+#include "nrfclaw_ninalink_telemetry.h"
 #include "nrfclaw_opcodes.h"
 #include "nrfclaw_rtc.h"
 #include "nrfclaw_battery.h"
@@ -12,11 +13,14 @@
 #include "nrfclaw_tracking.h"
 #include "nrfclaw_ble_app.h"
 #include "nrfclaw_ds18b20.h"
+#include "nrfclaw_temperature.h"
 #include "nrfclaw_vib_health.h"
 #include "nrfclaw_vib_auto.h"
 #include "nrfclaw_system_power.h"
-
-#include "SEGGER_RTT.h"
+#include "nrfclaw_ha_role.h"
+#include "nrfclaw_ha_ninalink_node.h"
+#include "nrfclaw_capability.h"
+#include "nrfclaw_vm_semantic_state.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -72,6 +76,19 @@ static uint8_t m_pending_event_type;
 static uint8_t m_pending_event_reg0;
 static uint8_t m_pending_event_reg1;
 static nrfclaw_vm_notify_handler_t m_notify_handler;
+
+/* B7.6f2l3 semantic accumulator ownership. Persistent user-state load/save
+ * binds one state key to a VM register; SEMANTIC_PUBLISH snapshots that
+ * binding. This lets HA reset the retained accumulator generically instead of
+ * hard-coding the current compiler's state[15]/R1 choice. */
+static bool m_reg_state_key_valid[VM_REG_COUNT];
+static uint8_t m_reg_state_key[VM_REG_COUNT];
+static bool m_semantic_accumulator_bound;
+static uint8_t m_semantic_accumulator_reg;
+static uint8_t m_semantic_accumulator_key;
+static uint16_t m_semantic_accumulator_capability;
+static uint8_t m_semantic_accumulator_channel;
+static bool m_semantic_reset_restart_pending;
 
 /* R3.8.16a generic VM scratch buffer. It decouples producers (formatters,
  * LoRa RX) from consumers (LoRa TX, UART TX, BLE advertiser). */
@@ -263,17 +280,10 @@ static uint16_t crc16_ccitt(uint8_t const *data, uint16_t len)
 
 static void vm_error(char const *msg)
 {
-    char line[112];
-
-    snprintf(line, sizeof(line),
-             "VM ERROR: %s state=%u pc=%u\r\n",
-             msg ? msg : "unknown",
-             (unsigned)m_state,
-             (unsigned)m_pc);
-
-    SEGGER_RTT_WriteString(0, line);
+    (void)msg;
     m_state = NRFCLAW_VM_ERROR;
 }
+
 
 /* Validate the complete bytecode before it can become executable.
  * The validator never executes opcodes or touches hardware. */
@@ -456,6 +466,12 @@ static bool validate_program(uint8_t const *code, uint16_t len)
                 pc += 2U;
                 break;
 
+            case OP_PERSIST_LOAD_DEFAULT:
+                if ((uint16_t)(pc + 6U) > len || code[pc] >= NRFCLAW_STATE_USER_COUNT || code[pc+1U] >= VM_REG_COUNT)
+                    return false;
+                pc = (uint16_t)(pc + 6U);
+                break;
+
             case OP_GPIO_WRITE_IMM:
                 if ((uint16_t)(pc + 2U) > len) return false;
                 pc += 2U;
@@ -615,6 +631,7 @@ static bool validate_program(uint8_t const *code, uint16_t len)
                 break;
             }
 
+            case OP_LORA_LAST_RSSI:
             case OP_PARSE_BUF_I32:
                 if (pc >= len || code[pc] >= VM_REG_COUNT) return false;
                 pc += 1U;
@@ -643,6 +660,94 @@ static bool validate_program(uint8_t const *code, uint16_t len)
                 uint8_t plen = code[pc++];
                 if (plen == 0U || plen > 48U || (uint16_t)(pc + plen) > len) return false;
                 pc = (uint16_t)(pc + plen);
+                break;
+            }
+
+            /* B4.12 fixed-phase NinaLink telemetry config. */
+            case OP_NINALINK_TELEMETRY_SYNTH: {
+                uint16_t period_s, window_ms, backoff_ms;
+                uint8_t attempts;
+                int32_t temperature_mC;
+                if ((uint16_t)(pc + 11U) > len) return false;
+                period_s=(uint16_t)code[pc]|((uint16_t)code[pc+1U]<<8);
+                window_ms=(uint16_t)code[pc+2U]|((uint16_t)code[pc+3U]<<8);
+                attempts=code[pc+4U];
+                backoff_ms=(uint16_t)code[pc+5U]|((uint16_t)code[pc+6U]<<8);
+                temperature_mC=(int32_t)((uint32_t)code[pc+7U]|((uint32_t)code[pc+8U]<<8)|((uint32_t)code[pc+9U]<<16)|((uint32_t)code[pc+10U]<<24));
+                if (period_s<5U || period_s>300U || window_ms<100U || window_ms>4000U || attempts==0U || attempts>5U || (attempts>1U && (backoff_ms==0U || backoff_ms>4000U)) || temperature_mC<-55000L || temperature_mC>125000L) return false;
+                pc=(uint16_t)(pc+11U); break;
+            }
+
+            case OP_NINALINK_TELEMETRY: {
+                uint16_t period_s;
+                uint16_t window_ms;
+                uint8_t attempts;
+                uint16_t backoff_ms;
+
+                if ((uint16_t)(pc + 7U) > len)
+                    return false;
+
+                period_s = (uint16_t)code[pc] |
+                    ((uint16_t)code[pc + 1U] << 8);
+                window_ms = (uint16_t)code[pc + 2U] |
+                    ((uint16_t)code[pc + 3U] << 8);
+                attempts = code[pc + 4U];
+                backoff_ms = (uint16_t)code[pc + 5U] |
+                    ((uint16_t)code[pc + 6U] << 8);
+
+                if (period_s < 5U || period_s > 300U ||
+                    window_ms < 100U || window_ms > 4000U ||
+                    attempts == 0U || attempts > 5U ||
+                    (attempts > 1U &&
+                     (backoff_ms == 0U || backoff_ms > 4000U)))
+                    return false;
+
+                pc = (uint16_t)(pc + 7U);
+                break;
+            }
+
+            case OP_HA_ROLE_CONFIG:
+                if (pc >= len || code[pc] > NRFCLAW_HA_ROLE_BRIDGE)
+                    return false;
+                pc += 1U;
+                break;
+
+            case OP_HA_NINALINK_NODE_CONFIG: {
+                uint16_t period_s;
+                if ((uint16_t)(pc + 2U) > len)
+                    return false;
+                period_s = (uint16_t)code[pc] |
+                    ((uint16_t)code[pc + 1U] << 8);
+                if (period_s < NRFCLAW_HA_NODE_MIN_PERIOD_S ||
+                    period_s > NRFCLAW_HA_NODE_MAX_PERIOD_S)
+                    return false;
+                pc = (uint16_t)(pc + 2U);
+                break;
+            }
+
+            case OP_LORA_PROFILE_PERSIST: {
+                uint8_t mask;
+                if ((uint16_t)(pc + 10U) > len)
+                    return false;
+                mask = code[pc];
+                if (mask == 0U || (mask & 0xE0U) != 0U)
+                    return false;
+                pc = (uint16_t)(pc + 10U);
+                break;
+            }
+
+            case OP_SEMANTIC_PUBLISH: {
+                nrfclaw_capability_desc_t d;
+                uint16_t cap;
+                if ((uint16_t)(pc + 4U) > len || code[pc + 3U] >= VM_REG_COUNT)
+                    return false;
+                cap = (uint16_t)code[pc] | ((uint16_t)code[pc + 1U] << 8);
+                if (!nrfclaw_capability_descriptor(cap, code[pc + 2U], &d))
+                    return false;
+                if ((d.behavior_flags & (NRFCLAW_CAP_BEHAVIOR_REPORTABLE | NRFCLAW_CAP_BEHAVIOR_RETAINED)) !=
+                    (NRFCLAW_CAP_BEHAVIOR_REPORTABLE | NRFCLAW_CAP_BEHAVIOR_RETAINED))
+                    return false;
+                pc = (uint16_t)(pc + 4U);
                 break;
             }
 
@@ -746,9 +851,18 @@ static void runtime_reset(void)
 {
     m_pc = 0;
     memset(m_reg, 0, sizeof(m_reg));
+    memset(m_reg_state_key_valid, 0, sizeof(m_reg_state_key_valid));
+    memset(m_reg_state_key, 0, sizeof(m_reg_state_key));
+    m_semantic_accumulator_bound = false;
+    m_semantic_accumulator_reg = 0U;
+    m_semantic_accumulator_key = 0U;
+    m_semantic_accumulator_capability = 0U;
+    m_semantic_accumulator_channel = 0U;
+    m_semantic_reset_restart_pending = false;
     memset(m_buffer, 0, sizeof(m_buffer));
     m_buffer_len = 0U;
     m_app_event_pending = false;
+    nrfclaw_vm_semantic_state_clear();
     m_pending_battery_reg = 0;
     m_pending_hall_reg = 0;
     m_pending_event_type = 0;
@@ -826,7 +940,47 @@ bool nrfclaw_vm_run_loaded(void)
     runtime_reset();
     m_state = NRFCLAW_VM_READY;
 
-    SEGGER_RTT_WriteString(0, "VM: loaded program RUN\r\n");
+    ((void)0);
+    return true;
+}
+
+
+/* B7.6f2l3: reset the currently published retained accumulator. The VM is
+ * paused while the state journal commits zero, then the loaded program is
+ * restarted so it reloads zero and cannot resurrect the pre-reset RAM value
+ * on the next physical event. */
+bool nrfclaw_vm_semantic_accumulator_resettable(void)
+{
+    nrfclaw_vm_semantic_state_t semantic;
+    if (!m_semantic_accumulator_bound ||
+        m_semantic_accumulator_reg >= VM_REG_COUNT ||
+        m_semantic_accumulator_key >= NRFCLAW_STATE_USER_COUNT ||
+        !nrfclaw_vm_semantic_state_snapshot(&semantic))
+        return false;
+    return semantic.capability_id == m_semantic_accumulator_capability &&
+           semantic.channel == m_semantic_accumulator_channel;
+}
+
+bool nrfclaw_vm_semantic_accumulator_reset(void)
+{
+    if (!nrfclaw_vm_semantic_accumulator_resettable() ||
+        nrfclaw_state_status() != NRFCLAW_STATE_IDLE)
+        return false;
+    /* nrfclaw_state_persist() returns false when it has to start page
+     * compaction, even though the new RAM value is already installed and the
+     * compaction will persist it.  From an IDLE precondition, SAVING therefore
+     * also means the reset was accepted. */
+    if (!nrfclaw_state_persist(m_semantic_accumulator_key, 0U) &&
+        nrfclaw_state_status() != NRFCLAW_STATE_SAVING)
+        return false;
+
+    /* Stop before another physical event can consume the old accumulator.
+     * The retained semantic value is intentionally republished by the BOOT
+     * program only after the Flash transaction commits, making the observable
+     * zero and the persisted zero one atomic behavioral transition. */
+    m_reg[m_semantic_accumulator_reg] = 0U;
+    m_semantic_reset_restart_pending = true;
+    m_state = NRFCLAW_VM_STOPPED;
     return true;
 }
 
@@ -851,11 +1005,7 @@ bool nrfclaw_vm_install_program(uint8_t const *program,
     runtime_reset();
     m_state = NRFCLAW_VM_STOPPED;
 
-    SEGGER_RTT_printf(
-        0,
-        "VM: recovered persistent program len=%u\r\n",
-        (unsigned)len
-    );
+    ((void)0);
 
     return true;
 }
@@ -1054,10 +1204,7 @@ nrfclaw_upload_result_t nrfclaw_vm_upload_finish(void)
         &m_upload_schedule
     );
 
-    SEGGER_RTT_WriteString(
-        0,
-        "VM: authenticated program validated, RAM loaded, Flash commit pending\r\n"
-    );
+    ((void)0);
 
     return NRFCLAW_UPLOAD_OK;
 }
@@ -1145,7 +1292,7 @@ void nrfclaw_vm_on_event(nrfclaw_event_t const *e)
         return;
     }
 
-    if (e->type == NRFCLAW_EVT_DS18B20_DONE &&
+    if (e->type == NRFCLAW_EVT_TEMPERATURE_DONE &&
         m_state == NRFCLAW_VM_WAIT_DS18B20) {
         if (m_pending_ds18_reg >= VM_REG_COUNT) { vm_error("invalid DS18 destination register"); return; }
         m_reg[m_pending_ds18_reg] = e->arg0;
@@ -1215,6 +1362,21 @@ void nrfclaw_vm_on_event(nrfclaw_event_t const *e)
  * ------------------------------------------------------------------------- */
 void nrfclaw_vm_tick(void)
 {
+    if (m_semantic_reset_restart_pending) {
+        if (nrfclaw_state_status() == NRFCLAW_STATE_ERROR) {
+            m_semantic_reset_restart_pending = false;
+            m_state = NRFCLAW_VM_ERROR;
+            return;
+        }
+        if (nrfclaw_state_status() != NRFCLAW_STATE_IDLE)
+            return;
+        m_semantic_reset_restart_pending = false;
+        if (!nrfclaw_vm_run_loaded()) {
+            m_state = NRFCLAW_VM_ERROR;
+            return;
+        }
+    }
+
     app_event_try_send();
     uint8_t steps = 0;
 
@@ -1230,7 +1392,7 @@ void nrfclaw_vm_tick(void)
         switch (op) {
             case OP_END:
                 m_state = NRFCLAW_VM_DONE;
-                SEGGER_RTT_WriteString(0, "VM=DONE\r\n");
+                ((void)0);
                 return;
 
             case OP_MOV: {
@@ -1473,11 +1635,6 @@ void nrfclaw_vm_tick(void)
                     vm_error("invalid DEBUG_I32 register");
                     return;
                 }
-
-                char msg[64];
-                snprintf(msg, sizeof(msg), "VM: R%u=%ld\r\n",
-                         reg, (long)(int32_t)m_reg[reg]);
-                SEGGER_RTT_WriteString(0, msg);
                 break;
             }
 
@@ -1522,7 +1679,7 @@ void nrfclaw_vm_tick(void)
                          reg,
                          (unsigned long)(cv / 100U),
                          (unsigned long)(cv % 100U));
-                SEGGER_RTT_WriteString(0, msg);
+                ((void)0);
                 break;
             }
 
@@ -1623,6 +1780,8 @@ void nrfclaw_vm_tick(void)
                 if (key>=NRFCLAW_STATE_USER_COUNT || reg>=VM_REG_COUNT || !nrfclaw_state_persist(key,m_reg[reg])) {
                     vm_error("PERSIST_SAVE busy/rejected"); return;
                 }
+                m_reg_state_key_valid[reg] = true;
+                m_reg_state_key[reg] = key;
                 break;
             }
 
@@ -1633,6 +1792,34 @@ void nrfclaw_vm_tick(void)
                     vm_error("PERSIST_LOAD unavailable"); return;
                 }
                 m_reg[reg]=value;
+                m_reg_state_key_valid[reg] = true;
+                m_reg_state_key[reg] = key;
+                break;
+            }
+
+            case OP_PERSIST_LOAD_DEFAULT: {
+                uint8_t key, reg;
+                uint32_t value, fallback;
+                if ((uint16_t)(m_pc + 6U) > m_code_len) { vm_error("truncated PERSIST_LOAD_DEFAULT"); return; }
+                key = m_code[m_pc++];
+                reg = m_code[m_pc++];
+                fallback = (uint32_t)m_code[m_pc] |
+                           ((uint32_t)m_code[m_pc + 1U] << 8) |
+                           ((uint32_t)m_code[m_pc + 2U] << 16) |
+                           ((uint32_t)m_code[m_pc + 3U] << 24);
+                m_pc = (uint16_t)(m_pc + 4U);
+                if (key >= NRFCLAW_STATE_USER_COUNT || reg >= VM_REG_COUNT) {
+                    vm_error("PERSIST_LOAD_DEFAULT bad operand"); return;
+                }
+                if (!nrfclaw_state_get(key, &value)) {
+                    value = fallback;
+                    if (!nrfclaw_state_set(key, value)) {
+                        vm_error("PERSIST_LOAD_DEFAULT rejected"); return;
+                    }
+                }
+                m_reg[reg] = value;
+                m_reg_state_key_valid[reg] = true;
+                m_reg_state_key[reg] = key;
                 break;
             }
 
@@ -1720,7 +1907,7 @@ void nrfclaw_vm_tick(void)
                  * temperature API remains available to NDP and diagnostics,
                  * but must not short-circuit VM acquisition.
                  */
-                if(!nrfclaw_ds18b20_start()){vm_error("DS18 unavailable");return;}
+                if(!nrfclaw_temperature_start()){vm_error("temperature unavailable");return;}
                 m_pending_ds18_reg=reg;
                 m_state=NRFCLAW_VM_WAIT_DS18B20;
                 return;
@@ -2205,6 +2392,29 @@ void nrfclaw_vm_tick(void)
                 break;
             }
 
+            case OP_LORA_LAST_RSSI: {
+                if (m_pc >= m_code_len) {
+                    vm_error("truncated LORA_LAST_RSSI");
+                    return;
+                }
+                uint8_t reg = m_code[m_pc++];
+                int16_t rssi_x2 = 0;
+                int16_t snr_x4 = 0;
+                if (reg >= VM_REG_COUNT ||
+                    !nrfclaw_lora_get_last_packet_status(&rssi_x2, &snr_x4)) {
+                    vm_error("LORA_LAST_RSSI unavailable");
+                    return;
+                }
+
+                /*
+                 * Driver stores RSSI as signed dBm*2. For compact beacon text,
+                 * expose whole signed dBm. Sub-dB precision is intentionally
+                 * discarded.
+                 */
+                m_reg[reg] = (uint32_t)((int32_t)rssi_x2 / 2L);
+                break;
+            }
+
             case OP_PARSE_BUF_I32: {
                 if (m_pc>=m_code_len) { vm_error("truncated PARSE_BUF_I32"); return; }
                 uint8_t reg=m_code[m_pc++]; int32_t v=0;
@@ -2240,6 +2450,131 @@ void nrfclaw_vm_tick(void)
                 memcpy(m_buffer, &m_code[m_pc], plen);
                 m_pc = (uint16_t)(m_pc + plen);
                 m_buffer_len = (uint8_t)(m_buffer_len + plen);
+                break;
+            }
+
+            case OP_NINALINK_TELEMETRY_SYNTH: {
+                uint16_t period_s, window_ms, backoff_ms;
+                uint8_t attempts;
+                int32_t temperature_mC;
+                if ((uint16_t)(m_pc + 11U) > m_code_len) { vm_error("truncated NINALINK_TELEMETRY_SYNTH"); return; }
+                period_s=(uint16_t)m_code[m_pc]|((uint16_t)m_code[m_pc+1U]<<8);
+                window_ms=(uint16_t)m_code[m_pc+2U]|((uint16_t)m_code[m_pc+3U]<<8);
+                attempts=m_code[m_pc+4U];
+                backoff_ms=(uint16_t)m_code[m_pc+5U]|((uint16_t)m_code[m_pc+6U]<<8);
+                temperature_mC=(int32_t)((uint32_t)m_code[m_pc+7U]|((uint32_t)m_code[m_pc+8U]<<8)|((uint32_t)m_code[m_pc+9U]<<16)|((uint32_t)m_code[m_pc+10U]<<24));
+                m_pc=(uint16_t)(m_pc+11U);
+                if (!nrfclaw_ninalink_telemetry_start_synthetic(period_s,window_ms,attempts,backoff_ms,temperature_mC)) { vm_error("NINALINK synthetic telemetry start rejected"); return; }
+                break;
+            }
+
+            case OP_NINALINK_TELEMETRY: {
+                uint16_t period_s;
+                uint16_t window_ms;
+                uint8_t attempts;
+                uint16_t backoff_ms;
+
+                if ((uint16_t)(m_pc + 7U) > m_code_len) {
+                    vm_error("truncated NINALINK_TELEMETRY");
+                    return;
+                }
+
+                period_s = (uint16_t)m_code[m_pc] |
+                    ((uint16_t)m_code[m_pc + 1U] << 8);
+                window_ms = (uint16_t)m_code[m_pc + 2U] |
+                    ((uint16_t)m_code[m_pc + 3U] << 8);
+                attempts = m_code[m_pc + 4U];
+                backoff_ms = (uint16_t)m_code[m_pc + 5U] |
+                    ((uint16_t)m_code[m_pc + 6U] << 8);
+                m_pc = (uint16_t)(m_pc + 7U);
+
+                if (!nrfclaw_ninalink_telemetry_start(
+                        period_s,
+                        window_ms,
+                        attempts,
+                        backoff_ms)) {
+                    vm_error("NINALINK telemetry start rejected");
+                    return;
+                }
+                break;
+            }
+
+            case OP_HA_ROLE_CONFIG: {
+                if (m_pc >= m_code_len) {
+                    vm_error("truncated HA_ROLE_CONFIG");
+                    return;
+                }
+                nrfclaw_ha_role_t role = (nrfclaw_ha_role_t)m_code[m_pc++];
+                if (role > NRFCLAW_HA_ROLE_BRIDGE ||
+                    !nrfclaw_ha_role_configure(role)) {
+                    vm_error("HA role configuration rejected/busy");
+                    return;
+                }
+                break;
+            }
+
+            case OP_HA_NINALINK_NODE_CONFIG: {
+                uint16_t period_s;
+                if ((uint16_t)(m_pc + 2U) > m_code_len) {
+                    vm_error("truncated HA_NINALINK_NODE_CONFIG");
+                    return;
+                }
+                period_s = (uint16_t)m_code[m_pc] |
+                    ((uint16_t)m_code[m_pc + 1U] << 8);
+                m_pc = (uint16_t)(m_pc + 2U);
+                if (!nrfclaw_ha_role_configure_node(period_s)) {
+                    vm_error("HA NinaLink node interval rejected/busy");
+                    return;
+                }
+                break;
+            }
+
+            case OP_LORA_PROFILE_PERSIST: {
+                nrfclaw_lora_profile_t p;
+                nrfclaw_lora_profile_t current;
+                uint8_t mask;
+                uint32_t frequency_hz;
+                int8_t power_dbm;
+                uint8_t sf;
+                uint16_t bw_khz;
+                uint8_t cr;
+
+                if ((uint16_t)(m_pc + 10U) > m_code_len) {
+                    vm_error("truncated LORA_PROFILE_PERSIST");
+                    return;
+                }
+
+                mask = m_code[m_pc++];
+                frequency_hz = read_u32_le(&m_code[m_pc]); m_pc += 4U;
+                power_dbm = (int8_t)m_code[m_pc++];
+                sf = m_code[m_pc++];
+                bw_khz = (uint16_t)m_code[m_pc] |
+                    ((uint16_t)m_code[m_pc + 1U] << 8); m_pc += 2U;
+                cr = m_code[m_pc++];
+
+                if (mask == 0U || (mask & 0xE0U) != 0U) {
+                    vm_error("invalid LORA_PROFILE_PERSIST mask");
+                    return;
+                }
+
+                nrfclaw_lora_get_profile(&current);
+                p = current;
+                if (mask & 0x01U) p.frequency_hz = frequency_hz;
+                if (mask & 0x02U) p.power_dbm = power_dbm;
+                if (mask & 0x04U) p.sf = sf;
+                if (mask & 0x08U) p.bw_khz = bw_khz;
+                if (mask & 0x10U) p.cr = cr;
+
+                if (!nrfclaw_lora_profile_validate(&p)) {
+                    vm_error("persistent LoRa profile invalid");
+                    return;
+                }
+
+                if (memcmp(&p, &current, sizeof(p)) != 0 &&
+                    !nrfclaw_lora_set_profile_persist(&p)) {
+                    vm_error("persistent LoRa profile rejected/busy");
+                    return;
+                }
                 break;
             }
 
@@ -2292,15 +2627,15 @@ void nrfclaw_vm_tick(void)
             }
 
             case OP_DEBUG_BUFFER: {
-                SEGGER_RTT_printf(0, "VM BUFFER len=%u: ", (unsigned)m_buffer_len);
+                ((void)0);
                 for (uint8_t i = 0U; i < m_buffer_len; ++i)
-                    SEGGER_RTT_printf(0, "%02X ", m_buffer[i]);
-                SEGGER_RTT_WriteString(0, "\r\nVM BUFFER ASCII: ");
+                    ((void)0);
+                ((void)0);
                 for (uint8_t i = 0U; i < m_buffer_len; ++i) {
                     uint8_t c = m_buffer[i];
-                    SEGGER_RTT_PutChar(0, (c >= 32U && c <= 126U) ? (char)c : '.');
+                    ((void)0);
                 }
-                SEGGER_RTT_WriteString(0, "\r\n");
+                ((void)0);
                 break;
             }
 
@@ -2334,6 +2669,24 @@ void nrfclaw_vm_tick(void)
             case OP_BLE_APP_ROLE: {
                 if (m_pc>=m_code_len) { vm_error("truncated BLE_APP_ROLE"); return; }
                 uint8_t role=m_code[m_pc++];
+
+                /*
+                 * B7.6f2k3b: HA role NONE intentionally suspends the shared
+                 * Application/NDP advertising plane during boot.  A standalone
+                 * VM program that subsequently claims ADVERTISER/PERIPHERAL
+                 * ownership must therefore resume that plane explicitly before
+                 * selecting the role.  Without this, BLE_ADV_CONFIG succeeds
+                 * but BLE_ADV_START/BLE_ADV_BUF is rejected as BUSY and legacy
+                 * BOOT beacon programs never appear on air.
+                 *
+                 * Programming/P0.21 remains safe: opening NUS stops the VM and
+                 * suspends its scheduler before another opcode can execute.
+                 */
+                if (role == (uint8_t)NRFCLAW_BLE_APP_ADVERTISER ||
+                    role == (uint8_t)NRFCLAW_BLE_APP_PERIPHERAL) {
+                    nrfclaw_ble_app_resume();
+                }
+
                 if (nrfclaw_ble_app_set_role((nrfclaw_ble_app_role_t)role) != NRFCLAW_BLE_APP_OK) {
                     vm_error("BLE role rejected"); return;
                 }
@@ -2422,10 +2775,32 @@ void nrfclaw_vm_tick(void)
                 break;
             }
 
+            case OP_SEMANTIC_PUBLISH: {
+                uint16_t cap;
+                uint8_t channel, reg;
+                if ((uint16_t)(m_pc + 4U) > m_code_len) { vm_error("truncated SEMANTIC_PUBLISH"); return; }
+                cap = (uint16_t)m_code[m_pc] | ((uint16_t)m_code[m_pc + 1U] << 8);
+                channel = m_code[m_pc + 2U];
+                reg = m_code[m_pc + 3U];
+                m_pc += 4U;
+                if (reg >= VM_REG_COUNT) { vm_error("SEMANTIC_PUBLISH bad register"); return; }
+                if (!nrfclaw_vm_semantic_state_publish(cap, channel, m_reg[reg])) {
+                    vm_error("SEMANTIC_PUBLISH rejected"); return;
+                }
+                if (m_reg_state_key_valid[reg]) {
+                    m_semantic_accumulator_bound = true;
+                    m_semantic_accumulator_reg = reg;
+                    m_semantic_accumulator_key = m_reg_state_key[reg];
+                    m_semantic_accumulator_capability = cap;
+                    m_semantic_accumulator_channel = channel;
+                } else {
+                    m_semantic_accumulator_bound = false;
+                }
+                break;
+            }
+
             default: {
-                char msg[48];
-                snprintf(msg, sizeof(msg), "unknown opcode 0x%02X", op);
-                vm_error(msg);
+                vm_error(NULL);
                 return;
             }
         }

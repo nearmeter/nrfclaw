@@ -10,6 +10,7 @@
 void nrfclaw_ble_init(void);
 void nrfclaw_ble_programming_open(uint32_t seconds);
 void nrfclaw_ble_programming_close(void);
+void nrfclaw_ble_programming_release(void);
 bool nrfclaw_ble_is_connected(void);
 bool nrfclaw_ble_programming_active(void);
 void nrfclaw_ble_process(void);

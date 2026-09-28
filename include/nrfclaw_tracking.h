@@ -37,37 +37,6 @@ typedef struct
 } nrfclaw_tracking_info_t;
 
 
-typedef enum
-{
-    NRFCLAW_TRACK_DBG_NONE = 0,
-    NRFCLAW_TRACK_DBG_START_REQUESTED,
-    NRFCLAW_TRACK_DBG_JOURNAL_PENDING,
-    NRFCLAW_TRACK_DBG_INDEX_COMMITTED,
-    NRFCLAW_TRACK_DBG_KEY_DERIVED,
-    NRFCLAW_TRACK_DBG_ADV_STOP,
-    NRFCLAW_TRACK_DBG_ADDR_SET,
-    NRFCLAW_TRACK_DBG_ADV_CONFIGURE,
-    NRFCLAW_TRACK_DBG_TX_POWER,
-    NRFCLAW_TRACK_DBG_ADV_START,
-    NRFCLAW_TRACK_DBG_ACTIVE
-} nrfclaw_tracking_debug_stage_t;
-
-typedef struct
-{
-    uint8_t stage;
-    uint8_t start_pending;
-    uint8_t index_commit_pending;
-    uint8_t apply_pending;
-    uint8_t active;
-    uint8_t commit_state;
-    uint8_t journal_state;
-    uint8_t reserved;
-    uint32_t key_index;
-    uint32_t last_sd_error;
-} nrfclaw_tracking_debug_t;
-
-void nrfclaw_tracking_debug(nrfclaw_tracking_debug_t *debug);
-
 void nrfclaw_tracking_init(void);
 void nrfclaw_tracking_process(void);
 

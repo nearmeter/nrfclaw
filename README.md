@@ -96,17 +96,17 @@ The primary reference board is **NINASENSE**. Other nRF52832 boards can be suppo
 
 | Hardware | Capability |
 |---|---|
-| Nordic nRF52832 | MCU, BLE, VM, RTC, flash/state |
+| Nordic nRF52832 | MCU, BLE, VM, RTC, flash/state, internal die temperature fallback |
 | LLCC68 | LoRa TX/RX |
 | LIS2DH12 | Motion, TAP, FALL, vibration, VIB_AUTO |
-| DS18B20 | Temperature |
+| DS18B20 | Preferred external temperature source |
 | Battery measurement circuit | Battery telemetry |
 | Hall/reed inputs | Event, digital input and counting |
 | 32.768 kHz crystal | Accurate low-power timing |
 | UART pins | Serial TX/RX |
 | P0.21 button | Physical programming/recovery access |
 
-A board does not need every peripheral. Full capability requires the corresponding hardware to be fitted. For example, temperature requires DS18B20, vibration/FALL requires LIS2DH12, and LoRa requires LLCC68.
+A board does not need every peripheral. Full capability requires the corresponding hardware to be fitted. For example, external ambient-grade temperature uses DS18B20, while the nRF52832 internal die sensor remains available as a fallback; vibration/FALL requires LIS2DH12, and LoRa requires LLCC68.
 
 Current firmware capabilities include GPIO, battery, temperature, accelerometer, LoRa, BLE Application/NDP, RTC, Hall, persistent state, Serial, tracking and VIB_AUTO.
 

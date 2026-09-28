@@ -25,6 +25,8 @@ nrfclaw_hall_mode_t nrfclaw_hall_mode(void);
 int32_t nrfclaw_hall_position(void);
 uint32_t nrfclaw_hall_count(void);
 uint8_t nrfclaw_hall_channel(void);
+bool nrfclaw_hall_level(bool *level);
+void nrfclaw_hall_reset_value(void);
 void nrfclaw_hall_diag(uint8_t *hall1_pin,uint8_t *hall2_pin,uint32_t *hall1_rc,uint32_t *hall2_rc);
 
 /* Backward-compatible helper: enables quadrature. */

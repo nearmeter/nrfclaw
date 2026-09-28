@@ -16,7 +16,7 @@ from nrfclaw_hybrid_semantic import (
     OP_BLE_APP_ROLE, BLE_ROLE_OFF, BLE_ROLE_ADVERTISER, OP_BLE_ADV_CONFIG,
     OP_BLE_ADV_START, OP_BLE_ADV_NAME, OP_BLE_ADV_BUF, OP_TRACKING_CONFIG, OP_TRACKING_START,
     OP_TRACKING_STOP, OP_TRACKING_ROTATION_SET, OP_LORA_CONFIG,
-    OP_LORA_SEND_BYTES, OP_LORA_SEND_BUF, OP_LORA_RX_START,
+    OP_LORA_SEND_BYTES, OP_LORA_SEND_BUF, OP_LORA_RX_START, OP_LORA_LAST_RSSI,
     OP_SERIAL_CONFIG, OP_SERIAL_WRITE_BUF, OP_FORMAT_REG, OP_FORMAT_2REG, OP_PARSE_BUF_I32, OP_PARSE_BUF_FIXED, OP_FORMAT_REG_FIXED, OP_BUFFER_PREPEND, OP_BUFFER_SET, OP_WAIT_EVENT,
     OP_VIB_AUTO_START, OP_VIB_AUTO_STOP, OP_VIB_AUTO_CONFIG_TIME, OP_SYSTEM_MIN_POWER, OP_SERIAL_RX_BUF, OP_APP_SEND_BUF, OP_SERIAL_CONFIG_ECO, OP_WAIT_HALL, OP_APP_EVENT_SEND, OP_DEBUG_BUFFER,
     EVENT_ACCEL_MOTION, EVENT_VIB_MACHINE_ON, EVENT_VIB_WARNING,
@@ -62,6 +62,7 @@ GRAMMAR = r'''nRFClaw pseudo-code (one statement per line):
   LORA SEND "literal"
   LORA SEND BUFFER
   LORA RX -> BUFFER
+  LORA LAST RSSI -> R<n>
   SERIAL CONFIG tx=<pin> rx=<pin> baud=<baud> 8N1
   SERIAL CONFIG ECONOMY tx=<pin> rx=<pin> baud=<baud> 8N1
   SERIAL WRITE BUFFER
@@ -196,6 +197,8 @@ def compile_pseudo(text: str, force_boot: bool=False) -> CompileResult:
             a.emit(OP_LORA_SEND_BYTES,len(raw)); a.code+=raw; ir.append(s); continue
         if u=='LORA SEND BUFFER': a.emit(OP_LORA_SEND_BUF); ir.append(s); continue
         if u in ('LORA RX -> BUFFER','LORA RECEIVE -> BUFFER'): a.emit(OP_LORA_RX_START,1); ir.append(s); continue
+        m=re.fullmatch(r'LORA\s+LAST\s+RSSI\s*->\s*R([0-7])',s,re.I)
+        if m: a.emit(OP_LORA_LAST_RSSI,int(m.group(1))); ir.append(s); continue
         m=re.fullmatch(r'SERIAL\s+CONFIG\s+ECONOMY\s+tx\s*=\s*(?:D)?(\d+)\s+rx\s*=\s*(?:D)?(\d+)\s+(?:baud\s*=\s*)?(\d+)\s+8N1',s,re.I)
         if m:
             a.emit(OP_SERIAL_CONFIG_ECO,int(m.group(1)),int(m.group(2))); a.u32(int(m.group(3))); ir.append(s); continue

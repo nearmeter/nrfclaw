@@ -36,6 +36,7 @@ bool nrfclaw_llcc68_rl_finish_tx(void);
 
 /* Start one receive window. infinite=true uses SX126x RxContinuous. */
 bool nrfclaw_llcc68_rl_start_rx(bool infinite);
+bool nrfclaw_llcc68_rl_start_rx_ms(uint32_t timeout_ms);
 bool nrfclaw_llcc68_rl_rearm_rx(void);
 bool nrfclaw_llcc68_rl_finish_rx(void);
 

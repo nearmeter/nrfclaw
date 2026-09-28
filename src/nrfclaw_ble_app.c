@@ -11,8 +11,6 @@
 #include "nrf_error.h"
 #include "app_error.h"
 #include "app_timer.h"
-#include "SEGGER_RTT.h"
-
 #include <string.h>
 
 /*
@@ -38,6 +36,7 @@ static nrfclaw_ble_app_role_t m_role;
 static bool m_suspended;
 static bool m_adv_active;
 static bool m_notify_enabled;
+static uint32_t m_tx_generation;
 static uint16_t m_conn_handle;
 
 /*
@@ -60,6 +59,10 @@ static bool     m_adv_restart_pending;
 static bool     m_adv_restart_due;
 static uint32_t m_adv_restart_attempts;
 static uint32_t m_adv_last_sd_error;
+
+/* B7.6b: one-shot Direct-NDP disconnect policy. RAM only. */
+static bool m_next_disconnect_low_power;
+static bool m_adv_restart_low_power;
 
 /*
  * R2G R3.1 three-state adaptive advertising.
@@ -110,11 +113,7 @@ static void adv_adaptive_arm(uint32_t delay_ms)
     if (err != NRF_SUCCESS)
     {
         m_adv_adaptive_due = true;
-        SEGGER_RTT_printf(
-            0,
-            "BLE APP ADAPT: timer arm failed err=0x%08lX -> immediate process\r\n",
-            (unsigned long)err
-        );
+        ((void)0);
     }
 }
 
@@ -140,11 +139,7 @@ static void adv_restart_schedule(uint32_t delay_ms)
     {
         /* Never strand reconnect because the timer could not be armed. */
         m_adv_restart_due = true;
-        SEGGER_RTT_printf(
-            0,
-            "BLE APP: restart timer arm failed err=0x%08lX -> immediate process\r\n",
-            (unsigned long)err
-        );
+        ((void)0);
     }
 }
 
@@ -160,6 +155,13 @@ static uint16_t m_adv_interval_ms;
 static int8_t m_tx_power_dbm;
 static uint8_t m_user_payload[24];
 static uint8_t m_user_payload_len;
+/* B7.6d Direct Advertising Telemetry primary manufacturer payload. */
+#define DIRECT_TELEMETRY_MAX_LEN 19U
+static uint8_t m_direct_telemetry[DIRECT_TELEMETRY_MAX_LEN] = {
+    0x4EU, 0x43U, 0x02U
+};
+static uint8_t m_direct_telemetry_len = DIRECT_TELEMETRY_MAX_LEN;
+
 static uint8_t m_adv_name[24];
 static uint8_t m_adv_name_len;
 
@@ -215,6 +217,9 @@ static uint32_t service_init(void)
 
 void nrfclaw_ble_app_init(void)
 {
+    m_next_disconnect_low_power = false;
+    m_adv_restart_low_power = false;
+
     /*
      * S132/nRF52832: use the advertising set already allocated by the
      * programming/NUS layer. We intentionally never allocate a second set.
@@ -222,7 +227,7 @@ void nrfclaw_ble_app_init(void)
     m_adv_handle = nrfclaw_ble_shared_adv_handle();
 
     m_role=NRFCLAW_BLE_APP_OFF; m_suspended=false; m_adv_active=false;
-    m_notify_enabled=false; m_conn_handle=BLE_CONN_HANDLE_INVALID;
+    m_notify_enabled=false; m_tx_generation=0U; m_conn_handle=BLE_CONN_HANDLE_INVALID;
     m_adv_restart_pending=false; m_adv_restart_due=false;
     m_adv_restart_attempts=0U; m_adv_last_sd_error=NRF_SUCCESS;
     m_adv_adaptive_enabled=false; m_adv_adaptive_due=false;
@@ -248,12 +253,7 @@ void nrfclaw_ble_app_init(void)
      */
     uint32_t err = service_init();
 
-    SEGGER_RTT_printf(
-        0,
-        "BLE APP: service_init err=0x%08lX uuid_type=%u\r\n",
-        (unsigned long)err,
-        (unsigned)m_uuid_type
-    );
+    ((void)0);
 
     APP_ERROR_CHECK(err);
 
@@ -274,6 +274,9 @@ void nrfclaw_ble_app_init(void)
 
 void nrfclaw_ble_app_suspend(void)
 {
+    m_next_disconnect_low_power = false;
+    m_adv_restart_low_power = false;
+
     m_suspended=true;
     m_adv_restart_pending=false;
     m_adv_restart_due=false;
@@ -296,6 +299,19 @@ void nrfclaw_ble_app_resume(void)
     }
 }
 bool nrfclaw_ble_app_is_suspended(void){return m_suspended;}
+
+bool nrfclaw_ble_app_next_disconnect_low_power(void)
+{
+    if (m_suspended ||
+        m_role != NRFCLAW_BLE_APP_PERIPHERAL ||
+        m_conn_handle == BLE_CONN_HANDLE_INVALID)
+        return false;
+
+    m_next_disconnect_low_power = true;
+    ((void)0);
+    return true;
+}
+
 bool nrfclaw_ble_app_connected(void){return m_conn_handle!=BLE_CONN_HANDLE_INVALID;}
 
 nrfclaw_ble_app_status_t nrfclaw_ble_app_set_role(nrfclaw_ble_app_role_t role)
@@ -358,15 +374,7 @@ nrfclaw_ble_app_status_t nrfclaw_ble_app_adaptive_config(uint16_t fast_interval_
     m_adv_adaptive_state = APP_ADV_ADAPT_FAST;
     m_adv_interval_ms = m_adv_fast_interval_ms;
 
-    SEGGER_RTT_printf(
-        0,
-        "BLE APP ADAPT: configured FAST=%u/%lu ms NORMAL=%u/%lu ms SLOW=%u ms\r\n",
-        (unsigned)m_adv_fast_interval_ms,
-        (unsigned long)m_adv_fast_window_ms,
-        (unsigned)m_adv_normal_interval_ms,
-        (unsigned long)m_adv_normal_window_ms,
-        (unsigned)m_adv_slow_interval_ms
-    );
+    ((void)0);
 
     return NRFCLAW_BLE_APP_OK;
 }
@@ -390,30 +398,66 @@ nrfclaw_ble_app_status_t nrfclaw_ble_app_adv_name(const uint8_t *name,uint8_t le
 uint16_t nrfclaw_ble_app_adv_interval_ms(void){return m_adv_interval_ms;}
 int8_t nrfclaw_ble_app_adv_tx_power_dbm(void){return m_tx_power_dbm;}
 
-nrfclaw_ble_app_status_t nrfclaw_ble_app_beacon_config(uint16_t interval_ms,int8_t tx_power_dbm)
+
+
+
+bool nrfclaw_ble_app_telemetry_can_publish_now(void)
 {
-    /* Small manufacturer payload: 'N','C', protocol version. Device address
-     * remains visible in every advertising report and avoids wasting legacy
-     * 31-byte advertising space on a duplicated identifier. */
-    static const uint8_t payload[3]={'N','C',1U};
-    nrfclaw_ble_app_status_t st=nrfclaw_ble_app_set_role(NRFCLAW_BLE_APP_ADVERTISER);
-    if(st!=NRFCLAW_BLE_APP_OK)return st;
-    m_adv_adaptive_enabled=false;
-    (void)app_timer_stop(m_adv_adaptive_timer);
-    return nrfclaw_ble_app_adv_config(interval_ms,tx_power_dbm,payload,sizeof(payload));
+    return m_role == NRFCLAW_BLE_APP_PERIPHERAL &&
+           !m_suspended &&
+           m_conn_handle == BLE_CONN_HANDLE_INVALID &&
+           m_adv_active &&
+           (!m_adv_adaptive_enabled ||
+            m_adv_adaptive_state == APP_ADV_ADAPT_SLOW);
+}
+
+bool nrfclaw_ble_app_telemetry_set(const uint8_t *payload, uint8_t len)
+{
+    nrfclaw_ble_app_status_t st;
+
+    if (!payload || len == 0U || len > sizeof(m_direct_telemetry))
+        return false;
+
+    memcpy(m_direct_telemetry, payload, len);
+    m_direct_telemetry_len = len;
+
+    if (m_role != NRFCLAW_BLE_APP_PERIPHERAL ||
+        m_suspended ||
+        m_conn_handle != BLE_CONN_HANDLE_INVALID ||
+        !m_adv_active)
+        return true;
+
+    /*
+     * Do not lengthen FAST/NORMAL recovery. Cache the bytes and let the next
+     * existing adaptive reconfigure consume them. In SLOW, one stop/start per
+     * telemetry publication safely updates SoftDevice buffers in main context.
+     */
+    if (m_adv_adaptive_enabled &&
+        m_adv_adaptive_state != APP_ADV_ADAPT_SLOW)
+        return true;
+
+    st = nrfclaw_ble_app_adv_stop();
+    if (st != NRFCLAW_BLE_APP_OK)
+        return false;
+
+    st = nrfclaw_ble_app_adv_start();
+    return st == NRFCLAW_BLE_APP_OK;
 }
 
 nrfclaw_ble_app_status_t nrfclaw_ble_app_adv_start(void)
 {
-    if (m_suspended)
+    ble_advdata_t adv={0};
+    ble_advdata_t scan_rsp={0};
+    ble_advdata_manuf_data_t manufacturer={0};
+    uint16_t adv_len;
+    uint16_t scan_len=0U;
+    uint32_t err;
+
+    if (m_suspended || m_role == NRFCLAW_BLE_APP_OFF)
         return NRFCLAW_BLE_APP_BUSY;
-
-    if (m_role != NRFCLAW_BLE_APP_ADVERTISER &&
-        m_role != NRFCLAW_BLE_APP_PERIPHERAL)
-        return NRFCLAW_BLE_APP_BAD_ARG;
-
     if (m_adv_active)
         return NRFCLAW_BLE_APP_OK;
+
 
     if (m_role == NRFCLAW_BLE_APP_ADVERTISER && m_adv_name_len != 0U)
     {
@@ -427,291 +471,81 @@ nrfclaw_ble_app_status_t nrfclaw_ble_app_adv_start(void)
         nrfclaw_ble_set_gap_name_ndp();
     }
 
-    /*
-     * Legacy advertising on S132/nRF52832 is limited to 31 bytes per
-     * advertising packet.
-     *
-     * Do NOT put:
-     *
-     *   flags + full name + 128-bit UUID + manufacturer payload
-     *
-     * in the same packet. It exceeds 31 bytes and ble_advdata_encode()
-     * returns NRF_ERROR_DATA_SIZE.
-     *
-     * Peripheral mode is scannable, therefore split the data:
-     *
-     *   ADV:
-     *       flags
-     *       128-bit nRFClaw Application service UUID
-     *
-     *   SCAN RESPONSE:
-     *       full GAP device name ("nRFClaw-XXXXXX")
-     *       optional user/manufacturer payload
-     *
-     * This also lets Bleak/nRF Connect discover the device either by
-     * service UUID or by its board-specific name.
-     */
-    ble_advdata_t adv = {0};
-    ble_advdata_t scan_rsp = {0};
-
-    ble_uuid_t service_uuid =
-    {
-        .uuid = APP_SERVICE_UUID,
-        .type = m_uuid_type
-    };
-
-
-    adv.name_type = BLE_ADVDATA_NO_NAME;
-    adv.flags =
-        BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE;
+    adv.flags=BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE;
 
     if (m_role == NRFCLAW_BLE_APP_PERIPHERAL)
     {
-        adv.uuids_complete.uuid_cnt = 1U;
-        adv.uuids_complete.p_uuids = &service_uuid;
-    }
-    else if (m_adv_name_len != 0U)
-    {
-        /* Broadcaster: spend the legacy 31-byte budget on the programmed
-         * local name rather than the NDP service UUID. */
-        adv.name_type = BLE_ADVDATA_FULL_NAME;
-    }
-
-
-    ble_advdata_manuf_data_t manufacturer = {0};
-
-    if (m_role == NRFCLAW_BLE_APP_PERIPHERAL)
-    {
-        /*
-         * A connectable/scannable peripheral can use scan response.
-         */
-        scan_rsp.name_type =
-            BLE_ADVDATA_FULL_NAME;
-
-        if (m_user_payload_len != 0U)
-        {
-            manufacturer.company_identifier =
-                0xFFFFU;
-
-            manufacturer.data.p_data =
-                m_user_payload;
-
-            manufacturer.data.size =
-                m_user_payload_len;
-
-            scan_rsp.p_manuf_specific_data =
-                &manufacturer;
-        }
+        /* Primary packet is passive-runtime telemetry; scan response keeps
+         * the full NDP name for CLI/user discovery. */
+        manufacturer.company_identifier=0xFFFFU;
+        manufacturer.data.p_data=m_direct_telemetry;
+        manufacturer.data.size=m_direct_telemetry_len;
+        adv.p_manuf_specific_data=&manufacturer;
+        scan_rsp.name_type=BLE_ADVDATA_FULL_NAME;
     }
     else
     {
-        /*
-         * Generic non-connectable advertiser currently has no scan response.
-         * Keep the primary packet compact and put only manufacturer data
-         * beside flags + service UUID when it fits.
-         *
-         * Stage 8 validation focuses on PERIPHERAL.
-         */
+
+        if (m_adv_name_len != 0U)
+            adv.name_type = BLE_ADVDATA_FULL_NAME;
+
         if (m_user_payload_len != 0U)
         {
-            manufacturer.company_identifier =
-                0xFFFFU;
-
-            manufacturer.data.p_data =
-                m_user_payload;
-
-            manufacturer.data.size =
-                m_user_payload_len;
-
-            adv.p_manuf_specific_data =
-                &manufacturer;
+            manufacturer.company_identifier=0xFFFFU;
+            manufacturer.data.p_data=m_user_payload;
+            manufacturer.data.size=m_user_payload_len;
+            adv.p_manuf_specific_data=&manufacturer;
         }
     }
 
-
-    uint16_t adv_len =
-        sizeof(m_adv_encoded);
-
-    uint32_t err =
-        ble_advdata_encode(
-            &adv,
-            m_adv_encoded,
-            &adv_len
-        );
-
+    adv_len=sizeof(m_adv_encoded);
+    err=ble_advdata_encode(&adv,m_adv_encoded,&adv_len);
     if (err != NRF_SUCCESS)
-    {
-        SEGGER_RTT_printf(
-            0,
-            "BLE APP ADV: encode ADV err=0x%08lX handle=%u\r\n",
-            (unsigned long)err,
-            (unsigned)m_adv_handle
-        );
         return NRFCLAW_BLE_APP_BAD_ARG;
-    }
-
-
-    uint16_t scan_len = 0U;
 
     if (m_role == NRFCLAW_BLE_APP_PERIPHERAL)
     {
-        scan_len =
-            sizeof(m_scan_encoded);
-
-        err =
-            ble_advdata_encode(
-                &scan_rsp,
-                m_scan_encoded,
-                &scan_len
-            );
-
+        scan_len=sizeof(m_scan_encoded);
+        err=ble_advdata_encode(&scan_rsp,m_scan_encoded,&scan_len);
         if (err != NRF_SUCCESS)
-        {
-            SEGGER_RTT_printf(
-                0,
-                "BLE APP ADV: encode SCAN err=0x%08lX handle=%u\r\n",
-                (unsigned long)err,
-                (unsigned)m_adv_handle
-            );
             return NRFCLAW_BLE_APP_BAD_ARG;
-        }
     }
 
-
-    ble_gap_adv_data_t data = {0};
-
-    data.adv_data.p_data =
-        m_adv_encoded;
-
-    data.adv_data.len =
-        adv_len;
-
-
+    ble_gap_adv_data_t data={0};
+    data.adv_data.p_data=m_adv_encoded;
+    data.adv_data.len=adv_len;
     if (scan_len != 0U)
     {
-        data.scan_rsp_data.p_data =
-            m_scan_encoded;
-
-        data.scan_rsp_data.len =
-            scan_len;
-    }
-    else
-    {
-        data.scan_rsp_data.p_data = NULL;
-        data.scan_rsp_data.len = 0U;
+        data.scan_rsp_data.p_data=m_scan_encoded;
+        data.scan_rsp_data.len=scan_len;
     }
 
-
-    ble_gap_adv_params_t params = {0};
-
-    params.properties.type =
-        (m_role == NRFCLAW_BLE_APP_PERIPHERAL)
-            ? BLE_GAP_ADV_TYPE_CONNECTABLE_SCANNABLE_UNDIRECTED
-            : BLE_GAP_ADV_TYPE_NONCONNECTABLE_NONSCANNABLE_UNDIRECTED;
-
-    params.primary_phy =
-        BLE_GAP_PHY_1MBPS;
-
-    params.duration =
-        0U;
-
-    params.interval =
-        MSEC_TO_UNITS(
-            m_adv_interval_ms,
-            UNIT_0_625_MS
-        );
-
-    params.filter_policy =
-        BLE_GAP_ADV_FP_ANY;
-
+    ble_gap_adv_params_t params={0};
+    params.properties.type=(m_role == NRFCLAW_BLE_APP_PERIPHERAL)
+        ? BLE_GAP_ADV_TYPE_CONNECTABLE_SCANNABLE_UNDIRECTED
+        : BLE_GAP_ADV_TYPE_NONCONNECTABLE_NONSCANNABLE_UNDIRECTED;
+    params.primary_phy=BLE_GAP_PHY_1MBPS;
+    params.duration=0U;
+    params.interval=MSEC_TO_UNITS(m_adv_interval_ms,UNIT_0_625_MS);
+    params.filter_policy=BLE_GAP_ADV_FP_ANY;
 
     if (m_adv_handle == BLE_GAP_ADV_SET_HANDLE_NOT_SET)
-    {
-        SEGGER_RTT_WriteString(
-            0,
-            "BLE APP ADV: shared handle NOT_SET\r\n"
-        );
         return NRFCLAW_BLE_APP_RESOURCES;
-    }
 
-    SEGGER_RTT_printf(
-        0,
-        "BLE APP ADV: interval=%u ms units=%u\r\n",
-        (unsigned)m_adv_interval_ms,
-        (unsigned)params.interval
-    );
-
-    err =
-        sd_ble_gap_adv_set_configure(
-            &m_adv_handle,
-            &data,
-            &params
-        );
-
+    err=sd_ble_gap_adv_set_configure(&m_adv_handle,&data,&params);
     if (err != NRF_SUCCESS)
-    {
-        SEGGER_RTT_printf(
-            0,
-            "BLE APP ADV: configure err=0x%08lX handle=%u adv_len=%u scan_len=%u\r\n",
-            (unsigned long)err,
-            (unsigned)m_adv_handle,
-            (unsigned)adv_len,
-            (unsigned)scan_len
-        );
-
-        return
-            (err == NRF_ERROR_RESOURCES)
-                ? NRFCLAW_BLE_APP_RESOURCES
-                : NRFCLAW_BLE_APP_BUSY;
-    }
-
-
-    SEGGER_RTT_printf(
-        0,
-        "BLE APP ADV: configure OK handle=%u adv_len=%u scan_len=%u\r\n",
-        (unsigned)m_adv_handle,
-        (unsigned)adv_len,
-        (unsigned)scan_len
-    );
-
+        return (err == NRF_ERROR_RESOURCES)
+            ? NRFCLAW_BLE_APP_RESOURCES : NRFCLAW_BLE_APP_BUSY;
 
     (void)sd_ble_gap_tx_power_set(
-        BLE_GAP_TX_POWER_ROLE_ADV,
-        m_adv_handle,
-        m_tx_power_dbm
-    );
+        BLE_GAP_TX_POWER_ROLE_ADV,m_adv_handle,m_tx_power_dbm);
 
-
-    err =
-        sd_ble_gap_adv_start(
-            m_adv_handle,
-            APP_CONN_CFG_TAG
-        );
-
+    err=sd_ble_gap_adv_start(m_adv_handle,APP_CONN_CFG_TAG);
     if (err != NRF_SUCCESS)
-    {
-        SEGGER_RTT_printf(
-            0,
-            "BLE APP ADV: start err=0x%08lX handle=%u tag=%u\r\n",
-            (unsigned long)err,
-            (unsigned)m_adv_handle,
-            (unsigned)APP_CONN_CFG_TAG
-        );
+        return (err == NRF_ERROR_RESOURCES)
+            ? NRFCLAW_BLE_APP_RESOURCES : NRFCLAW_BLE_APP_BUSY;
 
-        return
-            (err == NRF_ERROR_RESOURCES)
-                ? NRFCLAW_BLE_APP_RESOURCES
-                : NRFCLAW_BLE_APP_BUSY;
-    }
-
-
-    SEGGER_RTT_printf(
-        0,
-        "BLE APP ADV: START OK handle=%u\r\n",
-        (unsigned)m_adv_handle
-    );
-
-    m_adv_active = true;
+    m_adv_active=true;
 
     if (m_adv_adaptive_enabled)
     {
@@ -719,23 +553,13 @@ nrfclaw_ble_app_status_t nrfclaw_ble_app_adv_start(void)
             m_adv_interval_ms == m_adv_fast_interval_ms)
         {
             adv_adaptive_arm(m_adv_fast_window_ms);
-            SEGGER_RTT_printf(
-                0,
-                "BLE APP ADAPT: FAST %u ms for %lu ms\r\n",
-                (unsigned)m_adv_fast_interval_ms,
-                (unsigned long)m_adv_fast_window_ms
-            );
+            ((void)0);
         }
         else if (m_adv_adaptive_state == APP_ADV_ADAPT_NORMAL &&
                  m_adv_interval_ms == m_adv_normal_interval_ms)
         {
             adv_adaptive_arm(m_adv_normal_window_ms);
-            SEGGER_RTT_printf(
-                0,
-                "BLE APP ADAPT: NORMAL %u ms for %lu ms\r\n",
-                (unsigned)m_adv_normal_interval_ms,
-                (unsigned long)m_adv_normal_window_ms
-            );
+            ((void)0);
         }
     }
 
@@ -776,6 +600,8 @@ nrfclaw_ble_app_status_t nrfclaw_ble_app_send(const nrfclaw_app_frame_t *f)
     if(e==NRF_ERROR_RESOURCES)return NRFCLAW_BLE_APP_RESOURCES;
     return NRFCLAW_BLE_APP_BUSY;
 }
+
+uint32_t nrfclaw_ble_app_tx_generation(void){return m_tx_generation;}
 
 nrfclaw_ble_app_status_t nrfclaw_ble_app_send_raw(const uint8_t *data,
                                                    uint16_t len)
@@ -897,9 +723,13 @@ void nrfclaw_ble_app_process(void)
                  * Reconfigure, do not merely resume, because the previous
                  * advertising set may already have fallen back to SLOW.
                  */
-                m_adv_adaptive_state = APP_ADV_ADAPT_FAST;
+                m_adv_adaptive_state = m_adv_restart_low_power
+                    ? APP_ADV_ADAPT_SLOW
+                    : APP_ADV_ADAPT_FAST;
                 m_adv_adaptive_start_retry = false;
-                m_adv_interval_ms = m_adv_fast_interval_ms;
+                m_adv_interval_ms = m_adv_restart_low_power
+                    ? m_adv_slow_interval_ms
+                    : m_adv_fast_interval_ms;
                 m_adv_active = false;
                 status = nrfclaw_ble_app_adv_start();
             }
@@ -910,25 +740,16 @@ void nrfclaw_ble_app_process(void)
 
             if (status == NRFCLAW_BLE_APP_OK)
             {
-                SEGGER_RTT_printf(
-                    0,
-                    "BLE APP: advertising restart OK attempt=%lu sd=0x%08lX\r\n",
-                    (unsigned long)m_adv_restart_attempts,
-                    (unsigned long)m_adv_last_sd_error
-                );
+                ((void)0);
 
                 m_adv_restart_pending = false;
                 m_adv_restart_attempts = 0U;
+                /* B7.6b consumed after successful restart. */
+                m_adv_restart_low_power = false;
             }
             else
             {
-                SEGGER_RTT_printf(
-                    0,
-                    "BLE APP: advertising restart RETRY attempt=%lu status=%u sd=0x%08lX\r\n",
-                    (unsigned long)m_adv_restart_attempts,
-                    (unsigned)status,
-                    (unsigned long)m_adv_last_sd_error
-                );
+                ((void)0);
 
                 adv_restart_schedule(APP_ADV_RETRY_DELAY_MS);
             }
@@ -975,12 +796,7 @@ void nrfclaw_ble_app_process(void)
             nrfclaw_ble_app_status_t stop_status = nrfclaw_ble_app_adv_stop();
             if (stop_status != NRFCLAW_BLE_APP_OK)
             {
-                SEGGER_RTT_printf(
-                    0,
-                    "BLE APP ADAPT: transition stop retry state=%u status=%u\r\n",
-                    (unsigned)m_adv_adaptive_state,
-                    (unsigned)stop_status
-                );
+                ((void)0);
                 adv_adaptive_arm(APP_ADV_ADAPTIVE_RETRY_MS);
                 return;
             }
@@ -996,30 +812,17 @@ void nrfclaw_ble_app_process(void)
         m_adv_adaptive_start_retry = false;
         if (m_adv_adaptive_state == APP_ADV_ADAPT_NORMAL)
         {
-            SEGGER_RTT_printf(
-                0,
-                "BLE APP ADAPT: NORMAL %u ms active\r\n",
-                (unsigned)m_adv_normal_interval_ms
-            );
+            ((void)0);
         }
         else
         {
-            SEGGER_RTT_printf(
-                0,
-                "BLE APP ADAPT: SLOW %u ms active\r\n",
-                (unsigned)m_adv_slow_interval_ms
-            );
+            ((void)0);
         }
         return;
     }
 
     m_adv_adaptive_start_retry = true;
-    SEGGER_RTT_printf(
-        0,
-        "BLE APP ADAPT: transition start retry state=%u status=%u\r\n",
-        (unsigned)m_adv_adaptive_state,
-        (unsigned)start_status
-    );
+    ((void)0);
     adv_adaptive_arm(APP_ADV_ADAPTIVE_RETRY_MS);
 }
 
@@ -1057,11 +860,7 @@ static void ble_evt(ble_evt_t const *e,void *ctx)
                 m_adv_adaptive_start_retry = false;
                 (void)app_timer_stop(m_adv_adaptive_timer);
 
-                SEGGER_RTT_printf(
-                    0,
-                    "BLE APP: CONNECTED handle=%u\r\n",
-                    (unsigned)m_conn_handle
-                );
+                ((void)0);
 
                 push_event(
                     NRFCLAW_EVT_APP_CONNECTED,
@@ -1078,11 +877,7 @@ static void ble_evt(ble_evt_t const *e,void *ctx)
         {
             if (e->evt.gap_evt.conn_handle == m_conn_handle)
             {
-                SEGGER_RTT_printf(
-                    0,
-                    "BLE APP: DISCONNECTED reason=0x%02X\r\n",
-                    (unsigned)e->evt.gap_evt.params.disconnected.reason
-                );
+                ((void)0);
 
                 m_conn_handle =
                     BLE_CONN_HANDLE_INVALID;
@@ -1115,13 +910,16 @@ static void ble_evt(ble_evt_t const *e,void *ctx)
                 if (!m_suspended &&
                     m_role == NRFCLAW_BLE_APP_PERIPHERAL)
                 {
+                    m_adv_restart_low_power = m_next_disconnect_low_power;
+                    m_next_disconnect_low_power = false;
+                    if (m_adv_restart_low_power) {
+                        ((void)0);
+                    }
+
                     m_adv_restart_attempts = 0U;
                     adv_restart_schedule(APP_ADV_RESTART_DELAY_MS);
 
-                    SEGGER_RTT_WriteString(
-                        0,
-                        "BLE APP: advertising restart scheduled\r\n"
-                    );
+                    ((void)0);
                 }
             }
 
@@ -1133,6 +931,12 @@ static void ble_evt(ble_evt_t const *e,void *ctx)
             if(w->handle==m_rx_handles.value_handle)nrfclaw_ble_app_on_rx(w->data,w->len);
             else if(w->handle==m_tx_handles.cccd_handle && w->len==2U)m_notify_enabled=ble_srv_is_notification_enabled(w->data);
             break;}
+        case BLE_GATTS_EVT_HVN_TX_COMPLETE:
+            if(e->evt.gatts_evt.conn_handle==m_conn_handle){
+                m_tx_generation++;
+                if(m_tx_generation==0U)m_tx_generation=1U;
+            }
+            break;
         default:break;
     }
 }

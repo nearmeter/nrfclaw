@@ -101,7 +101,15 @@ typedef enum
     OP_PARSE_BUF_FIXED  = 0x8A, /* dst:u8 decimals:u8; parse first signed decimal token, scaled by 10^decimals */
     OP_FORMAT_REG_FIXED = 0x8B, /* prefix_len:u8 prefix[] reg:u8 decimals:u8 suffix_len:u8 suffix[] */
     OP_BUFFER_PREPEND    = 0x8C, /* prefix_len:u8 prefix[]; prepend literal to current VM buffer */
-    OP_BUFFER_SET        = 0x8D  /* len:u8 bytes[]; replace current VM buffer with literal */
+    OP_BUFFER_SET        = 0x8D  /* len:u8 bytes[]; replace current VM buffer with literal */,
+    OP_NINALINK_TELEMETRY = 0x8E /* period_s:u16 window_ms:u16 attempts:u8 backoff_ms:u16 */,
+    OP_NINALINK_TELEMETRY_SYNTH = 0x8F /* period:u16 window:u16 attempts:u8 backoff:u16 temp_mC:i32 */,
+    OP_LORA_LAST_RSSI = 0x90, /* dst:u8; last valid LoRa packet RSSI, signed whole dBm */
+    OP_HA_ROLE_CONFIG = 0x91, /* role:u8; legacy/general persist + apply HA transport role */
+    OP_LORA_PROFILE_PERSIST = 0x92, /* mask:u8 + frozen 9-byte RF fields; preserve unmasked fields */
+    OP_HA_NINALINK_NODE_CONFIG = 0x93, /* period_s:u16; persist NINALINK_NODE role + report period atomically */
+    OP_SEMANTIC_PUBLISH = 0x94, /* semantic_id:u16 channel:u8 reg:u8; retained VM semantic state */
+    OP_PERSIST_LOAD_DEFAULT = 0x95 /* key:u8 reg:u8 default:u32le; missing key becomes RAM default */
 } nrfclaw_opcode_t;
 
 #define NRFCLAW_VM_REGISTER_COUNT 8U

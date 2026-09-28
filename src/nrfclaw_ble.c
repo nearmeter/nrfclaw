@@ -17,14 +17,13 @@
 #include "nrf_sdh.h"
 #include "nrf_sdh_ble.h"
 #include "nrf_soc.h"
+#include "nrf_nvic.h"
 #include "nrf_ble_gatt.h"
 #include "nrf_ble_qwr.h"
 #include "app_timer.h"
 #include "app_error.h"
 #include "ble_conn_params.h"
 #include "ble_advdata.h"
-#include "SEGGER_RTT.h"
-
 #include <stdio.h>
 #include <string.h>
 
@@ -62,12 +61,10 @@ enum {
     CMD_PROGRAM_AUTH  = 0x17,
     CMD_PROGRAM_SCHEDULE = 0x18,
     CMD_RESET = 0x19U,
-    CMD_EVENT_INJECT = 0x1AU,
     CMD_CAPABILITIES = 0x1BU,
     CMD_FACTORY_RESET = 0x1CU,
     CMD_TRACKING_IDENTITY = 0x1DU,
     CMD_TRACKING_INFO = 0x1EU,
-    CMD_TRACKING_DEBUG = 0x1FU,
     CMD_DFU_ENTER = 0x20U
 };
 
@@ -138,11 +135,10 @@ static ret_code_t programming_adv_start(void);
 
 static void log_ret(char const *name, ret_code_t err)
 {
-    char msg[80];
-    snprintf(msg, sizeof(msg), "BLE: %s=0x%08lX\r\n",
-             name, (unsigned long)err);
-    SEGGER_RTT_WriteString(0, msg);
+    (void)name;
+    (void)err;
 }
+
 
 static void advertising_idle(void)
 {
@@ -204,10 +200,7 @@ static void discovery_timeout(void *p_context)
         m_programming_allowed = false;
         advertising_idle();
 
-        SEGGER_RTT_WriteString(
-            0,
-            "BLE: no connection in 60 s, programming OFF"
-        );
+        ((void)0);
     }
 }
 */
@@ -279,7 +272,7 @@ static void idle_timeout(void *p_context)
 {
     (void)p_context;
 
-    SEGGER_RTT_WriteString(0, "BLE: programming session timeout\r\n");
+    ((void)0);
     nrfclaw_ble_programming_close();
 }
 
@@ -351,7 +344,7 @@ static bool vm_notify_enqueue(nrfclaw_vm_notify_type_t type,
     m_vm_notify.active = true;
     m_vm_notify_wait_hvn_complete = false;
 
-    SEGGER_RTT_WriteString(0, "BLE: VM notify queued\r\n");
+    ((void)0);
     return true;
 }
 
@@ -406,10 +399,7 @@ static void vm_notify_process(void)
         m_vm_notify.offset =
             (uint16_t)(m_vm_notify.offset + chunk);
 
-        SEGGER_RTT_WriteString(
-            0,
-            "BLE: VM notify sent"
-        );
+        ((void)0);
 
         if (m_vm_notify.offset >= m_vm_notify.len)
         {
@@ -435,10 +425,7 @@ static void vm_notify_process(void)
     {
         m_vm_notify_wait_hvn_complete = true;
 
-        SEGGER_RTT_WriteString(
-            0,
-            "BLE: VM notify waiting HVN_TX_COMPLETE"
-        );
+        ((void)0);
 
         return;
     }
@@ -446,10 +433,7 @@ static void vm_notify_process(void)
     if (err == NRF_ERROR_INVALID_STATE ||
         err == NRF_ERROR_NOT_FOUND)
     {
-        SEGGER_RTT_WriteString(
-            0,
-            "BLE: VM notify dropped, notifications unavailable"
-        );
+        ((void)0);
 
         m_vm_notify.active = false;
         m_vm_notify_wait_hvn_complete = false;
@@ -694,10 +678,7 @@ static void handle_binary_command(uint8_t const *d, uint16_t len)
 
             nus_reply(cmd, ST_OK, NULL, 0);
 
-            SEGGER_RTT_WriteString(
-                0,
-                "BLE: RUN ACK queued, VM waits HVN_TX_COMPLETE\r\n"
-            );
+            ((void)0);
 
             return;
 
@@ -812,56 +793,6 @@ static void handle_binary_command(uint8_t const *d, uint16_t len)
                 return;
             }
 
-        case CMD_TRACKING_DEBUG:
-            if (len != 1U) {
-                nus_reply(cmd, ST_BAD_LENGTH, NULL, 0);
-                return;
-            } else {
-                nrfclaw_tracking_debug_t dbg;
-                nrfclaw_tracking_debug(&dbg);
-
-                uint8_t p[16] = {
-                    dbg.stage,
-                    dbg.start_pending,
-                    dbg.index_commit_pending,
-                    dbg.apply_pending,
-                    dbg.active,
-                    dbg.commit_state,
-                    dbg.journal_state,
-                    0U,
-                    (uint8_t)(dbg.key_index),
-                    (uint8_t)(dbg.key_index >> 8),
-                    (uint8_t)(dbg.key_index >> 16),
-                    (uint8_t)(dbg.key_index >> 24),
-                    (uint8_t)(dbg.last_sd_error),
-                    (uint8_t)(dbg.last_sd_error >> 8),
-                    (uint8_t)(dbg.last_sd_error >> 16),
-                    (uint8_t)(dbg.last_sd_error >> 24)
-                };
-
-                nus_reply(cmd, ST_OK, p, sizeof(p));
-                return;
-            }
-
-        case CMD_EVENT_INJECT:
-            if (len != 10U) {
-                nus_reply(cmd, ST_BAD_LENGTH, NULL, 0);
-                return;
-            } else {
-                nrfclaw_event_t ev;
-                ev.type = (nrfclaw_event_type_t)d[1];
-                ev.arg0 = ((uint32_t)d[2]) | ((uint32_t)d[3] << 8) |
-                          ((uint32_t)d[4] << 16) | ((uint32_t)d[5] << 24);
-                ev.arg1 = ((uint32_t)d[6]) | ((uint32_t)d[7] << 8) |
-                          ((uint32_t)d[8] << 16) | ((uint32_t)d[9] << 24);
-                if (!nrfclaw_event_push(&ev)) {
-                    nus_reply(cmd, ST_BUSY, NULL, 0);
-                    return;
-                }
-                nus_reply(cmd, ST_OK, NULL, 0);
-                return;
-            }
-
         case CMD_CAPABILITIES:
             if (len != 1U) {
                 nus_reply(cmd, ST_BAD_LENGTH, NULL, 0);
@@ -870,7 +801,7 @@ static void handle_binary_command(uint8_t const *d, uint16_t len)
                 uint32_t supported = 0U;
                 uint32_t active = 0U;
 
-                for (uint8_t cap = 1U; cap <= NRFCLAW_CAP_VIB_AUTO; cap++) {
+                for (uint8_t cap = 1U; cap <= NRFCLAW_CAP_TEMPERATURE; cap++) {
                     if (nrfclaw_native_capability_supported(cap))
                         supported |= (1UL << cap);
                     if (nrfclaw_native_capability_available(cap))
@@ -972,18 +903,8 @@ static void ble_evt(ble_evt_t const *p_ble_evt, void *p_context)
                 start_idle_timer();
             }
 
-            SEGGER_RTT_printf(
-                0,
-                "BLE MAC-COMPAT: CONNECTED handle=%u interval=%u latency=%u timeout=%u\r\n",
-                (unsigned)m_conn_handle,
-                (unsigned)p_ble_evt->evt.gap_evt.params.connected.conn_params.min_conn_interval,
-                (unsigned)p_ble_evt->evt.gap_evt.params.connected.conn_params.slave_latency,
-                (unsigned)p_ble_evt->evt.gap_evt.params.connected.conn_params.conn_sup_timeout
-            );
-            SEGGER_RTT_WriteString(
-                0,
-                "BLE: connected, 5-minute command timer active\r\n"
-            );
+            ((void)0);
+            ((void)0);
 
             nrfclaw_event_t ev = {
                 .type = NRFCLAW_EVT_BLE_CONNECTED
@@ -1004,12 +925,7 @@ static void ble_evt(ble_evt_t const *p_ble_evt, void *p_context)
             m_conn_handle = BLE_CONN_HANDLE_INVALID;
             m_vm_notify.active = false;
 
-            SEGGER_RTT_printf(
-                0,
-                "BLE MAC-COMPAT: DISCONNECTED handle=%u reason=0x%02X\r\n",
-                (unsigned)p_ble_evt->evt.gap_evt.conn_handle,
-                (unsigned)p_ble_evt->evt.gap_evt.params.disconnected.reason
-            );
+            ((void)0);
 
             /*
              * If a programming session is still authorized, immediately
@@ -1032,14 +948,11 @@ static void ble_evt(ble_evt_t const *p_ble_evt, void *p_context)
                     );
                 }
 
-                SEGGER_RTT_WriteString(
-                    0,
-                    "BLE: session open, FAST advertising"
-                );
+                ((void)0);
             }
             else {
                 advertising_idle();
-                SEGGER_RTT_WriteString(0, "BLE: programming OFF");
+                ((void)0);
 
                 /* Programming ownership ended: restore the native
                  * Application/HA peripheral advertisement. */
@@ -1070,7 +983,7 @@ static void ble_evt(ble_evt_t const *p_ble_evt, void *p_context)
                 NULL);
             if (err != NRF_SUCCESS && err != NRF_ERROR_INVALID_STATE)
                 log_ret("sec_params_reply", err);
-            SEGGER_RTT_WriteString(0, "BLE MAC-COMPAT: pairing request rejected (NUS is open)\r\n");
+            ((void)0);
             break;
         }
 
@@ -1086,18 +999,12 @@ static void ble_evt(ble_evt_t const *p_ble_evt, void *p_context)
                 &phys);
             if (err != NRF_SUCCESS && err != NRF_ERROR_INVALID_STATE)
                 log_ret("phy_update", err);
-            SEGGER_RTT_WriteString(0, "BLE MAC-COMPAT: PHY request -> 1M/1M\r\n");
+            ((void)0);
             break;
         }
 
         case BLE_GAP_EVT_CONN_PARAM_UPDATE:
-            SEGGER_RTT_printf(
-                0,
-                "BLE MAC-COMPAT: CONN_PARAM_UPDATE interval=%u latency=%u timeout=%u\r\n",
-                (unsigned)p_ble_evt->evt.gap_evt.params.conn_param_update.conn_params.min_conn_interval,
-                (unsigned)p_ble_evt->evt.gap_evt.params.conn_param_update.conn_params.slave_latency,
-                (unsigned)p_ble_evt->evt.gap_evt.params.conn_param_update.conn_params.conn_sup_timeout
-            );
+            ((void)0);
             break;
 
         case BLE_GATTS_EVT_SYS_ATTR_MISSING: {
@@ -1109,7 +1016,7 @@ static void ble_evt(ble_evt_t const *p_ble_evt, void *p_context)
             ret_code_t err = sd_ble_gatts_sys_attr_set(handle, NULL, 0, 0);
             if (err != NRF_SUCCESS && err != NRF_ERROR_INVALID_STATE)
                 log_ret("sys_attr_set", err);
-            SEGGER_RTT_WriteString(0, "BLE MAC-COMPAT: SYS_ATTR_MISSING cleared\r\n");
+            ((void)0);
             break;
         }
 
@@ -1119,7 +1026,7 @@ static void ble_evt(ble_evt_t const *p_ble_evt, void *p_context)
                 m_factory_reset_after_hvn_complete = false;
                 (void)nrfclaw_vm_stop();
                 if (!nrfclaw_factory_request())
-                    SEGGER_RTT_WriteString(0,"BLE ERROR: factory reset request rejected\r\n");
+                    ((void)0);
                 break;
             }
 
@@ -1149,17 +1056,11 @@ static void ble_evt(ble_evt_t const *p_ble_evt, void *p_context)
 
                 if (nrfclaw_vm_run_loaded())
                 {
-                    SEGGER_RTT_WriteString(
-                        0,
-                        "BLE: RUN ACK complete -> VM started\r\n"
-                    );
+                    ((void)0);
                 }
                 else
                 {
-                    SEGGER_RTT_WriteString(
-                        0,
-                        "BLE ERROR: deferred VM RUN rejected\r\n"
-                    );
+                    ((void)0);
                 }
             }
 
@@ -1171,10 +1072,7 @@ static void ble_evt(ble_evt_t const *p_ble_evt, void *p_context)
             {
                 m_vm_notify_wait_hvn_complete = false;
 
-                SEGGER_RTT_WriteString(
-                    0,
-                    "BLE: HVN_TX_COMPLETE -> VM notify retry\r\n"
-                );
+                ((void)0);
             }
             break;
 
@@ -1293,12 +1191,6 @@ void nrfclaw_ble_init(void)
 
     m_programming_allowed = false;
     m_session_connected_once = false;
-
-    char msg[80];
-    snprintf(msg, sizeof(msg),
-             "BLE: ready as %s, advertising OFF\r\n",
-             m_device_name_ndp);
-    SEGGER_RTT_WriteString(0, msg);
 }
 
 
@@ -1467,10 +1359,7 @@ void nrfclaw_ble_programming_open(uint32_t seconds)
         m_session_connected_once = true;
         start_idle_timer();
 
-        SEGGER_RTT_WriteString(
-            0,
-            "BLE: active session refreshed"
-        );
+        ((void)0);
         return;
     }
 
@@ -1501,10 +1390,7 @@ void nrfclaw_ble_programming_open(uint32_t seconds)
         APP_ERROR_CHECK(err);
     }
 
-    SEGGER_RTT_WriteString(
-        0,
-        "BLE: FAST discovery OPEN for 60 s"
-    );
+    ((void)0);
 }
 /*
 void nrfclaw_ble_programming_close(void)
@@ -1527,6 +1413,20 @@ void nrfclaw_ble_programming_close(void)
     advertising_idle();
 }
 */
+
+void nrfclaw_ble_programming_release(void)
+{
+    /*
+     * B5.5 handoff: stop authorizing new NUS work but keep the current link
+     * alive long enough for the command response.  When the CLI disconnects,
+     * the existing DISCONNECTED path sees programming_allowed=false and
+     * returns ownership to the Application/NDP plane.
+     */
+    m_programming_allowed = false;
+    m_session_connected_once = false;
+    stop_timer_safely(m_discovery_timer);
+    stop_timer_safely(m_idle_timer);
+}
 
 void nrfclaw_ble_programming_close(void)
 {

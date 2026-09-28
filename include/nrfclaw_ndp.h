@@ -57,14 +57,28 @@ typedef enum {
     NRFCLAW_NDP_KEY_STATUS       = 82,
     /* r3.8.10 physical-NUS-only boot control for Application/NDP advertising. */
     NRFCLAW_NDP_BLE_BOOT_CONTROL = 83,
-    /* r3.8.14 physical-NUS-only Beacon/Broadcaster test control. */
-    NRFCLAW_NDP_BLE_BEACON_CONTROL = 84,
-    /* r3.8.16b1l physical-NUS direct LoRa diagnostics. */
-    NRFCLAW_NDP_LORA_DIAG_SEND    = 85,
-    NRFCLAW_NDP_LORA_DIAG_RX      = 86,
+    /* 84 retired: historical Beacon/Broadcaster hardware test control. */
+    /* 85..86 retired: historical direct LoRa diagnostic endpoints. */
     /* r3.8.18 extended persistent LoRa profile; legacy 56/57 remain frozen. */
     NRFCLAW_NDP_RADIO_GET_EXT      = 87,
-    NRFCLAW_NDP_RADIO_SET_EXT      = 88
+    NRFCLAW_NDP_RADIO_SET_EXT      = 88,
+    /* 89 retired: historical NinaLink lab uplink endpoint. */
+    /* B4.2 physical-NUS bridge control / validated RX queue. */
+    NRFCLAW_NDP_NINALINK_BRIDGE    = 90,
+    /* 91 retired: historical NinaLink node/link hardware gate endpoint. */
+    /* B7.6b Application-only one-shot intentional disconnect hint. */
+    NRFCLAW_NDP_BLE_DISCONNECT_HINT = 92,
+    NRFCLAW_NDP_HA_ROLE_CONTROL      = 93,
+    /* B7.6f2k2 Direct accelerometer event preset GET/SET. */
+    NRFCLAW_NDP_DIRECT_SENSOR_CONTROL = 94,
+    /* B7.6f2k3 user-facing LOW/NORMAL/HIGH event sensitivity. */
+    NRFCLAW_NDP_DIRECT_EVENT_SENSITIVITY = 95,
+    /* B7.6f2k3 persistent Hall behavior + reset. */
+    NRFCLAW_NDP_DIRECT_HALL_CONTROL = 96,
+    /* B7.6f2k4 read-only current VM semantic state. */
+    NRFCLAW_NDP_DIRECT_SEMANTIC_STATE = 97,
+    /* B7.6f2l1 physical-NUS-only persistent NinaLink network ID. */
+    NRFCLAW_NDP_NINALINK_NETWORK = 98
 } nrfclaw_ndp_opcode_t;
 
 /* Stable NDP v1 status values. */
@@ -85,7 +99,8 @@ typedef enum {
     NRFCLAW_NDP_SENSOR_HALL         = 2,
     NRFCLAW_NDP_SENSOR_ACCEL_XYZ    = 3,
     NRFCLAW_NDP_SENSOR_DS18B20      = 4,
-    NRFCLAW_NDP_SENSOR_ACCEL_METRICS= 5
+    NRFCLAW_NDP_SENSOR_ACCEL_METRICS= 5,
+    NRFCLAW_NDP_SENSOR_TEMPERATURE  = 6
 } nrfclaw_ndp_sensor_t;
 
 bool nrfclaw_ndp_is_session_frame(uint8_t const *data,uint16_t len);

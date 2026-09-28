@@ -182,6 +182,12 @@ bool
 nrfclaw_vm_run_loaded(void);
 
 
+/* B7.6f2l3: reset one retained semantic accumulator without exposing VM
+ * register/state-key implementation details to Home Assistant. */
+bool nrfclaw_vm_semantic_accumulator_resettable(void);
+bool nrfclaw_vm_semantic_accumulator_reset(void);
+
+
 /*
  * Install an already validated/recovered program into the RAM execution slot.
  * The program is structurally validated again before it is accepted.

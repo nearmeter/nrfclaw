@@ -138,6 +138,127 @@ Typical qualitative classes:
 | Continuous Serial RX | Higher consumption |
 | Continuous LoRa RX | Higher consumption |
 
+## Home Assistant installation
+
+nRFClaw is distributed as a small Home Assistant integration package. **HACS is
+not required.** No GitHub authentication or third-party repository is required.
+
+### 1. Download the integration
+
+<p align="left">
+  <a href="https://github.com/nearmeter/nrfclaw/releases/latest/download/nrfclaw-home-assistant.zip">
+    <img src="https://img.shields.io/badge/Download-nRFClaw_for_Home_Assistant-41BDF5?style=for-the-badge&logo=homeassistant&logoColor=white"
+         alt="Download nRFClaw for Home Assistant">
+  </a>
+</p>
+
+Direct URL:
+
+```text
+https://github.com/nearmeter/nrfclaw/releases/latest/download/nrfclaw-home-assistant.zip
+```
+
+The ZIP contains:
+
+```text
+custom_components/
+└── nrfclaw/
+    ├── __init__.py
+    ├── manifest.json
+    ├── config_flow.py
+    ├── sensor.py
+    └── ... remaining nRFClaw integration files
+```
+
+### 2. Copy the files into Home Assistant
+
+Extract the ZIP and copy:
+
+```text
+custom_components/nrfclaw/
+```
+
+into the Home Assistant configuration directory so the final path is:
+
+```text
+/config/custom_components/nrfclaw/
+```
+
+If an older nRFClaw integration is already installed, replace the complete
+`nrfclaw` directory instead of copying only changed files. This avoids
+leaving obsolete modules from an older release.
+
+For **Home Assistant OS**, the simplest file-copy method is the official
+**Samba share** app included in the Home Assistant App store:
+
+```text
+Settings → Apps → Install app → Samba share
+```
+
+Configure a Samba username/password, enable the `config` share, and connect
+from your computer:
+
+```text
+Windows:       \\<HOME_ASSISTANT_IP>\config
+macOS / Linux: smb://<HOME_ASSISTANT_IP>/config
+```
+
+Copy the extracted `custom_components` directory into that `config` share.
+No custom App repository and no HACS installation are needed.
+
+Official Samba share reference:
+
+```text
+https://github.com/home-assistant/addons/tree/master/samba
+```
+
+The official **File editor** app is useful for inspecting the resulting files
+from the Home Assistant UI:
+
+```text
+Settings → Apps → Install app → File editor
+https://github.com/home-assistant/addons/tree/master/configurator
+```
+
+Developers who already have filesystem or SSH/SCP access may copy the same
+directory by any normal file-transfer method.
+
+### 3. Restart Home Assistant
+
+```text
+Settings → System → Restart Home Assistant
+```
+
+### 4. Discover the nRFClaw device
+
+Power or reset an nRFClaw device configured as **Direct** or **NinaLink
+Bridge**, then open:
+
+```text
+Settings → Devices & services
+```
+
+Home Assistant Bluetooth discovery should offer the device automatically. If
+Direct NDP authentication is enabled, enter the 256-bit **NDP access key** in
+the discovered-device setup form.
+
+A low-power **NinaLink Node** does not connect directly to Home Assistant. The
+Bridge receives the Node over LoRa and exposes the Node and its entities to
+Home Assistant.
+
+For maintainers, the release package is generated directly from the single
+canonical source tree:
+
+```text
+integrations/home-assistant/custom_components/nrfclaw/
+```
+
+Build it locally with:
+
+```bash
+python3 tools/build_home_assistant_package.py
+```
+
 ## Quick Start
 
 ### 1. Clone

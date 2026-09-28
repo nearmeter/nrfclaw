@@ -1,4 +1,6 @@
 {
+  "domain": "nrfclaw",
+  "name": "nRFClaw",
   "bluetooth": [
     {
       "connectable": true,
@@ -19,13 +21,16 @@
       "manufacturer_id": 65535
     }
   ],
+  "codeowners": [
+    "@tuxap"
+  ],
   "config_flow": true,
   "dependencies": [
     "bluetooth_adapters"
   ],
-  "domain": "nrfclaw",
+  "documentation": "https://github.com/nearmeter/nrfclaw#home-assistant-installation",
   "integration_type": "device",
   "iot_class": "local_push",
-  "name": "nRFClaw",
+  "issue_tracker": "https://github.com/nearmeter/nrfclaw/issues",
   "version": "0.10.23"
 }

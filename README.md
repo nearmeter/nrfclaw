@@ -141,26 +141,44 @@ Typical qualitative classes:
 ## Home Assistant installation (HACS)
 
 The nRFClaw Home Assistant integration can be installed without SSH, a terminal,
-or manually copying `custom_components`.
+or manually copying files into `custom_components`.
 
-[![Open nRFClaw in HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=nearmeter&repository=nrfclaw&category=integration)
+### Installation
 
-1. Click **Open nRFClaw in HACS**.
-2. Download the nRFClaw integration.
+1. Click the **Open nRFClaw in HACS** button below. It opens the nRFClaw
+   repository directly in HACS on your Home Assistant instance.
+
+<p align="left">
+  <a href="https://my.home-assistant.io/redirect/hacs_repository/?owner=nearmeter&repository=nrfclaw&category=integration">
+    <img src="https://my.home-assistant.io/badges/hacs_repository.svg"
+         alt="Open nRFClaw in HACS">
+  </a>
+</p>
+
+Direct URL:
+
+```text
+https://my.home-assistant.io/redirect/hacs_repository/?owner=nearmeter&repository=nrfclaw&category=integration
+```
+
+2. In HACS, click **Download** to install the nRFClaw integration.
 3. Restart Home Assistant when HACS asks for it.
-4. Power or reset an nRFClaw device configured for Home Assistant.
-5. Home Assistant Bluetooth discovery will offer a **Direct** device or a
-   **NinaLink Bridge** automatically.
-6. If Direct NDP authentication is enabled on the device, paste its 256-bit
-   NDP access key into the discovered-device setup form.
+4. Power or reset an nRFClaw device that has been configured for Home Assistant.
+5. Home Assistant Bluetooth discovery will automatically offer either a
+   **Direct** device or a **NinaLink Bridge**, according to the role advertised
+   by the board.
+6. If Direct NDP authentication is enabled, paste the device's 256-bit
+   **NDP access key** into the discovered-device setup form.
+7. Finish the Home Assistant setup flow. The device and its nRFClaw entities
+   should then appear under **Settings → Devices & services**.
 
 A NinaLink low-power **Node** does not need its own Home Assistant Bluetooth
 connection. Its Application/NDP plane remains off; the Bridge receives the
 Node over LoRa and exposes the discovered Node and its entities to Home
 Assistant.
 
-If HACS is not installed yet, install HACS first using its supported Home
-Assistant OS/Supervised installation flow, then return to the button above.
+If HACS is not installed yet, install HACS using its supported Home Assistant
+installation flow, then return to the button or URL above.
 
 For maintainers, the HACS-visible tree at `custom_components/nrfclaw/` is a
 byte-for-byte distribution mirror of the canonical integration under

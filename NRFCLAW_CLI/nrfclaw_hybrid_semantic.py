@@ -1737,6 +1737,29 @@ def _compile_hall_semantic_volume(source: str, t: str, schedule: int, cfg: dict[
 
 
 def _compile_ha_transport_role(source: str, t: str, schedule: int, cfg: dict[str, Any]) -> CompileResult | None:
+    # B7.6f2o1b: HA transport-role lowerer is role-only.
+    #
+    # Do not let generic wrapper wording such as
+    # "Configure the device to do this: ... through Home Assistant"
+    # consume a richer sensor/event program merely because it contains the
+    # word "configure". Those prompts must fall through to the dedicated
+    # deterministic lowerers (VIB_AUTO, Hall semantic volume, motion, etc.).
+    #
+    # LoRa/NinaLink/bridge/RF words are intentionally NOT in this guard because
+    # they are valid transport-role qualifiers for the role-only family.
+    rich_workload = bool(re.search(
+        r"\b(?:"
+        r"vib(?:ration|racao|ra)?\w*|hvac|machine|equipment|motor|pump|fan|"
+        r"washer|washing\s+machine|mixer|"
+        r"hall\s*[12]?|pulse|pulses|pulso|pulsos|volume|consumption|consumo|"
+        r"temperature|temperatura|battery|bateria|motion|movimento|tracking|rastreamento|"
+        r"notify|notification|notifique|avise|message|mensagem|telegram|event|evento"
+        r")\b",
+        t,
+    ))
+    if rich_workload:
+        return None
+
     role = _ha_transport_role(t)
     if role is None:
         return None

@@ -1,12 +1,42 @@
 # nRFClaw Home Assistant installation with HACS
 
 B7.6f2p1 makes the nRFClaw repository directly installable as a custom HACS
-integration repository. No SSH shell, Terminal add-on, or manual copy into
+integration repository. No SSH shell, Terminal app, or manual copy into
 `/config/custom_components` is required.
 
-## Install
+## Prerequisite: HACS must be installed
 
-Use the My Home Assistant link:
+The HACS repository redirect is implemented by the `hacs` integration. If
+Home Assistant says that the redirect is not supported because the HACS
+integration is missing, install and configure HACS first.
+
+For Home Assistant OS / Supervised, the official HACS documentation provides a
+**Get HACS** Home Assistant App, so HACS can be installed without SSH or a
+Terminal.
+
+Add its App repository with:
+
+https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fhacs%2Faddons
+
+Repository URL:
+
+```text
+https://github.com/hacs/addons
+```
+
+Then:
+
+1. Go to **Settings → Apps → Install app**.
+2. Select **Get HACS** and click **Install**.
+3. Start the app.
+4. Follow the instructions in the Get HACS app logs.
+5. Restart Home Assistant.
+6. Go to **Settings → Devices & services → Add integration**.
+7. Add **HACS** and complete its setup.
+
+## Install nRFClaw
+
+Once HACS is configured, use:
 
 https://my.home-assistant.io/redirect/hacs_repository/?owner=nearmeter&repository=nrfclaw&category=integration
 

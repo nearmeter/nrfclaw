@@ -241,9 +241,25 @@ because ppm of CO, CH4, NH3, H2S, etc. are not semantically interchangeable.
 | `0x0209` | `vibration_frequency` | MEASUREMENT | U32 | -3 | HERTZ | 1000 = 1.000 Hz |
 | `0x020A` | `vibration_alarm` | STATE | BOOL | 0 | BOOLEAN | VIB_AUTO abnormal state |
 | `0x020B` | `walk` | EVENT | BOOL | 0 | BOOLEAN | Walking/activity event |
+| `0x020C` | `vibration_event` | EVENT | ENUM8 | 0 | NONE | VIB_AUTO semantic occurrence; enum defined below |
 
 `vibration_alarm` is a semantic alarm state. It is not the same namespace as
 the legacy native firmware capability `NRFCLAW_CAP_VIB_AUTO`.
+
+`vibration_event` is the momentary VIB_AUTO event stream. Its ENUM8 values are:
+
+```text
+1 VIBRATION_WARNING
+2 VIBRATION_ALARM
+3 MACHINE_ON
+4 MACHINE_OFF
+5 LEARN_COMPLETE
+```
+
+`vibration_alarm` (`0x020A`) remains the current BOOL alarm state. The
+`VIBRATION_ALARM` value in `vibration_event` (`0x020C`) is the separate momentary
+alarm occurrence. New standardized IDs are additive and keep registry version 1.
+
 
 ### 9.4 Digital / Hall / counting — `0x0300–0x03FF`
 
@@ -306,11 +322,11 @@ defined in B1.2:
 Examples:
 
 ```text
-DS18B20 absent:
-temperature: SUPPORTED, !PRESENT
+DS18B20 absent on nRF52832:
+temperature: SUPPORTED | PRESENT | ENABLED  (source = internal die TEMP)
 
 DS18B20 detected:
-temperature: SUPPORTED | PRESENT | ENABLED
+temperature: SUPPORTED | PRESENT | ENABLED  (source = DS18B20)
 
 Hall compiled in but disabled:
 hall_state: SUPPORTED | PRESENT, !ENABLED

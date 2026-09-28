@@ -8,6 +8,11 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List
 
+try:
+    from .device_identity import ninalink_node_identity
+except ImportError:  # CLI/host gate
+    from device_identity import ninalink_node_identity
+
 HA_MODEL_SCHEMA = 1
 
 
@@ -119,11 +124,14 @@ _CAPABILITY_MAP: Dict[int, Dict[str, Any]] = {
         "native_unit": "count",
         "state_class": None,
     },
+    # B7.6f2m3: quadrature is a signed counter, not a separate Position
+    # concept in Home Assistant. The node may still use semantic ID 0x0303
+    # on the wire; presentation is unified with Counter.
     0x0303: {
-        "name": "Position",
+        "name": "Counter",
         "platform": "sensor",
         "device_class": None,
-        "native_unit": None,
+        "native_unit": "count",
         "state_class": None,
     },
     0x0304: {
@@ -190,7 +198,14 @@ _CAPABILITY_MAP: Dict[int, Dict[str, Any]] = {
         "platform": "sensor",
         "device_class": "volume",
         "native_unit": "L",
-        "state_class": None,
+        "state_class": "total",
+    },
+    0x0606: {
+        "name": "Volume",
+        "platform": "sensor",
+        "device_class": "volume",
+        "native_unit": "gal",
+        "state_class": "total",
     },
     0x0602: {
         "name": "Distance",
@@ -223,6 +238,16 @@ _CAPABILITY_MAP: Dict[int, Dict[str, Any]] = {
 }
 
 
+# B7.6f2m6c4: raw acceleration XYZ and vibration scalar diagnostics remain
+# available internally/on the wire but are intentionally not projected as
+# Home Assistant sensor entities. XYZ updates are not useful as dashboard
+# state and make the device presentation look stale between reports.
+_HIDDEN_CAPABILITY_IDS = {
+    0x0203, 0x0204, 0x0205,
+    0x0206, 0x0207, 0x0208, 0x0209,
+}
+_CONFIG_CAPABILITY_IDS = {0x0800, 0x0801, 0x0802, 0x0803, 0x0804}
+
 _UNIT_FALLBACK = {
     "BOOLEAN": None,
     "PERCENT": "%",
@@ -244,6 +269,7 @@ _UNIT_FALLBACK = {
     "LITER_PER_MINUTE": "L/min",
     "RPM": "rpm",
     "COUNT": "count",
+    "US_GALLON": "gal",
 }
 
 
@@ -342,11 +368,43 @@ def project_model(
         node_id = int(node["node_id_raw"])
         entities: Dict[tuple[int, int], Dict[str, Any]] = {}
 
+        # B7.2 inventory pre-creates entities before first state/event.
+        for inv in node.get("inventory", []):
+            if int(inv["capability_id_raw"]) in (_HIDDEN_CAPABILITY_IDS | _CONFIG_CAPABILITY_IDS):
+                continue
+            cap = {
+                "capability_id": inv["capability_id"],
+                "capability_id_raw": inv["capability_id_raw"],
+                "channel": inv["channel"],
+                "name": inv["name"],
+                "value_type": inv["value_type"],
+                "value": None,
+                "descriptor": {
+                    "known": True,
+                    "kind": inv["kind"],
+                    "value_type": inv["value_type"],
+                    "scale10": inv["scale10"],
+                    "unit": inv["unit"],
+                    "behavior_flags": inv["behavior_flags"],
+                },
+            }
+            key = (
+                int(inv["capability_id_raw"]),
+                int(inv["channel"]),
+            )
+            ent = project_capability(node_id, cap)
+            ent["available"] = ent["platform"] == "event"
+            entities[key] = ent
+
         for cap in node["capabilities"]:
+            if int(cap["capability_id_raw"]) in (_HIDDEN_CAPABILITY_IDS | _CONFIG_CAPABILITY_IDS):
+                continue
             key = (int(cap["capability_id_raw"]), int(cap["channel"]))
             entities[key] = project_capability(node_id, cap)
 
         for key, event in observed_by_node.get(node_id, {}).items():
+            if int(event["capability_id_raw"]) in (_HIDDEN_CAPABILITY_IDS | _CONFIG_CAPABILITY_IDS):
+                continue
             if key not in entities:
                 entities[key] = project_capability(
                     node_id, event_as_capability(event)
@@ -357,16 +415,47 @@ def project_model(
             for key in sorted(entities)
         ]
 
+        # B7.6f2m3: one user-facing Hall quantity. If the node publishes an
+        # engineering Volume semantic, hide the raw COUNTER/QUADRATURE counter.
+        if any(int(ent["capability_id_raw"]) in (0x0601, 0x0606) for ent in ordered):
+            ordered = [
+                ent for ent in ordered
+                if int(ent["capability_id_raw"]) not in (0x0302, 0x0303)
+            ]
+
+        node_online = bool(node.get("online", True))
+        node_age_s = int(node.get("age_s", 0))
+        offline_after_s = int(node.get("offline_after_s", 0))
+        expected_interval_s = node.get("expected_report_interval_s")
+
+        for ent in ordered:
+            ent["available"] = bool(
+                ent.get("available", False) and node_online
+            )
+            ent["node_online"] = node_online
+            ent["last_seen_age_s"] = node_age_s
+            ent["offline_after_s"] = offline_after_s
+            ent["expected_report_interval_s"] = expected_interval_s
+
+        node_name, node_manufacturer, node_model = ninalink_node_identity(node)
         devices.append({
             "device_key": f"ninalink:{node_id:08X}",
             "node_id": node["node_id"],
             "node_id_raw": node_id,
-            "name": f"NinaLink {node_id:08X}",
+            "name": node_name,
+            "manufacturer": node_manufacturer,
+            "model": node_model,
             "topology": "via_device",
             "via_bridge_key": bridge_key,
+            "online": node_online,
+            "age_s": node_age_s,
+            "offline_after_s": offline_after_s,
+            "expected_report_interval_s": expected_interval_s,
             "ready": bool(node.get("ready")),
             "valid": bool(node.get("valid")),
             "session_valid": bool(node.get("session_valid")),
+            "rssi_dbm": node.get("rssi_dbm"),
+            "snr_db": node.get("snr_db"),
             "entities": ordered,
         })
 

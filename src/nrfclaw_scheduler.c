@@ -1,8 +1,6 @@
 #include "nrfclaw_scheduler.h"
 #include "nrfclaw_rtc.h"
 #include "nrfclaw_vm.h"
-#include "SEGGER_RTT.h"
-
 static nrfclaw_schedule_t m_rule;
 static nrfclaw_scheduler_state_t m_state;
 static uint32_t m_next_epoch;
@@ -202,12 +200,7 @@ static bool arm_next(void)
     m_next_epoch = next;
     m_state = NRFCLAW_SCHED_ARMED;
 
-    SEGGER_RTT_printf(
-        0,
-        "SCHED: armed mode=%u next=%lu\r\n",
-        (unsigned)m_rule.mode,
-        (unsigned long)m_next_epoch
-    );
+    ((void)0);
 
     return true;
 }
@@ -291,13 +284,13 @@ bool nrfclaw_scheduler_on_rtc_event(void)
 
     if (!nrfclaw_vm_run_loaded())
     {
-        SEGGER_RTT_WriteString(0, "SCHED ERROR: VM RUN rejected\r\n");
+        ((void)0);
         m_state = NRFCLAW_SCHED_ERROR;
         return true;
     }
 
     m_state = NRFCLAW_SCHED_RUNNING;
-    SEGGER_RTT_WriteString(0, "SCHED: fired -> VM RUN\r\n");
+    ((void)0);
     return true;
 }
 

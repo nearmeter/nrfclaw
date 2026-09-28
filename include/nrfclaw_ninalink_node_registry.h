@@ -6,7 +6,7 @@
 
 #include "nrfclaw_ninalink.h"
 
-#define NRFCLAW_NINALINK_NODE_REGISTRY_CAPACITY 8U
+#define NRFCLAW_NINALINK_NODE_REGISTRY_CAPACITY 16U
 
 typedef enum {
     NRFCLAW_NINALINK_NODE_DISC_NEW = 0,

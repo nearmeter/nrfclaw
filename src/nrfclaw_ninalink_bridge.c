@@ -1,7 +1,12 @@
 #include "nrfclaw_ninalink_bridge.h"
 #include "nrfclaw_ninalink_node_registry.h"
+#include "nrfclaw_ninalink_cap_inventory.h"
 #include "nrfclaw_ninalink_auto_discovery.h"
 #include "nrfclaw_ninalink_state_cache.h"
+#include "nrfclaw_ninalink_link.h"
+#include "nrfclaw_capability.h"
+#include "nrfclaw_ninalink_network.h"
+#include "nrfclaw_ninalink_query.h"
 
 #include "app_timer.h"
 #include "nrf.h"
@@ -12,8 +17,6 @@
 #include "nrfclaw_ninalink_command_discovery.h"
 #include "nrfclaw_ninalink_capability_discovery.h"
 
-#include "SEGGER_RTT.h"
-
 #include <string.h>
 
 #define BRIDGE_TX_DELAY_MS       60U
@@ -21,14 +24,11 @@
 #define BRIDGE_ACK_FRAME_LEN     18U
 #define BRIDGE_CAP_SET_LEN       22U
 
-#define APP_CAP_TRACKING_ACTIVE  0x0401U
-#define APP_TYPE_BOOL            0x01U
 
 #define COMMAND_PAYLOAD_BASE     5U
 #define COMMAND_RESULT_BASE      4U
 
-#define BRIDGE_DIAG_QUEUE_DEPTH 8U
-#define BRIDGE_SESSION_NODES 8U
+#define BRIDGE_SESSION_NODES 16U
 
 typedef struct {
     uint8_t len;
@@ -89,14 +89,6 @@ static uint8_t m_head;
 static uint8_t m_tail;
 static uint8_t m_count;
 
-static bridge_queue_packet_t m_diag_queue[BRIDGE_DIAG_QUEUE_DEPTH];
-static uint8_t m_diag_head;
-static uint8_t m_diag_tail;
-static uint8_t m_diag_count;
-static uint16_t m_consumer_consumed;
-static uint16_t m_consumer_cached_frames;
-static uint16_t m_consumer_cache_errors;
-static uint16_t m_diag_dropped;
 
 static bridge_session_entry_t m_sessions[BRIDGE_SESSION_NODES];
 
@@ -110,8 +102,7 @@ static uint16_t m_dropped;
 static uint16_t m_radio_dropped_base;
 static uint16_t m_ack_sent;
 static uint16_t m_duplicates;
-static uint16_t m_ack_test_dropped;
-static bool m_drop_next_ack;
+static uint16_t m_foreign_network;
 static uint8_t m_last_error;
 
 static uint8_t m_tx_wire[NRFCLAW_NINALINK_MAX_FRAME_SIZE];
@@ -130,6 +121,7 @@ static uint16_t m_next_discovery_sequence = 1U;
 
 static nrfclaw_ninalink_capability_discovery_status_t m_capdisc;
 static uint16_t m_next_capability_discovery_sequence = 1U;
+
 
 static uint16_t get_u16_le(const uint8_t *p)
 {
@@ -180,9 +172,6 @@ static void reset_queue(void)
     m_head = 0U;
     m_tail = 0U;
     m_count = 0U;
-    m_diag_head = 0U;
-    m_diag_tail = 0U;
-    m_diag_count = 0U;
 }
 
 static void reset_dup_cache(void)
@@ -375,23 +364,6 @@ static bool queue_validated(const uint8_t *data,
     return true;
 }
 
-static void diagnostic_mirror_push(
-    const bridge_queue_packet_t *src)
-{
-    bridge_queue_packet_t *dst;
-    if (!src)
-        return;
-    if (m_diag_count >= BRIDGE_DIAG_QUEUE_DEPTH) {
-        m_diag_tail = (uint8_t)((m_diag_tail + 1U) % BRIDGE_DIAG_QUEUE_DEPTH);
-        m_diag_count--;
-        if (m_diag_dropped != 0xFFFFU)
-            m_diag_dropped++;
-    }
-    dst = &m_diag_queue[m_diag_head];
-    *dst = *src;
-    m_diag_head = (uint8_t)((m_diag_head + 1U) % BRIDGE_DIAG_QUEUE_DEPTH);
-    m_diag_count++;
-}
 
 static void consume_validated_queue(void)
 {
@@ -425,28 +397,20 @@ static void consume_validated_queue(void)
                     dst_i++;
                 }
 
-                if (dst_i != 0U &&
-                    nrfclaw_ninalink_state_cache_ingest_values_session(
+                if (dst_i != 0U) {
+                    (void)nrfclaw_ninalink_state_cache_ingest_values_session(
                         frame.node_id, session_id, frame.sequence,
                         frame.message_type, entries, dst_i,
-                        nrfclaw_rtc_now())) {
-                    if (m_consumer_cached_frames != 0xFFFFU)
-                        m_consumer_cached_frames++;
-                } else if (m_consumer_cache_errors != 0xFFFFU) {
-                    m_consumer_cache_errors++;
+                        nrfclaw_rtc_now());
                 }
-            } else if (m_consumer_cache_errors != 0xFFFFU) {
-                m_consumer_cache_errors++;
             }
         }
 
-        diagnostic_mirror_push(packet);
         m_tail = (uint8_t)((m_tail + 1U) % NRFCLAW_NINALINK_BRIDGE_QUEUE_DEPTH);
         m_count--;
-        if (m_consumer_consumed != 0xFFFFU)
-            m_consumer_consumed++;
     }
 }
+
 
 static bool restart_stream(void)
 {
@@ -491,8 +455,8 @@ static void build_ack(uint16_t network_id, uint16_t ack_seq)
     m_tx_len = BRIDGE_ACK_FRAME_LEN;
 }
 
-static void build_tracking_cap_set(uint16_t network_id,
-                                   uint16_t reply_to_seq)
+static void build_cap_set(uint16_t network_id,
+                          uint16_t reply_to_seq)
 {
     uint16_t crc;
 
@@ -507,15 +471,16 @@ static void build_tracking_cap_set(uint16_t network_id,
     put_u16_le(&m_tx_wire[11], m_app.command_seq);
 
     put_u16_le(&m_tx_wire[13], reply_to_seq);
-    put_u16_le(&m_tx_wire[15], APP_CAP_TRACKING_ACTIVE);
-    m_tx_wire[17] = 0U; /* channel */
-    m_tx_wire[18] = APP_TYPE_BOOL;
-    m_tx_wire[19] = m_app.requested_value ? 1U : 0U;
+    put_u16_le(&m_tx_wire[15], m_app.capability_id);
+    m_tx_wire[17] = m_app.channel;
+    m_tx_wire[18] = m_app.value_type;
+    m_tx_wire[19] = m_app.requested_value;
 
     crc = crc16_ccitt_false(m_tx_wire, 20U);
     put_u16_le(&m_tx_wire[20], crc);
     m_tx_len = BRIDGE_CAP_SET_LEN;
 }
+
 
 static void build_command(uint16_t network_id,
                           uint16_t reply_to_seq)
@@ -667,14 +632,8 @@ static bool schedule_response_for_uplink(const uint8_t *wire)
     }
 
 if (app_matches_node(node_id)) {
-        build_tracking_cap_set(network_id, uplink_seq);
+        build_cap_set(network_id, uplink_seq);
         return schedule_tx(BRIDGE_TX_KIND_CAP_SET);
-    }
-
-    if (m_drop_next_ack) {
-        m_drop_next_ack = false;
-        m_ack_test_dropped++;
-        return true;
     }
 
     build_ack(network_id, uplink_seq);
@@ -700,15 +659,51 @@ static bool accept_app_result(const uint8_t *wire, uint8_t len)
         return false;
 
     m_app.result = wire[15];
+    m_app.cache_committed = false;
+    m_app.cache_error = 0U;
+
+    if (m_app.result == NRFCLAW_NINALINK_APP_OK) {
+        nrfclaw_ninalink_value_entry_t entry;
+        bool cache_value_valid = true;
+
+        memset(&entry, 0, sizeof(entry));
+        entry.capability_id = m_app.capability_id;
+        entry.channel = m_app.channel;
+        entry.value.type = m_app.value_type;
+
+        switch (m_app.value_type) {
+            case NRFCLAW_CAP_VALUE_BOOL:
+                entry.value.v.boolean = m_app.requested_value != 0U;
+                break;
+
+            case NRFCLAW_CAP_VALUE_U8:
+            case NRFCLAW_CAP_VALUE_ENUM8:
+                entry.value.v.u8 = m_app.requested_value;
+                break;
+
+            case NRFCLAW_CAP_VALUE_S8:
+                entry.value.v.s8 = (int8_t)m_app.requested_value;
+                break;
+
+            default:
+                cache_value_valid = false;
+                break;
+        }
+
+        if (cache_value_valid &&
+            nrfclaw_ninalink_state_cache_upsert_query_values(
+                m_app.target_node, &entry, 1U, nrfclaw_rtc_now())) {
+            m_app.cache_committed = true;
+        } else {
+            m_app.cache_error = 1U;
+        }
+    }
+
     m_app.pending = false;
     m_app.state = NRFCLAW_NINALINK_APP_DL_DONE;
     m_app.completed_count++;
 
-    SEGGER_RTT_printf(
-        0,
-        "NINALINK B4.5 BRIDGE: CAP_SET result seq=%u status=%u\r\n",
-        (unsigned)m_app.command_seq,
-        (unsigned)m_app.result);
+    ((void)0);
 
     return true;
 }
@@ -753,17 +748,20 @@ static bool accept_command_result(const uint8_t *wire, uint8_t len)
     if (result_len)
         memcpy(m_cmd.result_data, &wire[17], result_len);
 
+    nrfclaw_ninalink_query_on_command_result(
+        m_cmd.target_node,
+        m_cmd.command_seq,
+        m_cmd.command_id,
+        m_cmd.result,
+        m_cmd.result_data,
+        m_cmd.result_len,
+        nrfclaw_rtc_now());
+
     m_cmd.pending = false;
     m_cmd.state = NRFCLAW_NINALINK_APP_DL_DONE;
     m_cmd.completed_count++;
 
-    SEGGER_RTT_printf(
-        0,
-        "NINALINK B4.7 BRIDGE: COMMAND result seq=%u id=0x%04X status=%u len=%u\r\n",
-        (unsigned)m_cmd.command_seq,
-        (unsigned)m_cmd.command_id,
-        (unsigned)m_cmd.result,
-        (unsigned)m_cmd.result_len);
+    ((void)0);
 
     return true;
 }
@@ -814,13 +812,7 @@ static bool accept_command_discovery_response(
     m_disc.state = NRFCLAW_NINALINK_APP_DL_DONE;
     m_disc.completed_count++;
 
-    SEGGER_RTT_printf(
-        0,
-        "NINALINK B4.9 BRIDGE: discovery result seq=%u start=%u total=%u count=%u\r\n",
-        (unsigned)m_disc.request_seq,
-        (unsigned)m_disc.start_index,
-        (unsigned)m_disc.total_count,
-        (unsigned)m_disc.count);
+    ((void)0);
 
     return true;
 }
@@ -850,21 +842,15 @@ static bool accept_capability_discovery_response(
 
     node_id = get_u32_le(&wire[7]);
     request_seq = get_u16_le(&wire[11]);
-
     if (node_id != m_capdisc.target_node ||
         request_seq != m_capdisc.request_seq)
         return false;
 
     memset(descriptors, 0, sizeof(descriptors));
-
     if (nrfclaw_ninalink_parse_caps_response(
-            &frame,
-            &registry_version,
-            &page_index,
-            descriptors,
+            &frame, &registry_version, &page_index, descriptors,
             NRFCLAW_NINALINK_CAPABILITY_DISCOVERY_PAGE_MAX,
-            &count,
-            &more) != NRFCLAW_NINALINK_MSG_OK)
+            &count, &more) != NRFCLAW_NINALINK_MSG_OK)
         return false;
 
     if (registry_version != NRFCLAW_CAPABILITY_REGISTRY_VERSION ||
@@ -876,25 +862,18 @@ static bool accept_capability_discovery_response(
     m_capdisc.more = more;
     memset(m_capdisc.descriptors, 0, sizeof(m_capdisc.descriptors));
     if (count)
-        memcpy(
-            m_capdisc.descriptors,
-            descriptors,
-            (size_t)count * sizeof(descriptors[0]));
+        memcpy(m_capdisc.descriptors, descriptors,
+               (size_t)count * sizeof(descriptors[0]));
+
+    (void)nrfclaw_ninalink_cap_inventory_store_page(
+        node_id, registry_version, page_index, descriptors, count, more);
 
     m_capdisc.pending = false;
     m_capdisc.state = NRFCLAW_NINALINK_APP_DL_DONE;
     m_capdisc.completed_count++;
-
-    SEGGER_RTT_printf(
-        0,
-        "NINALINK B4.10 BRIDGE: CAPS_RESPONSE seq=%u page=%u count=%u more=%u\r\n",
-        (unsigned)m_capdisc.request_seq,
-        (unsigned)m_capdisc.page_index,
-        (unsigned)m_capdisc.count,
-        m_capdisc.more ? 1U : 0U);
-
     return true;
 }
+
 
 bool nrfclaw_ninalink_bridge_start(void)
 {
@@ -917,8 +896,7 @@ bool nrfclaw_ninalink_bridge_start(void)
     m_radio_dropped_base = 0U;
     m_ack_sent = 0U;
     m_duplicates = 0U;
-    m_ack_test_dropped = 0U;
-    m_drop_next_ack = false;
+    m_foreign_network = 0U;
     m_last_error = NRFCLAW_NINALINK_BRIDGE_ERR_NONE;
     m_tx_state = BRIDGE_TX_IDLE;
     m_tx_kind = BRIDGE_TX_KIND_NONE;
@@ -933,6 +911,7 @@ bool nrfclaw_ninalink_bridge_start(void)
     m_cmd.state = NRFCLAW_NINALINK_APP_DL_IDLE;
     m_cmd.result = 0xFFU;
     m_cmd_arg_len = 0U;
+    nrfclaw_ninalink_query_reset();
 
     memset(&m_disc, 0, sizeof(m_disc));
     m_disc.state = NRFCLAW_NINALINK_APP_DL_IDLE;
@@ -942,16 +921,12 @@ bool nrfclaw_ninalink_bridge_start(void)
 
     nrfclaw_ninalink_auto_discovery_reset_runtime();
 
-    m_consumer_consumed = 0U;
-    m_consumer_cached_frames = 0U;
-    m_consumer_cache_errors = 0U;
-    m_diag_dropped = 0U;
 
     if (!nrfclaw_lora_diag_stream_start())
         return false;
 
     m_active = true;
-    SEGGER_RTT_WriteString(0, "NINALINK B4.5 BRIDGE: RX active\r\n");
+    ((void)0);
     return true;
 }
 
@@ -976,34 +951,55 @@ void nrfclaw_ninalink_bridge_stop(void)
     reset_queue();
 }
 
-void nrfclaw_ninalink_bridge_drop_next_ack(void)
-{
-    m_drop_next_ack = true;
-}
 
-bool nrfclaw_ninalink_bridge_queue_tracking(uint32_t target_node, bool active)
+bool nrfclaw_ninalink_bridge_queue_cap_set(
+    uint32_t target_node,
+    uint16_t capability_id,
+    uint8_t channel,
+    uint8_t value_type,
+    uint8_t value)
 {
-    if (!m_active || m_app.pending || m_cmd.pending || m_disc.pending ||
-        m_capdisc.pending ||
+    if (!m_active || m_app.pending || m_cmd.pending ||
         m_tx_state == BRIDGE_TX_WAIT_APP_RESULT)
+        return false;
+
+    if (target_node == 0U || target_node == 0xFFFFFFFFUL ||
+        capability_id == 0U)
+        return false;
+
+    if (value_type != NRFCLAW_CAP_VALUE_BOOL &&
+        value_type != NRFCLAW_CAP_VALUE_U8 &&
+        value_type != NRFCLAW_CAP_VALUE_S8 &&
+        value_type != NRFCLAW_CAP_VALUE_ENUM8)
         return false;
 
     m_app.pending = true;
     m_app.target_node = target_node;
     m_app.command_seq = m_next_app_sequence++;
-    m_app.requested_value = active;
+    m_app.capability_id = capability_id;
+    m_app.channel = channel;
+    m_app.value_type = value_type;
+    m_app.requested_value = value;
+    m_app.cache_committed = false;
+    m_app.cache_error = 0U;
     m_app.state = NRFCLAW_NINALINK_APP_DL_PENDING;
     m_app.result = 0xFFU;
 
-    SEGGER_RTT_printf(
-        0,
-        "NINALINK B4.5 BRIDGE: queued tracking=%u target=0x%08lX cmd_seq=%u\r\n",
-        active ? 1U : 0U,
-        (unsigned long)target_node,
-        (unsigned)m_app.command_seq);
+    ((void)0);
 
     return true;
 }
+
+bool nrfclaw_ninalink_bridge_queue_tracking(uint32_t target_node, bool active)
+{
+    return nrfclaw_ninalink_bridge_queue_cap_set(
+        target_node,
+        NRFCLAW_SEMCAP_TRACKING_ACTIVE,
+        0U,
+        NRFCLAW_CAP_VALUE_BOOL,
+        active ? 1U : 0U);
+}
+
 
 void nrfclaw_ninalink_bridge_get_app_status(
     nrfclaw_ninalink_app_dl_status_t *out)
@@ -1042,13 +1038,7 @@ bool nrfclaw_ninalink_bridge_queue_command(
     if (arg_len)
         memcpy(m_cmd_args, args, arg_len);
 
-    SEGGER_RTT_printf(
-        0,
-        "NINALINK B4.7 BRIDGE: queued COMMAND id=0x%04X target=0x%08lX seq=%u args=%u\r\n",
-        (unsigned)command_id,
-        (unsigned long)target_node,
-        (unsigned)m_cmd.command_seq,
-        (unsigned)arg_len);
+    ((void)0);
 
     return true;
 }
@@ -1076,12 +1066,7 @@ bool nrfclaw_ninalink_bridge_queue_command_discovery(
     m_disc.start_index = start_index;
     m_disc.state = NRFCLAW_NINALINK_APP_DL_PENDING;
 
-    SEGGER_RTT_printf(
-        0,
-        "NINALINK B4.9 BRIDGE: queued discovery target=0x%08lX seq=%u start=%u\r\n",
-        (unsigned long)target_node,
-        (unsigned)m_disc.request_seq,
-        (unsigned)start_index);
+    ((void)0);
 
     return true;
 }
@@ -1109,12 +1094,7 @@ bool nrfclaw_ninalink_bridge_queue_capability_discovery(
     m_capdisc.page_index = page_index;
     m_capdisc.state = NRFCLAW_NINALINK_APP_DL_PENDING;
 
-    SEGGER_RTT_printf(
-        0,
-        "NINALINK B4.10 BRIDGE: queued capability discovery target=0x%08lX seq=%u page=%u\r\n",
-        (unsigned long)target_node,
-        (unsigned)m_capdisc.request_seq,
-        (unsigned)page_index);
+    ((void)0);
 
     return true;
 }
@@ -1240,6 +1220,7 @@ void nrfclaw_ninalink_bridge_process(void)
                 m_capdisc.state = NRFCLAW_NINALINK_APP_DL_WAIT_RESULT;
             }
 
+
             if (!nrfclaw_lora_receive_window_async(
                     BRIDGE_APP_RESULT_RX_MS)) {
                 if (m_tx_kind == BRIDGE_TX_KIND_CAP_SET)
@@ -1267,11 +1248,16 @@ void nrfclaw_ninalink_bridge_process(void)
             uint8_t result_wire[NRFCLAW_NINALINK_MAX_FRAME_SIZE];
             uint8_t result_len = 0U;
             bool accepted = false;
+            bool took_rx;
 
-            if (nrfclaw_lora_take_rx(
-                    result_wire,
-                    &result_len,
-                    sizeof(result_wire))) {
+
+            took_rx = nrfclaw_lora_take_rx(
+                result_wire,
+                &result_len,
+                sizeof(result_wire));
+
+
+            if (took_rx) {
                 if (m_tx_kind == BRIDGE_TX_KIND_CAP_SET)
                     accepted = accept_app_result(result_wire, result_len);
                 else if (m_tx_kind == BRIDGE_TX_KIND_COMMAND)
@@ -1370,6 +1356,16 @@ void nrfclaw_ninalink_bridge_process(void)
             continue;
         }
 
+        /* B7.6f2l1: reject a foreign NinaLink network before registry,
+         * duplicate tracking, semantic validation, ACK or cache ingestion.
+         * network_id already exists in the frozen v1 header, so this adds
+         * zero bytes and zero LoRa airtime to the protocol. */
+        if (frame.network_id != nrfclaw_ninalink_network_id()) {
+            if (m_foreign_network != 0xFFFFU)
+                m_foreign_network++;
+            continue;
+        }
+
         if (!validate_semantic(&frame)) {
             m_invalid++;
             m_last_error = NRFCLAW_NINALINK_BRIDGE_ERR_SEMANTIC;
@@ -1422,34 +1418,6 @@ void nrfclaw_ninalink_bridge_process(void)
     }
 }
 
-bool nrfclaw_ninalink_bridge_take(
-    nrfclaw_ninalink_bridge_packet_t *out)
-{
-    bridge_queue_packet_t const *p;
-    if (!out || m_diag_count == 0U)
-        return false;
-    p = &m_diag_queue[m_diag_tail];
-    out->len = p->len;
-    memcpy(out->data, p->data, p->len);
-    out->rssi_x2 = p->rssi_x2;
-    out->snr_x4 = p->snr_x4;
-    m_diag_tail = (uint8_t)((m_diag_tail + 1U) % BRIDGE_DIAG_QUEUE_DEPTH);
-    m_diag_count--;
-    return true;
-}
-
-void nrfclaw_ninalink_bridge_get_consumer_status(
-    nrfclaw_ninalink_bridge_consumer_status_t *out)
-{
-    if (!out)
-        return;
-    out->admission_queued = m_count;
-    out->consumed = m_consumer_consumed;
-    out->cached_frames = m_consumer_cached_frames;
-    out->cache_errors = m_consumer_cache_errors;
-    out->diagnostic_queued = m_diag_count;
-    out->diagnostic_dropped = m_diag_dropped;
-}
 
 void nrfclaw_ninalink_bridge_get_status(nrfclaw_ninalink_bridge_status_t *out)
 {
@@ -1472,6 +1440,5 @@ void nrfclaw_ninalink_bridge_get_status(nrfclaw_ninalink_bridge_status_t *out)
     out->last_error = m_last_error;
     out->ack_sent = m_ack_sent;
     out->duplicates = m_duplicates;
-    out->ack_test_dropped = m_ack_test_dropped;
-    out->drop_next_ack = m_drop_next_ack;
+    out->foreign_network = m_foreign_network;
 }

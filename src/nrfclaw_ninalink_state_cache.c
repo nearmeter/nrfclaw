@@ -1,4 +1,5 @@
 #include "nrfclaw_ninalink_state_cache.h"
+#include "nrfclaw_ninalink_command.h"
 #include <string.h>
 
 typedef struct {
@@ -335,6 +336,68 @@ bool nrfclaw_ninalink_state_cache_ingest_values(
 {
     return nrfclaw_ninalink_state_cache_ingest_values_session(
         node_id, 0U, sequence, message_type, entries, entry_count, now_s);
+}
+
+bool nrfclaw_ninalink_state_cache_upsert_query_values(
+    uint32_t node_id,
+    const nrfclaw_ninalink_value_entry_t *entries,
+    uint8_t entry_count,
+    uint32_t now_s)
+{
+    node_slot_t *node;
+    int found;
+    uint8_t node_index, i;
+
+    if (node_id == 0U || node_id == 0xFFFFFFFFUL ||
+        !entries || entry_count == 0U)
+        return false;
+
+    found = find_node(node_id);
+    if (found >= 0) {
+        node_index = (uint8_t)found;
+    } else {
+        node_index = choose_node();
+        memset(&m_nodes[node_index], 0, sizeof(m_nodes[node_index]));
+        m_nodes[node_index].pub.valid = true;
+        m_nodes[node_index].pub.node_id = node_id;
+    }
+
+    node = &m_nodes[node_index];
+    node->pub.last_seen_s = now_s;
+    node->touch_order = next_touch();
+
+    for (i = 0U; i < entry_count; i++) {
+        value_slot_t *slot;
+        uint8_t value_index;
+        uint16_t old_count = 0U;
+        found = find_value(node, entries[i].capability_id, entries[i].channel);
+        if (found >= 0) {
+            value_index = (uint8_t)found;
+            old_count = node->values[value_index].pub.update_count;
+        } else {
+            value_index = choose_value(node);
+        }
+        slot = &node->values[value_index];
+        memset(&slot->pub, 0, sizeof(slot->pub));
+        slot->pub.valid = true;
+        slot->pub.capability_id = entries[i].capability_id;
+        slot->pub.channel = entries[i].channel;
+        slot->pub.value = entries[i].value;
+        slot->pub.last_sequence = node->pub.last_sequence;
+        slot->pub.last_message_type = NRFCLAW_NINALINK_MSG_COMMAND_RESULT;
+        slot->pub.updated_s = now_s;
+        slot->pub.update_count = old_count == 0xFFFFU ? old_count : (uint16_t)(old_count + 1U);
+        if (slot->pub.update_count == 0U) slot->pub.update_count = 1U;
+        slot->touch_order = next_touch();
+        m_value_updates = sat_inc16(m_value_updates);
+    }
+
+    node->pub.value_count = 0U;
+    for (i = 0U; i < NRFCLAW_NINALINK_STATE_CACHE_VALUES_PER_NODE; i++)
+        if (node->values[i].pub.valid) node->pub.value_count++;
+
+    mark_state_changed();
+    return true;
 }
 
 void nrfclaw_ninalink_state_cache_get_status(

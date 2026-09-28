@@ -5,10 +5,24 @@
 #include "nrfclaw_serial.h"
 #include "nrfclaw_tracking.h"
 #include "nrfclaw_ds18b20.h"
+#include "nrfclaw_temperature.h"
 #include "nrfclaw_vib_health.h"
 #include "nrfclaw_vib_auto.h"
 #include "nrf_gpio.h"
 
+
+static void gpio_release_highz(uint8_t pin)
+{
+    /* B7.6f2m2a: a truly unused GPIO must not only have pulls disabled;
+     * its input buffer must also be disconnected so a floating pad cannot
+     * toggle the input stage and raise sleep current. */
+    nrf_gpio_cfg(pin,
+                 NRF_GPIO_PIN_DIR_INPUT,
+                 NRF_GPIO_PIN_INPUT_DISCONNECT,
+                 NRF_GPIO_PIN_NOPULL,
+                 NRF_GPIO_PIN_S0S1,
+                 NRF_GPIO_PIN_NOSENSE);
+}
 
 static void gpio_release_to_default(uint8_t pin)
 {
@@ -17,13 +31,15 @@ static void gpio_release_to_default(uint8_t pin)
      * Keep it high impedance to avoid wasting current through that resistor.
      */
     if (pin == P_DS18) {
-        nrf_gpio_cfg_input(pin, NRF_GPIO_PIN_NOPULL);
+        gpio_release_highz(pin);
         return;
     }
 
     /*
-     * Shared/free user GPIOs default to INPUT + PULLDOWN.
-     * This gives a deterministic LOW without actively driving the pin.
+     * B7.6f2m2: every unclaimed/shared user GPIO defaults to INPUT + NOPULL.
+     * A free pin may be connected to an externally driven signal; an internal
+     * pull can then waste hundreds of microamps.  Active functions are
+     * responsible for requesting any pull they actually require.
      */
     switch (pin) {
         case P_HALL1:
@@ -33,17 +49,17 @@ static void gpio_release_to_default(uint8_t pin)
         case P_FREE_A29:
         case P_FREE_A30:
         case P_FREE_A31:
-            nrf_gpio_cfg_input(pin, NRF_GPIO_PIN_PULLDOWN);
+            gpio_release_highz(pin);
             break;
 
         /*
-         * D18 belongs to LIS2DH12 when the accelerometer is present.
-         * When absent it may be used as GPIO, but the LIS driver owns the
-         * release/probe state, so do not override it here at boot.
+         * D18 belongs to LIS2DH12 when the accelerometer is present.  When the
+         * device is absent and D18 becomes a free GPIO, use the same high-Z
+         * default as every other unclaimed GPIO.
          */
         case P_LIS_SDA:
             if (!nrfclaw_lis2dh12_present())
-                nrf_gpio_cfg_input(pin, NRF_GPIO_PIN_PULLDOWN);
+                gpio_release_highz(pin);
             break;
 
         default:
@@ -87,8 +103,8 @@ void nrfclaw_native_init(void)
      *
      * D11/D14 are optional Hall/Reed inputs and general-purpose GPIOs.
      * D15/D16/A29/A30/A31 are exposed general-purpose GPIOs.
-     * All start as input + pulldown so they read a deterministic LOW and
-     * never float around intermediate voltages.
+     * All unclaimed GPIOs start as input + NOPULL (high impedance).  A feature
+     * that owns a pin must configure any required pull explicitly.
      */
     gpio_release_to_default(P_HALL1);
     gpio_release_to_default(P_HALL2);
@@ -106,10 +122,11 @@ void nrfclaw_native_init(void)
 
     /* Stage 10.2.3: automatic, one-time 1-Wire presence probe. */
     nrfclaw_ds18b20_init();
+    nrfclaw_temperature_init();
 
     /*
      * Probe LIS2DH12 last. If it is absent, the LIS driver releases its pins.
-     * D18 can then fall back to the same deterministic GPIO LOW state.
+     * D18 can then fall back to the same high-Z free-GPIO state.
      */
     nrfclaw_lis2dh12_init();
 
@@ -144,6 +161,8 @@ bool nrfclaw_native_capability_supported(uint8_t capability)
         case NRFCLAW_CAP_VIB_AUTO:
             return (nrfclaw_vib_auto_build_gate() == 1U) &&
                    nrfclaw_vib_auto_supported();
+        case NRFCLAW_CAP_TEMPERATURE:
+            return nrfclaw_temperature_available();
         default:
             return false;
     }
@@ -171,6 +190,8 @@ bool nrfclaw_native_capability_active(uint8_t capability)
             nrfclaw_vib_auto_get_status(&st);
             return st.enabled;
         }
+        case NRFCLAW_CAP_TEMPERATURE:
+            return nrfclaw_temperature_available();
         default:
             return false;
     }
@@ -223,13 +244,15 @@ nrfclaw_native_status_t nrfclaw_native_gpio_read(uint8_t pin, uint32_t *value)
         return NRFCLAW_NATIVE_BUSY;
 
     /*
-     * Restore the board-defined safe input state before reading.
-     * D20 remains high-Z because of its external pull-up; the other exposed
-     * general-purpose pins use pulldown so they do not float.
+     * Restore the board-defined free-pin state before reading.  Unclaimed
+     * GPIOs are high-Z/NOPULL; therefore an unconnected input has no guaranteed
+     * logical level until the caller or external circuit provides a bias.
      */
-    gpio_release_to_default(pin);
-
+    /* B7.6f2m2a: unused pins normally have their input buffer disconnected.
+     * Reconnect it only for this explicit GPIO sample, then restore high-Z. */
+    nrf_gpio_cfg_input(pin, NRF_GPIO_PIN_NOPULL);
     *value = nrf_gpio_pin_read(pin) ? 1U : 0U;
+    gpio_release_to_default(pin);
     return NRFCLAW_NATIVE_OK;
 }
 

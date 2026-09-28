@@ -85,6 +85,123 @@ static uint8_t command_get_tracking_state(
     return NRFCLAW_NINALINK_COMMAND_STATUS_OK;
 }
 
+static uint8_t command_query_capabilities(
+    const nrfclaw_ninalink_command_context_t *context,
+    const uint8_t *args,
+    uint8_t arg_len,
+    uint8_t *result,
+    uint8_t *result_len)
+{
+    uint8_t count;
+    uint8_t i;
+    uint8_t off = 1U;
+
+    if (!context || !context->query_read || !args)
+        return NRFCLAW_NINALINK_COMMAND_STATUS_EXEC_FAILED;
+
+    count = args[0];
+    if (count == 0U || count > NRFCLAW_NINALINK_QUERY_MAX_ITEMS)
+        return NRFCLAW_NINALINK_COMMAND_STATUS_BAD_ARGS;
+
+    if (arg_len != (uint8_t)(1U + 3U * count))
+        return NRFCLAW_NINALINK_COMMAND_STATUS_BAD_ARGS;
+
+    result[0] = count;
+
+    for (i = 0U; i < count; i++) {
+        uint8_t arg_off = (uint8_t)(1U + 3U * i);
+        uint16_t capability_id =
+            (uint16_t)args[arg_off] |
+            ((uint16_t)args[arg_off + 1U] << 8);
+        uint8_t channel = args[arg_off + 2U];
+        uint8_t value_type = 0U;
+        uint32_t raw_value = 0U;
+        uint8_t item_status = context->query_read(
+            capability_id,
+            channel,
+            &value_type,
+            &raw_value);
+
+        result[off++] = item_status;
+        result[off++] = item_status == NRFCLAW_NINALINK_QUERY_ITEM_OK
+            ? value_type : 0U;
+        put_u32_le(&result[off],
+                   item_status == NRFCLAW_NINALINK_QUERY_ITEM_OK
+                       ? raw_value : 0U);
+        off = (uint8_t)(off + 4U);
+    }
+
+    *result_len = off;
+    return NRFCLAW_NINALINK_COMMAND_STATUS_OK;
+}
+
+/*
+ * B7.6f2m6a one-shot device operations.
+ *
+ * Firmware links the real backends. Host registry/discovery gates link a
+ * dedicated test stub so the registry remains independently testable.
+ */
+bool nrfclaw_direct_hall_control_reset_value(void);
+bool nrfclaw_vib_auto_reset_learning(void);
+bool nrfclaw_vm_semantic_accumulator_reset(void);
+
+static uint8_t command_reset_hall_counter(
+    const nrfclaw_ninalink_command_context_t *context,
+    const uint8_t *args,
+    uint8_t arg_len,
+    uint8_t *result,
+    uint8_t *result_len)
+{
+    (void)context;
+    (void)args;
+    (void)arg_len;
+    (void)result;
+
+    *result_len = 0U;
+
+    return nrfclaw_direct_hall_control_reset_value()
+        ? NRFCLAW_NINALINK_COMMAND_STATUS_OK
+        : NRFCLAW_NINALINK_COMMAND_STATUS_EXEC_FAILED;
+}
+
+static uint8_t command_vib_auto_relearn(
+    const nrfclaw_ninalink_command_context_t *context,
+    const uint8_t *args,
+    uint8_t arg_len,
+    uint8_t *result,
+    uint8_t *result_len)
+{
+    (void)context;
+    (void)args;
+    (void)arg_len;
+    (void)result;
+
+    *result_len = 0U;
+
+    return nrfclaw_vib_auto_reset_learning()
+        ? NRFCLAW_NINALINK_COMMAND_STATUS_OK
+        : NRFCLAW_NINALINK_COMMAND_STATUS_EXEC_FAILED;
+}
+
+static uint8_t command_reset_semantic_total(
+    const nrfclaw_ninalink_command_context_t *context,
+    const uint8_t *args,
+    uint8_t arg_len,
+    uint8_t *result,
+    uint8_t *result_len)
+{
+    (void)context;
+    (void)args;
+    (void)arg_len;
+    (void)result;
+
+    *result_len = 0U;
+
+    return nrfclaw_vm_semantic_accumulator_reset()
+        ? NRFCLAW_NINALINK_COMMAND_STATUS_OK
+        : NRFCLAW_NINALINK_COMMAND_STATUS_EXEC_FAILED;
+}
+
 static const command_entry_t m_registry[] = {
     {
         { NRFCLAW_NINALINK_COMMAND_ECHO_U32,
@@ -100,6 +217,26 @@ static const command_entry_t m_registry[] = {
         { NRFCLAW_NINALINK_COMMAND_GET_TRACKING_STATE,
           0U, 0U, 1U, NRFCLAW_NINALINK_COMMAND_FLAG_READ_ONLY },
         command_get_tracking_state
+    },
+    {
+        { NRFCLAW_NINALINK_COMMAND_QUERY_CAPABILITIES,
+          4U, 7U, 13U, NRFCLAW_NINALINK_COMMAND_FLAG_READ_ONLY },
+        command_query_capabilities
+    },
+    {
+        { NRFCLAW_NINALINK_COMMAND_RESET_HALL_COUNTER,
+          0U, 0U, 0U, 0U },
+        command_reset_hall_counter
+    },
+    {
+        { NRFCLAW_NINALINK_COMMAND_VIB_AUTO_RELEARN,
+          0U, 0U, 0U, 0U },
+        command_vib_auto_relearn
+    },
+    {
+        { NRFCLAW_NINALINK_COMMAND_RESET_SEMANTIC_TOTAL,
+          0U, 0U, 0U, 0U },
+        command_reset_semantic_total
     }
 };
 

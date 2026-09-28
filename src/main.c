@@ -6,8 +6,7 @@
 #include "nrf_pwr_mgmt.h"
 #include "app_error.h"
 #include "nrf_drv_gpiote.h"
-#include "SEGGER_RTT.h"
-
+#include "nrf_gpio.h"
 #include "nrfclaw_event.h"
 #include "nrfclaw_rtc.h"
 #include "nrfclaw_inputs.h"
@@ -19,23 +18,32 @@
 #include "nrfclaw_flash.h"
 #include "nrfclaw_scheduler.h"
 #include "nrfclaw_native.h"
+#include "nrfclaw_temperature.h"
 #include "nrfclaw_vib_health.h"
 #include "nrfclaw_vib_auto.h"
 #include "nrfclaw_ble_app.h"
+#include "nrfclaw_direct_adv.h"
+#include "nrfclaw_direct_sensor_control.h"
+#include "nrfclaw_direct_hall_control.h"
 #include "nrfclaw_ble_boot.h"
+#include "nrfclaw_ha_role.h"
+#include "nrfclaw_ha_ninalink_node.h"
 #include "nrfclaw_state.h"
 #include "nrfclaw_factory.h"
 #include "nrfclaw_tracking.h"
 #include "nrfclaw_board_api.h"
 #include "nrfclaw_lis2dh12.h"
+#include "nrfclaw_capability.h"
 #include "nrfclaw_serial.h"
 #include "nrfclaw_ds18b20.h"
-#include "nrfclaw_ninalink_lab.h"
 #include "nrfclaw_ninalink_bridge.h"
 #include "nrfclaw_ninalink_external_subscription.h"
 #include "nrfclaw_ninalink_link.h"
-#include "nrfclaw_b55_gate.h"
+#include "nrfclaw_ninalink_event_router.h"
+#include "nrfclaw_ninalink_network.h"
+#include "nrfclaw_ninalink_telemetry.h"
 
+#if NRFCLAW_BOARD_HAS_LORA
 static void lora_dio_handler(nrf_drv_gpiote_pin_t pin,
                              nrf_gpiote_polarity_t action)
 {
@@ -66,6 +74,7 @@ static void lora_irq_init(void)
 
     nrf_drv_gpiote_in_event_disable(P_LORA_DIO1);
 }
+#endif /* NRFCLAW_BOARD_HAS_LORA */
 
 static bool m_programming_pending;
 
@@ -81,11 +90,28 @@ static void dispatch(nrfclaw_event_t const *p_evt)
         return;
 
     if (p_evt->type == NRFCLAW_EVT_BUTTON) {
+        /*
+         * B7.6f2k3a: GPIOTE/SENSE can leave a transient/stale BUTTON event
+         * queued across early boot. P0.21 is our physical-presence gate, so
+         * verify that it is still asserted LOW before allowing programming
+         * mode to preempt an autonomous BOOT program. A released/HIGH pin
+         * must never stop the VM or steal the shared BLE advertiser.
+         */
+        if (nrf_gpio_pin_read(P_BUTTON) != 0U)
+        {
+            ((void)0);
+            return;
+        }
+
         /* Programming/NUS always owns the device after physical presence. */
         m_programming_pending = true;
 
         /* P0.21 has priority over the experimental tracking advertiser. */
         nrfclaw_tracking_stop();
+        nrfclaw_ninalink_telemetry_stop();
+        nrfclaw_ninalink_event_router_reset();
+        nrfclaw_ha_ninalink_node_stop();
+        nrfclaw_ninalink_bridge_stop();
         nrfclaw_ble_app_suspend();
 
         /*
@@ -118,6 +144,7 @@ static void dispatch(nrfclaw_event_t const *p_evt)
             return;
     }
     else if (p_evt->type == NRFCLAW_EVT_LORA_DIO1) {
+#if NRFCLAW_BOARD_HAS_LORA
         if (nrfclaw_lora_on_dio1_event()) {
             nrfclaw_event_t tx_done = {
                 .type = NRFCLAW_EVT_LORA_TX_DONE,
@@ -133,29 +160,37 @@ static void dispatch(nrfclaw_event_t const *p_evt)
             };
             nrfclaw_vm_on_event(&rx_done);
         }
+#endif
         return;
     }
 
     nrfclaw_battery_on_event(p_evt);
     nrfclaw_ds18b20_on_event(p_evt);
+    nrfclaw_temperature_on_event(p_evt);
+    nrfclaw_ninalink_telemetry_on_event(p_evt);
+    nrfclaw_ha_ninalink_node_on_event(p_evt);
+    if (p_evt->type == NRFCLAW_EVT_ACCEL_MOTION)
+        nrfclaw_capability_motion_latch_set();
     nrfclaw_lis2dh12_on_event(p_evt);
+    /* B7.6f2l6a raw INT1 qualification is driver-internal.  The driver may
+     * enqueue a validated ACCEL_TAP; never expose the raw edge to VM/HA. */
+    if (p_evt->type == NRFCLAW_EVT_ACCEL_INT1_RAW)
+        return;
     nrfclaw_vib_auto_on_event(p_evt);
     /* r3.8.11 watchdog polling is an internal driver wake, not a VM/user event. */
     if (p_evt->type == NRFCLAW_EVT_ACCEL_VIBRATION_POLL)
         return;
+    nrfclaw_direct_adv_on_event(p_evt);
+    nrfclaw_ninalink_event_router_on_event(p_evt);
     nrfclaw_vm_on_event(p_evt);
 }
 
 int main(void)
 {
     nrfclaw_board_api_init();
-    SEGGER_RTT_Init();
+    ((void)0);
 
-    SEGGER_RTT_WriteString(
-        0,
-        "\r\n========================\r\n"
-        "nRFClaw Stage 8.2 runtime\r\n"
-        "========================\r\n");
+    ((void)0);
 
     APP_ERROR_CHECK(app_timer_init());
     APP_ERROR_CHECK(nrf_pwr_mgmt_init());
@@ -174,61 +209,32 @@ int main(void)
      * Application/NDP plane is allowed to advertise at boot. The physical
      * P0.21/NUS plane remains initialized regardless of this setting. */
     nrfclaw_state_init();
+    nrfclaw_ninalink_network_init(); /* B7.6f2l1 persistent NinaLink network ID */
     nrfclaw_ble_boot_init();
     nrfclaw_ble_app_init();
 
-#if NRFCLAW_HA_NATIVE_ENABLE
-    if (nrfclaw_ble_boot_ndp_enabled()) {
-    /*
-     * Pack 02 native Home Assistant transport.
-     *
-     * Advertising is intentionally owned by the existing Application BLE
-     * plane. Home Assistant connects to the Application GATT service and
-     * exchanges NDP-SESSION frames directly. P0.21 still has priority and
-     * temporarily suspends this plane for the validated NUS programming
-     * session.
-     *
-     * Per-board current consumption is NOT assumed here; the interval and
-     * TX power are board configuration values and must be measured.
-     */
-    APP_ERROR_CHECK(
-        nrfclaw_ble_app_set_role(NRFCLAW_BLE_APP_PERIPHERAL) ==
-        NRFCLAW_BLE_APP_OK ? NRF_SUCCESS : NRF_ERROR_INTERNAL);
+/* B7.6f: HA transport role is applied only after BLE, LoRa, native
+     * capability and NinaLink services are initialized below. Fresh devices
+     * stay silent on Application/NDP until a role is explicitly configured. */
 
-    APP_ERROR_CHECK(
-        nrfclaw_ble_app_adaptive_config(
-            NRFCLAW_HA_ADV_FAST_INTERVAL_MS,
-            NRFCLAW_HA_ADV_FAST_WINDOW_MS,
-            NRFCLAW_HA_ADV_NORMAL_INTERVAL_MS,
-            NRFCLAW_HA_ADV_NORMAL_WINDOW_MS,
-            NRFCLAW_HA_ADV_SLOW_INTERVAL_MS) ==
-        NRFCLAW_BLE_APP_OK ? NRF_SUCCESS : NRF_ERROR_INTERNAL);
-
-    APP_ERROR_CHECK(
-        nrfclaw_ble_app_adv_config(
-            NRFCLAW_HA_ADV_FAST_INTERVAL_MS,
-            NRFCLAW_HA_ADV_TX_POWER_DBM,
-            NULL,
-            0U) == NRFCLAW_BLE_APP_OK ? NRF_SUCCESS : NRF_ERROR_INTERNAL);
-
-    APP_ERROR_CHECK(
-        nrfclaw_ble_app_adv_start() ==
-        NRFCLAW_BLE_APP_OK ? NRF_SUCCESS : NRF_ERROR_INTERNAL);
-    } else {
-        SEGGER_RTT_WriteString(0, "BLE APP: NDP boot advertising DISABLED (P0.21/NUS still available)\r\n");
-    }
-#endif
 
     nrfclaw_tracking_init();
 
+#if NRFCLAW_BOARD_HAS_LORA
     nrfclaw_lora_init();
     lora_irq_init();
     nrfclaw_lora_irq_ready();
+#endif
 
     nrfclaw_vm_init();
     nrfclaw_scheduler_init();
     nrfclaw_native_init();
-    APP_ERROR_CHECK(nrfclaw_ninalink_lab_init() ? NRF_SUCCESS : NRF_ERROR_INTERNAL);
+    nrfclaw_direct_sensor_control_init(); /* Direct event mode + sensitivity preset */
+    nrfclaw_direct_hall_control_init();   /* B7.6f2k3 saved Direct Hall preset */
+    nrfclaw_direct_adv_init(); /* B7.6d/e, B7.6f v2 envelope */
+    if (!nrfclaw_ha_role_apply_runtime(nrfclaw_ha_role_get())) {
+        ((void)0);
+    }
     nrfclaw_vib_health_init();
     nrfclaw_vib_auto_init();
     nrfclaw_factory_init();
@@ -254,10 +260,7 @@ int main(void)
                 persisted_program,
                 persisted_len))
         {
-            SEGGER_RTT_WriteString(
-                0,
-                "FLASH: recovered image rejected by VM validator\r\n"
-            );
+            ((void)0);
         }
         else
         {
@@ -266,36 +269,28 @@ int main(void)
              * persistent slot. Wall-clock is intentionally invalid after
              * reset, so non-manual rules enter WAIT_TIME here.
              */
-            (void)nrfclaw_scheduler_set_rule(
+            /*
+             * The scheduler owns BOOT startup. set_rule() -> arm_next()
+             * already calls nrfclaw_vm_run_loaded() for BOOT rules. Do not
+             * call it a second time here: the second call is correctly
+             * rejected because the VM is already READY and used to produce
+             * the misleading "BOOT auto-start failed" diagnostic.
+             */
+            bool const schedule_ok = nrfclaw_scheduler_set_rule(
                 &persisted_schedule
             );
 
-            /*
-             * Stage 8.2:
-             *
-             * BOOT programs are autonomous by definition. Do not leave them
-             * waiting for an explicit NUS RUN after reset.
-             *
-             * This is intentionally handled here, immediately after recovery,
-             * so TRACKING and other BOOT applications work even before wall
-             * clock synchronization.
-             */
             if (persisted_schedule.mode ==
                 NRFCLAW_SCHEDULE_BOOT)
             {
-                if (nrfclaw_vm_run_loaded())
+                if (schedule_ok &&
+                    nrfclaw_vm_state() == NRFCLAW_VM_READY)
                 {
-                    SEGGER_RTT_WriteString(
-                        0,
-                        "VM: BOOT program auto-started.\r\n"
-                    );
+                    ((void)0);
                 }
                 else
                 {
-                    SEGGER_RTT_WriteString(
-                        0,
-                        "VM: BOOT auto-start failed.\r\n"
-                    );
+                    ((void)0);
                 }
             }
         }
@@ -305,25 +300,16 @@ int main(void)
     {
         if (nrfclaw_vm_state() == NRFCLAW_VM_READY)
         {
-            SEGGER_RTT_WriteString(
-                0,
-                "VM: persistent BOOT program running.\r\n"
-            );
+            ((void)0);
         }
         else
         {
-            SEGGER_RTT_WriteString(
-                0,
-                "VM: persistent program ready.\r\n"
-            );
+            ((void)0);
         }
     }
     else
     {
-        SEGGER_RTT_WriteString(
-            0,
-            "VM: STOPPED, no program loaded. Press P0.21 for BLE programming.\r\n"
-        );
+        ((void)0);
     }
 
     for (;;) {
@@ -340,8 +326,9 @@ int main(void)
 
         nrfclaw_scheduler_process();
 
-        nrfclaw_ninalink_lab_process();
+#if NRFCLAW_BOARD_HAS_LORA
         nrfclaw_lora_process();
+#endif
         nrfclaw_ninalink_bridge_process();
 
         /*
@@ -350,8 +337,12 @@ int main(void)
          * Otherwise the MCU may sleep before arming the ACK RX window.
          */
         nrfclaw_ninalink_link_process();
-        nrfclaw_b55_gate_process();
+        nrfclaw_ninalink_event_router_process();
+        nrfclaw_ninalink_telemetry_process();
+        nrfclaw_ha_ninalink_node_process();
+#if NRFCLAW_BOARD_HAS_LORA
         nrfclaw_lora_profile_process();
+#endif
 
         /*
          * Stage 8.2 autonomous TRACKING:
@@ -372,6 +363,7 @@ int main(void)
 
         /* Pack 02 R2G: deferred/retried Application advertising restart. */
         nrfclaw_ble_app_process();
+        nrfclaw_direct_adv_process();
         nrfclaw_ninalink_external_subscription_process();
 
         nrf_pwr_mgmt_run();

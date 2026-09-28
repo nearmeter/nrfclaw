@@ -5,8 +5,6 @@
 #include "nrf_gpio.h"
 #include "nrf_delay.h"
 #include "app_error.h"
-#include "SEGGER_RTT.h"
-
 #include <string.h>
 
 /*

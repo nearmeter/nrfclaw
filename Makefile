@@ -33,6 +33,7 @@ CC      := $(TC)arm-none-eabi-gcc
 AS      := $(TC)arm-none-eabi-gcc
 OBJCOPY := $(TC)arm-none-eabi-objcopy
 SIZE    := $(TC)arm-none-eabi-size
+NM      := $(TC)arm-none-eabi-nm
 
 TARGET := $(BUILD_DIR)/nrfclaw_$(BOARD)
 ELF := $(TARGET).out
@@ -60,15 +61,19 @@ CORE_SRC := \
   src/nrfclaw_capability.c \
   src/nrfclaw_ninalink.c \
   src/nrfclaw_ninalink_msg.c \
-  src/nrfclaw_ninalink_lab.c \
   src/nrfclaw_ninalink_bridge.c \
+  src/nrfclaw_ninalink_query.c \
   src/nrfclaw_ninalink_node_registry.c \
   src/nrfclaw_ninalink_auto_discovery.c \
   src/nrfclaw_ninalink_state_cache.c \
   src/nrfclaw_ninalink_external.c \
+  src/nrfclaw_ninalink_cap_inventory.c \
   src/nrfclaw_ninalink_external_subscription.c \
   src/nrfclaw_ninalink_link.c \
-  src/nrfclaw_b55_gate.c \
+  src/nrfclaw_ninalink_event_router.c \
+  src/nrfclaw_ninalink_report_packer.c \
+  src/nrfclaw_ninalink_network.c \
+  src/nrfclaw_ninalink_telemetry.c \
   src/nrfclaw_ninalink_command_registry.c \
   src/nrfclaw_ninalink_command_discovery.c \
   src/nrfclaw_ninalink_capability_discovery.c \
@@ -78,7 +83,13 @@ CORE_SRC := \
   src/nrfclaw_vib_auto.c \
   src/nrfclaw_vib_auto_store.c \
   src/nrfclaw_ble_app.c \
+  src/nrfclaw_direct_adv.c \
+  src/nrfclaw_direct_sensor_control.c \
+  src/nrfclaw_direct_hall_control.c \
+  src/nrfclaw_vm_semantic_state.c \
   src/nrfclaw_ble_boot.c \
+  src/nrfclaw_ha_role.c \
+  src/nrfclaw_ha_ninalink_node.c \
   src/nrfclaw_state.c \
   src/nrfclaw_factory.c \
   src/nrfclaw_serial.c \
@@ -88,16 +99,11 @@ CORE_SRC := \
   src/nrfclaw_ndp_access.c \
   src/nrfclaw_ndp_key_store.c \
   src/nrfclaw_ds18b20.c \
+  src/nrfclaw_temperature.c \
   src/nrfclaw_board_api.c
 
 SDK_SRC := \
   $(NRF5SDK)/modules/nrfx/mdk/gcc_startup_nrf52.S \
-  $(NRF5SDK)/components/libraries/log/src/nrf_log_backend_rtt.c \
-  $(NRF5SDK)/components/libraries/log/src/nrf_log_backend_serial.c \
-  $(NRF5SDK)/components/libraries/log/src/nrf_log_backend_uart.c \
-  $(NRF5SDK)/components/libraries/log/src/nrf_log_default_backends.c \
-  $(NRF5SDK)/components/libraries/log/src/nrf_log_frontend.c \
-  $(NRF5SDK)/components/libraries/log/src/nrf_log_str_formatter.c \
   $(NRF5SDK)/components/libraries/button/app_button.c \
   $(NRF5SDK)/components/libraries/util/app_error.c \
   $(NRF5SDK)/components/libraries/util/app_error_handler_gcc.c \
@@ -117,8 +123,6 @@ SDK_SRC := \
   $(NRF5SDK)/components/libraries/atomic/nrf_atomic.c \
   $(NRF5SDK)/components/libraries/balloc/nrf_balloc.c \
   $(NRF5SDK)/components/libraries/queue/nrf_queue.c \
-  $(NRF5SDK)/external/fprintf/nrf_fprintf.c \
-  $(NRF5SDK)/external/fprintf/nrf_fprintf_format.c \
   $(NRF5SDK)/components/libraries/fstorage/nrf_fstorage.c \
   $(NRF5SDK)/components/libraries/fstorage/nrf_fstorage_sd.c \
   $(NRF5SDK)/components/libraries/memobj/nrf_memobj.c \
@@ -147,9 +151,6 @@ SDK_SRC := \
   $(NRF5SDK)/components/libraries/bsp/bsp.c \
   $(NRF5SDK)/components/libraries/bsp/bsp_btn_ble.c \
   $(NRF5SDK)/external/micro-ecc/micro-ecc/uECC.c \
-  $(NRF5SDK)/external/segger_rtt/SEGGER_RTT.c \
-  $(NRF5SDK)/external/segger_rtt/SEGGER_RTT_Syscalls_GCC.c \
-  $(NRF5SDK)/external/segger_rtt/SEGGER_RTT_printf.c \
   $(NRF5SDK)/components/ble/peer_manager/auth_status_tracker.c \
   $(NRF5SDK)/components/ble/common/ble_advdata.c \
   $(NRF5SDK)/components/ble/common/ble_conn_params.c \
@@ -327,7 +328,7 @@ CPPFLAGS += -DuECC_SUPPORTS_secp256r1=0 -DuECC_SUPPORTS_secp256k1=0
 CPPFLAGS += -D__HEAP_SIZE=8192 -D__STACK_SIZE=8192
 
 ARCH := -mcpu=cortex-m4 -mthumb -mabi=aapcs -mfloat-abi=hard -mfpu=fpv4-sp-d16
-OPT ?= -O3 -g3
+OPT ?= -Os -g3
 CFLAGS := $(ARCH) $(OPT) -ffunction-sections -fdata-sections -fno-strict-aliasing -fno-builtin -fshort-enums
 ASFLAGS := $(ARCH) -g3 -x assembler-with-cpp
 LDFLAGS := $(ARCH) $(OPT) -T$(LINKER_SCRIPT) -L$(NRF5SDK)/modules/nrfx/mdk -Wl,-Map=$(MAP) -Wl,--gc-sections --specs=nano.specs
@@ -408,8 +409,8 @@ NRF_SPEED ?= 50000
 NRF_RETRIES ?= 10
 define NRFJPROG_RETRY
 	@attempt=1; while [ $$attempt -le $(NRF_RETRIES) ]; do \
-	 echo "[J-Link] attempt $$attempt/$(NRF_RETRIES): $(NRFJPROG) -f $(NRF_FAMILY) --clockspeed $(NRF_SPEED) $(1)"; \
-	 $(NRFJPROG) -f $(NRF_FAMILY) --clockspeed $(NRF_SPEED) $(1) && exit 0; \
+	 echo "[J-Link] attempt $$attempt/$(NRF_RETRIES): $(NRFJPROG) -f $(NRF_FAMILY)  $(1)"; \
+	 $(NRFJPROG) -f $(NRF_FAMILY)  $(1) && exit 0; \
 	 [ $$attempt -ge $(NRF_RETRIES) ] && exit 1; attempt=$$((attempt+1)); done
 endef
 
@@ -430,7 +431,7 @@ recover:
 	$(call NRFJPROG_RETRY,--recover)
 
 bootloader: check-toolchain check-vendor
-	$(MAKE) -C bootloader NRF5SDK=../$(NRF5SDK) TOOLCHAIN_PATH=$(TOOLCHAIN_PATH)
+	$(MAKE) -C bootloader NRF5SDK=$(NRF5SDK) TOOLCHAIN_PATH=$(TOOLCHAIN_PATH)
 
 install_bootloader: bootloader
 	@echo 'ONE-TIME factory operation: program bootloader and UICR BOOTLOADERADDR.'
@@ -439,3 +440,9 @@ install_bootloader: bootloader
 	$(call NRFJPROG_RETRY,--reset)
 
 -include $(OBJ:.o=.d)
+
+# Production size audit: largest linked symbols after --gc-sections.
+size-detail: $(ELF)
+	$(SIZE) $(ELF)
+	@echo "--- largest symbols ---"
+	$(NM) -S --size-sort --radix=d $(ELF) | tail -n 80

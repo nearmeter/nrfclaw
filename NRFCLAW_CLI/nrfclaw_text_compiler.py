@@ -60,6 +60,10 @@ class CompileResult:
     warnings: list[str]
     # R3.8.20c2g3a-r1: authenticated program schedule metadata. VM bytecode ABI unchanged.
     schedule: dict | None = None
+    # B7.6f2l2: optional host-side provisioning action applied by `prompt --upload`
+    # before bytecode upload. This deliberately reuses existing NDP management
+    # instead of adding another VM opcode or changing the NinaLink wire format.
+    provision: dict | None = None
 
     @property
     def schedule_name(self) -> str:

@@ -51,15 +51,6 @@ typedef struct {
     uint16_t last_backoff_ms;
 } nrfclaw_ninalink_link_status_t;
 
-typedef struct {
-    bool valid;
-    uint16_t sequence;
-    uint8_t result;
-    uint16_t applied_count;
-    uint16_t duplicate_count;
-    bool tracking_active;
-} nrfclaw_ninalink_app_status_t;
-
 #define NRFCLAW_NINALINK_COMMAND_RESULT_MAX 16U
 
 typedef enum {
@@ -106,10 +97,16 @@ bool nrfclaw_ninalink_link_start(uint16_t ack_window_ms);
 bool nrfclaw_ninalink_link_start_reliable(uint16_t ack_window_ms,
                                           uint8_t max_attempts,
                                           uint16_t base_backoff_ms);
-bool nrfclaw_ninalink_link_start_event_test(uint8_t event_kind,
-                                            uint16_t ack_window_ms,
-                                            uint8_t max_attempts,
-                                            uint16_t base_backoff_ms);
+bool nrfclaw_ninalink_link_busy(void);
+bool nrfclaw_ninalink_link_start_event(
+    uint16_t capability_id,
+    uint8_t channel,
+    uint8_t value_type,
+    uint32_t raw_value,
+    uint16_t ack_window_ms,
+    uint8_t max_attempts,
+    uint16_t base_backoff_ms);
+
 bool nrfclaw_ninalink_link_start_state_test(int16_t temperature_centi,
                                             uint16_t forced_sequence,
                                             uint16_t ack_window_ms,
@@ -119,8 +116,6 @@ void nrfclaw_ninalink_link_process(void);
 void nrfclaw_ninalink_link_get_status(nrfclaw_ninalink_link_status_t *out);
 bool nrfclaw_ninalink_link_get_session(uint32_t *session_id,
                                        uint16_t *generation);
-bool nrfclaw_ninalink_link_force_session(uint32_t session_id);
-void nrfclaw_ninalink_link_get_app_status(nrfclaw_ninalink_app_status_t *out);
 void nrfclaw_ninalink_link_get_command_status(
     nrfclaw_ninalink_command_status_t *out);
 void nrfclaw_ninalink_link_get_command_discovery_status(
@@ -128,9 +123,12 @@ void nrfclaw_ninalink_link_get_command_discovery_status(
 void nrfclaw_ninalink_link_get_capability_discovery_status(
     nrfclaw_ninalink_capability_discovery_node_status_t *out);
 
-/* B4.6/B4.7/B4.9/B4.10 deterministic result loss injection. */
-void nrfclaw_ninalink_link_drop_next_app_result(void);
-bool nrfclaw_ninalink_link_app_result_drop_armed(void);
-uint16_t nrfclaw_ninalink_link_app_result_drop_count(void);
+
+/* B4.12 production periodic temperature path. */
+bool nrfclaw_ninalink_link_start_temperature_mC(
+    int32_t temperature_mC,
+    uint16_t ack_window_ms,
+    uint8_t max_attempts,
+    uint16_t base_backoff_ms);
 
 #endif

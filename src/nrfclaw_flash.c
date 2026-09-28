@@ -6,8 +6,6 @@
 #include "nrf_soc.h"
 #include "nrf_sdh.h"
 #include "nrf_sdh_soc.h"
-#include "SEGGER_RTT.h"
-
 #include <string.h>
 
 #define SLOT_MAGIC              0x364C434EUL /* "NCL6" LE */
@@ -184,10 +182,7 @@ void nrfclaw_flash_init(void)
 
     if (!geometry_ok())
     {
-        SEGGER_RTT_WriteString(
-            0,
-            "FLASH ERROR: unsupported geometry/slot addresses\r\n"
-        );
+        ((void)0);
 
         m_status = NRFCLAW_FLASH_ERROR;
         return;
@@ -201,10 +196,7 @@ void nrfclaw_flash_init(void)
 
     if (!valid0 && !valid1)
     {
-        SEGGER_RTT_WriteString(
-            0,
-            "FLASH: no committed program\r\n"
-        );
+        ((void)0);
 
         return;
     }
@@ -222,12 +214,7 @@ void nrfclaw_flash_init(void)
 
     m_status = NRFCLAW_FLASH_READY;
 
-    SEGGER_RTT_printf(
-        0,
-        "FLASH: recovered slot=%u generation=%lu\r\n",
-        (unsigned)m_active_slot,
-        (unsigned long)m_generation
-    );
+    ((void)0);
 }
 
 bool nrfclaw_flash_get_latest(uint8_t const **program,
@@ -318,21 +305,16 @@ bool nrfclaw_flash_request_save(uint8_t const *program,
     m_wr_state = WR_ERASE_PENDING;
     m_status = NRFCLAW_FLASH_SAVING;
 
-    SEGGER_RTT_printf(
-        0,
-        "FLASH: saving to slot=%u generation=%lu\r\n",
-        (unsigned)m_target_slot,
-        (unsigned long)(m_generation + 1U)
-    );
+    ((void)0);
 
     return true;
 }
 
 static void flash_fail(char const *msg)
 {
-    SEGGER_RTT_WriteString(0, "FLASH ERROR: ");
-    SEGGER_RTT_WriteString(0, msg);
-    SEGGER_RTT_WriteString(0, "\r\n");
+    ((void)0);
+    ((void)0);
+    ((void)0);
 
     /*
      * The previous committed slot remains untouched and remains recoverable.
@@ -466,12 +448,7 @@ void nrfclaw_flash_process(void)
                 m_wr_state = WR_IDLE;
                 m_status = NRFCLAW_FLASH_READY;
 
-                SEGGER_RTT_printf(
-                    0,
-                    "FLASH: COMMITTED slot=%u generation=%lu\r\n",
-                    (unsigned)m_active_slot,
-                    (unsigned long)m_generation
-                );
+                ((void)0);
             }
 
             break;

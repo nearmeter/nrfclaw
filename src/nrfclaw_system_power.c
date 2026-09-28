@@ -7,8 +7,6 @@
 #include "nrfclaw_lis2dh12.h"
 #include "nrfclaw_lora.h"
 #include "nrfclaw_ds18b20.h"
-#include "SEGGER_RTT.h"
-
 void nrfclaw_system_minimum_power(void)
 {
     /* Stop application activities first so they cannot re-arm peripherals. */
@@ -26,5 +24,5 @@ void nrfclaw_system_minimum_power(void)
 
     /* P0.21 is intentionally untouched: nrfclaw_inputs keeps its GPIOTE
      * wake/programming ownership active. */
-    SEGGER_RTT_WriteString(0, "POWER R3.8.18b: minimum-power baseline, P0.21 preserved\r\n");
+    ((void)0);
 }

@@ -42,7 +42,13 @@ typedef enum {
     NRFCLAW_EVT_ACCEL_VIBRATION_POLL,
 
     /* R3.8.18c framed SERIAL source completion; appended to preserve event IDs. */
-    NRFCLAW_EVT_SERIAL_FRAME
+    NRFCLAW_EVT_SERIAL_FRAME,
+
+    /* B7.6f2i1 logical temperature completion; appended to preserve event IDs. */
+    NRFCLAW_EVT_TEMPERATURE_DONE,
+
+    /* B7.6f2l6a internal deferred INT1 qualification. Never forwarded to VM/user consumers. */
+    NRFCLAW_EVT_ACCEL_INT1_RAW
 
 } nrfclaw_event_type_t;
 

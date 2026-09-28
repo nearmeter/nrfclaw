@@ -22,7 +22,7 @@ _UNIT_NAMES = {
     5: "WATT", 6: "WATT_HOUR", 7: "CELSIUS", 8: "PASCAL", 9: "LUX",
     10: "PPM", 11: "PPB", 12: "MILLI_G", 13: "HERTZ", 14: "SECOND",
     15: "METER", 16: "METER_PER_SECOND", 17: "LITER",
-    18: "LITER_PER_MINUTE", 19: "RPM", 20: "COUNT",
+    18: "LITER_PER_MINUTE", 19: "RPM", 20: "COUNT", 21: "US_GALLON",
 }
 
 _CAPABILITY_NAMES = {
@@ -42,7 +42,7 @@ _CAPABILITY_NAMES = {
     0x0501: "CURRENT", 0x0502: "POWER", 0x0503: "ENERGY",
     0x0504: "LINE_FREQUENCY", 0x0600: "FLOW_RATE", 0x0601: "VOLUME",
     0x0602: "DISTANCE", 0x0603: "LEVEL_PERCENT", 0x0604: "RPM",
-    0x0605: "SPEED",
+    0x0605: "SPEED", 0x0606: "VOLUME_US_GALLON",
 }
 
 def _signed(raw: int, bits: int) -> int:
@@ -121,6 +121,59 @@ class NinaLinkExternalModelBuilder:
         if not isinstance(value, (int, float)):
             return None
         return value * (10 ** desc["scale10"])
+
+
+    async def read_inventory(self, node_id: int) -> Dict[str, Any]:
+        p = await self._command(bytes([40]) + struct.pack("<I", node_id))
+        if len(p) != 6:
+            raise RuntimeError(
+                f"Invalid B7.2 inventory info length: {len(p)}"
+            )
+
+        out = {
+            "valid": bool(p[0]),
+            "node_id": f"0x{node_id:08X}",
+            "node_id_raw": node_id,
+            "registry_version": p[1],
+            "count": p[2],
+            "complete": bool(p[3]),
+            "overflow": bool(p[4]),
+            "capacity": p[5],
+            "capabilities": [],
+        }
+
+        if not out["valid"]:
+            return out
+
+        for index in range(out["count"]):
+            d = await self._command(
+                bytes([41]) + struct.pack("<I", node_id) + bytes([index])
+            )
+            if len(d) != 9:
+                raise RuntimeError(
+                    f"Invalid B7.2 inventory entry length: {len(d)}"
+                )
+            scale10 = d[5] - 256 if d[5] & 0x80 else d[5]
+            cap_id = int.from_bytes(d[0:2], "little")
+            out["capabilities"].append({
+                "capability_id": f"0x{cap_id:04X}",
+                "capability_id_raw": cap_id,
+                "name": capability_name(cap_id),
+                "channel": d[2],
+                "kind_code": d[3],
+                "kind": _KIND_NAMES.get(d[3], f"KIND_{d[3]}"),
+                "value_type": d[4],
+                "scale10": scale10,
+                "unit_code": d[6],
+                "unit": _UNIT_NAMES.get(d[6], f"UNIT_{d[6]}"),
+                "behavior_flags": d[7],
+                "state_flags": d[8],
+            })
+
+        out["capabilities"].sort(
+            key=lambda x: (x["capability_id_raw"], x["channel"])
+        )
+        return out
 
     async def read(self) -> Dict[str, Any]:
         info = await self._info()

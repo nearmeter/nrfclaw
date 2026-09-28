@@ -5,8 +5,8 @@
 #include <stdint.h>
 #include "nrfclaw_ninalink_msg.h"
 
-#define NRFCLAW_NINALINK_STATE_CACHE_NODES            8U
-#define NRFCLAW_NINALINK_STATE_CACHE_VALUES_PER_NODE 24U
+#define NRFCLAW_NINALINK_STATE_CACHE_NODES            16U
+#define NRFCLAW_NINALINK_STATE_CACHE_VALUES_PER_NODE 16U
 #define NRFCLAW_NINALINK_EVENT_HISTORY_DEPTH          8U
 
 typedef struct {
@@ -79,6 +79,12 @@ bool nrfclaw_ninalink_state_cache_ingest_values_session(
     const nrfclaw_ninalink_value_entry_t *entries,
     uint8_t entry_count,
     uint32_t now_s);
+bool nrfclaw_ninalink_state_cache_upsert_query_values(
+    uint32_t node_id,
+    const nrfclaw_ninalink_value_entry_t *entries,
+    uint8_t entry_count,
+    uint32_t now_s);
+
 void nrfclaw_ninalink_state_cache_get_status(
     nrfclaw_ninalink_state_cache_status_t *out);
 bool nrfclaw_ninalink_state_cache_get_node(

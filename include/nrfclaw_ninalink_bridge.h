@@ -39,15 +39,19 @@ typedef struct {
     uint8_t last_error;
     uint16_t ack_sent;
     uint16_t duplicates;
-    uint16_t ack_test_dropped;
-    bool drop_next_ack;
+    uint16_t foreign_network;
 } nrfclaw_ninalink_bridge_status_t;
 
 typedef struct {
     bool pending;
     uint32_t target_node;
     uint16_t command_seq;
-    bool requested_value;
+    uint16_t capability_id;
+    uint8_t channel;
+    uint8_t value_type;
+    uint8_t requested_value;
+    bool cache_committed;
+    uint8_t cache_error;
     uint8_t state;
     uint8_t result;
     uint16_t sent_count;
@@ -103,20 +107,17 @@ typedef struct {
     uint8_t timeout_count;
 } nrfclaw_ninalink_capability_discovery_status_t;
 
-typedef struct {
-    uint8_t len;
-    uint8_t data[NRFCLAW_NINALINK_MAX_FRAME_SIZE];
-    int16_t rssi_x2;
-    int16_t snr_x4;
-} nrfclaw_ninalink_bridge_packet_t;
-
 bool nrfclaw_ninalink_bridge_start(void);
 void nrfclaw_ninalink_bridge_stop(void);
 void nrfclaw_ninalink_bridge_process(void);
-bool nrfclaw_ninalink_bridge_take(nrfclaw_ninalink_bridge_packet_t *out);
 void nrfclaw_ninalink_bridge_get_status(nrfclaw_ninalink_bridge_status_t *out);
-void nrfclaw_ninalink_bridge_drop_next_ack(void);
 
+bool nrfclaw_ninalink_bridge_queue_cap_set(
+    uint32_t target_node,
+    uint16_t capability_id,
+    uint8_t channel,
+    uint8_t value_type,
+    uint8_t value);
 bool nrfclaw_ninalink_bridge_queue_tracking(uint32_t target_node, bool active);
 void nrfclaw_ninalink_bridge_get_app_status(
     nrfclaw_ninalink_app_dl_status_t *out);
@@ -151,16 +152,5 @@ bool nrfclaw_ninalink_bridge_cancel_command_discovery(
     uint16_t request_seq);
 
 
-typedef struct {
-    uint8_t admission_queued;
-    uint16_t consumed;
-    uint16_t cached_frames;
-    uint16_t cache_errors;
-    uint8_t diagnostic_queued;
-    uint16_t diagnostic_dropped;
-} nrfclaw_ninalink_bridge_consumer_status_t;
-
-void nrfclaw_ninalink_bridge_get_consumer_status(
-    nrfclaw_ninalink_bridge_consumer_status_t *out);
 
 #endif

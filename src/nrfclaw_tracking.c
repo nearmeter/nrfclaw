@@ -13,8 +13,6 @@
 #include "nrf_sdh_soc.h"
 #include "nrf_soc.h"
 #include "uECC.h"
-#include "SEGGER_RTT.h"
-
 #include <stddef.h>
 #include <string.h>
 
@@ -87,22 +85,7 @@ static bool m_rotate_pending;
 static bool m_start_pending;
 static bool m_index_commit_pending;
 static bool m_apply_pending;
-static uint8_t m_debug_stage;
-static uint32_t m_last_sd_error;
 static uint32_t m_pending_index;
-
-/*
- * Stage 8.3 diagnostic latch.
- *
- * P0.21 stops TRACKING before NUS becomes available. Preserve the runtime
- * state immediately before stop so tracking-debug reports the actual failure
- * state instead of the post-stop cleared flags.
- */
-static bool m_debug_latched_valid;
-static nrfclaw_tracking_debug_t m_debug_latched;
-
-static nrfclaw_tracking_debug_t m_debug_runtime_snapshot;
-static bool m_debug_runtime_snapshot_valid;
 
 /* app_timer is kept below its RTC counter range by using <=300 s chunks. */
 static uint32_t m_rotation_remaining_s;
@@ -565,8 +548,6 @@ static void journal_process(void)
 
         uint32_t err = sd_flash_page_erase(page);
 
-        m_last_sd_error = err;
-
         if (err == NRF_SUCCESS)
             m_journal_state = JOURNAL_ERASE_WAIT;
         else if (err != NRF_ERROR_BUSY)
@@ -600,7 +581,6 @@ static void journal_process(void)
          * This field is later overwritten by GAP calls once radio startup
          * begins, which is exactly what we want diagnostically.
          */
-        m_last_sd_error = err;
 
         if (err == NRF_SUCCESS)
             m_journal_state = JOURNAL_WRITE_WAIT;
@@ -643,9 +623,6 @@ static bool begin_index_commit(void)
 
     m_index_commit_pending =
         true;
-
-    m_debug_stage =
-        NRFCLAW_TRACK_DBG_JOURNAL_PENDING;
 
     /*
      * IMPORTANT:
@@ -695,9 +672,6 @@ static bool index_commit_finished(void)
 
     m_key_index =
         m_journal_index;
-
-    m_debug_stage =
-        NRFCLAW_TRACK_DBG_INDEX_COMMITTED;
 
     return true;
 }
@@ -898,18 +872,13 @@ static nrfclaw_tracking_status_t apply_advertising(void)
     uint8_t adv_handle =
         nrfclaw_ble_shared_adv_handle();
 
-    m_debug_stage = NRFCLAW_TRACK_DBG_ADV_STOP;
-
     if (adv_handle == BLE_GAP_ADV_SET_HANDLE_NOT_SET)
     {
-        m_last_sd_error = NRF_ERROR_INVALID_STATE;
         return NRFCLAW_TRACKING_ERROR;
     }
 
     uint32_t err =
         sd_ble_gap_adv_stop(adv_handle);
-
-    m_last_sd_error = err;
 
     if (err != NRF_SUCCESS &&
         err != NRF_ERROR_INVALID_STATE)
@@ -919,10 +888,7 @@ static nrfclaw_tracking_status_t apply_advertising(void)
     ble_gap_addr_t addr;
     build_tracking_address(&addr);
 
-    m_debug_stage = NRFCLAW_TRACK_DBG_ADDR_SET;
-
     err = sd_ble_gap_addr_set(&addr);
-    m_last_sd_error = err;
 
     if (err == NRF_ERROR_INVALID_STATE)
         return NRFCLAW_TRACKING_BUSY;
@@ -952,8 +918,6 @@ static nrfclaw_tracking_status_t apply_advertising(void)
     params.primary_phy = BLE_GAP_PHY_1MBPS;
     params.filter_policy = BLE_GAP_ADV_FP_ANY;
 
-    m_debug_stage = NRFCLAW_TRACK_DBG_ADV_CONFIGURE;
-
     err =
         sd_ble_gap_adv_set_configure(
             &adv_handle,
@@ -961,13 +925,8 @@ static nrfclaw_tracking_status_t apply_advertising(void)
             &params
         );
 
-    m_last_sd_error = err;
-
     if (err != NRF_SUCCESS)
         return NRFCLAW_TRACKING_ERROR;
-
-
-    m_debug_stage = NRFCLAW_TRACK_DBG_TX_POWER;
 
     err =
         sd_ble_gap_tx_power_set(
@@ -976,13 +935,8 @@ static nrfclaw_tracking_status_t apply_advertising(void)
             m_tx_power_dbm
         );
 
-    m_last_sd_error = err;
-
     if (err != NRF_SUCCESS)
         return NRFCLAW_TRACKING_BAD_ARG;
-
-
-    m_debug_stage = NRFCLAW_TRACK_DBG_ADV_START;
 
     err =
         sd_ble_gap_adv_start(
@@ -990,14 +944,8 @@ static nrfclaw_tracking_status_t apply_advertising(void)
             TRACKING_CONN_CFG_TAG
         );
 
-    m_last_sd_error = err;
-
     if (err != NRF_SUCCESS)
         return NRFCLAW_TRACKING_ERROR;
-
-
-    m_debug_stage = NRFCLAW_TRACK_DBG_ACTIVE;
-    m_last_sd_error = NRF_SUCCESS;
 
     return NRFCLAW_TRACKING_OK;
 }
@@ -1115,18 +1063,7 @@ void nrfclaw_tracking_init(void)
     m_start_pending = false;
     m_index_commit_pending = false;
     m_apply_pending = false;
-    m_debug_stage = NRFCLAW_TRACK_DBG_NONE;
-    m_last_sd_error = NRF_SUCCESS;
     m_pending_index = 0U;
-    m_debug_latched_valid = false;
-    memset(&m_debug_latched, 0, sizeof(m_debug_latched));
-
-    m_debug_runtime_snapshot_valid = false;
-    memset(
-        &m_debug_runtime_snapshot,
-        0,
-        sizeof(m_debug_runtime_snapshot)
-    );
     m_rotation_remaining_s = 0U;
     m_key_index = 0U;
 
@@ -1180,49 +1117,9 @@ void nrfclaw_tracking_init(void)
     );
 }
 
-static void tracking_debug_snapshot_runtime(void)
-{
-    memset(
-        &m_debug_runtime_snapshot,
-        0,
-        sizeof(m_debug_runtime_snapshot)
-    );
-
-    m_debug_runtime_snapshot.stage =
-        m_debug_stage;
-
-    m_debug_runtime_snapshot.start_pending =
-        m_start_pending ? 1U : 0U;
-
-    m_debug_runtime_snapshot.index_commit_pending =
-        m_index_commit_pending ? 1U : 0U;
-
-    m_debug_runtime_snapshot.apply_pending =
-        m_apply_pending ? 1U : 0U;
-
-    m_debug_runtime_snapshot.active =
-        m_active ? 1U : 0U;
-
-    m_debug_runtime_snapshot.commit_state =
-        (uint8_t)m_commit_state;
-
-    m_debug_runtime_snapshot.journal_state =
-        (uint8_t)m_journal_state;
-
-    m_debug_runtime_snapshot.key_index =
-        m_key_index;
-
-    m_debug_runtime_snapshot.last_sd_error =
-        m_last_sd_error;
-
-    m_debug_runtime_snapshot_valid =
-        true;
-}
-
 
 void nrfclaw_tracking_process(void)
 {
-    tracking_debug_snapshot_runtime();
     /*
      * Identity/config A/B store.
      */
@@ -1312,8 +1209,6 @@ void nrfclaw_tracking_process(void)
         journal_process();
     }
 
-    tracking_debug_snapshot_runtime();
-
 
     /*
      * Initial autonomous start:
@@ -1336,36 +1231,25 @@ void nrfclaw_tracking_process(void)
         {
             if (!begin_index_commit())
             {
-                tracking_debug_snapshot_runtime();
                 return;
             }
-
-            tracking_debug_snapshot_runtime();
         }
 
         if (!m_apply_pending)
         {
             if (!index_commit_finished())
             {
-                tracking_debug_snapshot_runtime();
                 return;
             }
-
-            tracking_debug_snapshot_runtime();
 
             if (!derive_adv_key(
                     m_key_index,
                     m_adv_key))
             {
-                tracking_debug_snapshot_runtime();
                 return;
             }
 
-            m_debug_stage =
-                NRFCLAW_TRACK_DBG_KEY_DERIVED;
-
             m_apply_pending = true;
-            tracking_debug_snapshot_runtime();
 
             /*
              * Continue in THIS SAME main-loop pass.
@@ -1381,10 +1265,7 @@ void nrfclaw_tracking_process(void)
         {
             /*
              * Retry this SAME durable index; do not allocate another one.
-             * Capture the exact GAP stage/error before returning.
              */
-            tracking_debug_snapshot_runtime();
-
             /*
              * GAP may transiently report BUSY/INVALID_STATE immediately after
              * Flash activity. Ensure there is a future RTC event to wake the
@@ -1405,15 +1286,10 @@ void nrfclaw_tracking_process(void)
         m_active =
             true;
 
-        SEGGER_RTT_WriteString(
-            0,
-            "TRACKING: advertising ACTIVE\r\n"
-        );
+        ((void)0);
 
         m_start_pending =
             false;
-
-        tracking_debug_snapshot_runtime();
 
         arm_rotation_timer();
 
@@ -1434,36 +1310,25 @@ void nrfclaw_tracking_process(void)
         {
             if (!begin_index_commit())
             {
-                tracking_debug_snapshot_runtime();
                 return;
             }
-
-            tracking_debug_snapshot_runtime();
         }
 
         if (!m_apply_pending)
         {
             if (!index_commit_finished())
             {
-                tracking_debug_snapshot_runtime();
                 return;
             }
-
-            tracking_debug_snapshot_runtime();
 
             if (!derive_adv_key(
                     m_key_index,
                     m_adv_key))
             {
-                tracking_debug_snapshot_runtime();
                 return;
             }
 
-            m_debug_stage =
-                NRFCLAW_TRACK_DBG_KEY_DERIVED;
-
             m_apply_pending = true;
-            tracking_debug_snapshot_runtime();
 
             /*
              * Apply the new key immediately. Do not sleep waiting for an
@@ -1474,8 +1339,6 @@ void nrfclaw_tracking_process(void)
         if (apply_advertising() !=
             NRFCLAW_TRACKING_OK)
         {
-            tracking_debug_snapshot_runtime();
-
             (void)app_timer_start(
                 m_apply_retry_timer,
                 APP_TIMER_TICKS(20U),
@@ -1655,10 +1518,7 @@ nrfclaw_tracking_status_t nrfclaw_tracking_start(void)
     if (app_st != NRFCLAW_BLE_APP_OK)
         return NRFCLAW_TRACKING_ERROR;
 
-    SEGGER_RTT_WriteString(
-        0,
-        "TRACKING: BLE Application ownership released; adaptive NDP OFF\r\n"
-    );
+    ((void)0);
 
     /*
      * Manual compatibility mode keeps Stage-8.2 behavior. It is intended for
@@ -1699,70 +1559,12 @@ nrfclaw_tracking_status_t nrfclaw_tracking_start(void)
     m_start_pending =
         true;
 
-    m_debug_stage =
-        NRFCLAW_TRACK_DBG_START_REQUESTED;
-
     return NRFCLAW_TRACKING_OK;
-}
-
-static void tracking_debug_latch_runtime(void)
-{
-    if (m_debug_runtime_snapshot_valid)
-    {
-        m_debug_latched =
-            m_debug_runtime_snapshot;
-
-        m_debug_latched_valid =
-            true;
-
-        return;
-    }
-
-    memset(
-        &m_debug_latched,
-        0,
-        sizeof(m_debug_latched)
-    );
-
-    m_debug_latched.stage =
-        m_debug_stage;
-
-    m_debug_latched.start_pending =
-        m_start_pending ? 1U : 0U;
-
-    m_debug_latched.index_commit_pending =
-        m_index_commit_pending ? 1U : 0U;
-
-    m_debug_latched.apply_pending =
-        m_apply_pending ? 1U : 0U;
-
-    m_debug_latched.active =
-        m_active ? 1U : 0U;
-
-    m_debug_latched.commit_state =
-        (uint8_t)m_commit_state;
-
-    m_debug_latched.journal_state =
-        (uint8_t)m_journal_state;
-
-    m_debug_latched.key_index =
-        m_key_index;
-
-    m_debug_latched.last_sd_error =
-        m_last_sd_error;
-
-    m_debug_latched_valid =
-        true;
 }
 
 
 void nrfclaw_tracking_stop(void)
 {
-    /*
-     * Capture the real pre-P0.21 state before clearing runtime flags.
-     */
-    tracking_debug_latch_runtime();
-
     (void)app_timer_stop(m_apply_retry_timer);
     (void)app_timer_stop(m_rotation_timer);
     m_rotate_pending = false;
@@ -1791,58 +1593,6 @@ bool nrfclaw_tracking_active(void)
 bool nrfclaw_tracking_has_identity(void)
 {
     return m_store != NULL;
-}
-
-void nrfclaw_tracking_debug(
-    nrfclaw_tracking_debug_t *debug)
-{
-    if (!debug)
-        return;
-
-    /*
-     * After P0.21 the live state has already been cleared by
-     * nrfclaw_tracking_stop(). Return the pre-stop snapshot instead.
-     */
-    if (m_debug_latched_valid)
-    {
-        *debug =
-            m_debug_latched;
-
-        return;
-    }
-
-    memset(
-        debug,
-        0,
-        sizeof(*debug)
-    );
-
-    debug->stage =
-        m_debug_stage;
-
-    debug->start_pending =
-        m_start_pending ? 1U : 0U;
-
-    debug->index_commit_pending =
-        m_index_commit_pending ? 1U : 0U;
-
-    debug->apply_pending =
-        m_apply_pending ? 1U : 0U;
-
-    debug->active =
-        m_active ? 1U : 0U;
-
-    debug->commit_state =
-        (uint8_t)m_commit_state;
-
-    debug->journal_state =
-        (uint8_t)m_journal_state;
-
-    debug->key_index =
-        m_key_index;
-
-    debug->last_sd_error =
-        m_last_sd_error;
 }
 
 

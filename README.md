@@ -143,10 +143,15 @@ Typical qualitative classes:
 The nRFClaw Home Assistant integration can be installed without SSH, a terminal,
 or manually copying files into `custom_components`.
 
-### Installation
+> **Important:** the **Open nRFClaw in HACS** link requires the HACS integration
+> to be installed and configured in Home Assistant. If Home Assistant reports
+> that the redirect is not supported because the `hacs` integration is
+> missing, follow **Install HACS first** below, then return to the nRFClaw button.
 
-1. Click the **Open nRFClaw in HACS** button below. It opens the nRFClaw
-   repository directly in HACS on your Home Assistant instance.
+### If HACS is already installed
+
+1. Click the button below. It opens the nRFClaw repository directly in HACS on
+   your Home Assistant instance.
 
 <p align="left">
   <a href="https://my.home-assistant.io/redirect/hacs_repository/?owner=nearmeter&repository=nrfclaw&category=integration">
@@ -172,13 +177,46 @@ https://my.home-assistant.io/redirect/hacs_repository/?owner=nearmeter&repositor
 7. Finish the Home Assistant setup flow. The device and its nRFClaw entities
    should then appear under **Settings → Devices & services**.
 
+### Install HACS first — Home Assistant OS / Supervised
+
+HACS itself is a custom integration. On Home Assistant OS / Supervised it can
+be downloaded without SSH or a Terminal by using the official **Get HACS**
+Home Assistant App.
+
+1. Add the official HACS App repository:
+
+<p align="left">
+  <a href="https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fhacs%2Faddons">
+    <img src="https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg"
+         alt="Add the HACS App repository">
+  </a>
+</p>
+
+Direct URL:
+
+```text
+https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fhacs%2Faddons
+```
+
+Repository URL, if Home Assistant asks for it explicitly:
+
+```text
+https://github.com/hacs/addons
+```
+
+2. Go to **Settings → Apps → Install app**.
+3. Open **Get HACS** and click **Install**.
+4. Start **Get HACS**.
+5. Open its logs and follow the instructions shown there.
+6. Restart Home Assistant.
+7. Go to **Settings → Devices & services → Add integration**, add **HACS**, and
+   complete the HACS setup.
+8. Return to **Open nRFClaw in HACS** above and install nRFClaw.
+
 A NinaLink low-power **Node** does not need its own Home Assistant Bluetooth
 connection. Its Application/NDP plane remains off; the Bridge receives the
 Node over LoRa and exposes the discovered Node and its entities to Home
 Assistant.
-
-If HACS is not installed yet, install HACS using its supported Home Assistant
-installation flow, then return to the button or URL above.
 
 For maintainers, the HACS-visible tree at `custom_components/nrfclaw/` is a
 byte-for-byte distribution mirror of the canonical integration under

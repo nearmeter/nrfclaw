@@ -19,6 +19,23 @@ Application/NDP plane: normal HA/application interface; device advertises nRFCla
 Application service UUID: 4e52a800-0000-10a7-d24b-6a3244619a47. RX: ...a801..., TX notify: ...a802....
 The firmware arbitrates the single advertising set. VM advertiser/tracking can take ownership; P0.21 has priority and can reclaim BLE for programming.
 
+
+## Home Assistant Transport Roles and NinaLink
+Home Assistant transport is a persistent role, not merely a temporary radio command. The three production roles are DIRECT_BLE, NINALINK_NODE and BRIDGE.
+
+DIRECT_BLE: Application/NDP is enabled. Passive telemetry/events use BLE advertising where possible; short NDP sessions are used for control/snapshots. This is a low-power battery-capable role.
+
+NINALINK_NODE: Application/NDP is OFF. The node uses LLCC68 NinaLink contacts/reports through a separate bridge; default contact/report period is 20 s. Between contacts the node returns the radio/MCU to the low-power path. P0.21/NUS remains available for maintenance. Shorter report periods trade power for lower latency.
+
+BRIDGE: Application/NDP is enabled for Home Assistant and the bridge keeps NinaLink LoRa RX active continuously. The bridge is the always-listening gateway and is therefore a higher-power role than a NinaLink Node.
+
+NinaLink Network ID is 16-bit. `0x0000` means legacy/unprovisioned. Prompt provisioning uses `0x0001..0xFFFF`. `Enable Home Assistant in bridge mode.` reuses a persisted non-zero ID or creates one when unprovisioned. A first-time node must use the bridge ID, for example `Enable Home Assistant in LoRa mode on network 0x7A31.`. Network provisioning is a host-side `prompt --upload` action before VM bytecode is stored; raw `.bin` bytecode does not provision the Network ID.
+
+The Network ID is isolation/admission metadata, not the Application/NDP authentication key.
+
+## NDP Owner Key
+Application/NDP protection is optional. Through the physical P0.21/NUS owner plane, `ndp-key-generate` creates/persists a 256-bit key and prints it as `hex:<64 hex digits>`. Home Assistant stores the same value in its NDP access key field. `ndp-key-get` can read it again through physical NUS. Once a key exists, Application/NDP requires it; P0.21/NUS remains the owner/recovery path.
+
 ## Hardware
 Reference: NINASENSE. MCU: nRF52832. Optional/full capability hardware: LLCC68 LoRa; LIS2DH12 accelerometer; DS18B20 temperature; Hall/reed inputs; battery ADC/divider; 32.768 kHz crystal; UART pins; P0.21 programming button. Board abstraction also contains pca10040 and halfmoon profiles.
 
@@ -70,6 +87,17 @@ Validated composite example: `Read temperature and battery, format both values i
 
 ## Agents
 Supported configured providers in CLI: openrouter, gemini, ollama. API keys are referenced through environment variables and must never be committed. Agent output is not trusted bytecode. The host validates Semantic IR/capabilities and performs deterministic lowering. Unsupported semantics must be rejected rather than silently dropping clauses.
+
+## Canonical Machine/Event Semantics
+English is the canonical standalone normalization language. These meanings are authoritative:
+- `machine starts running` -> `VIB_AUTO.MACHINE_ON`, HA app operation 1.
+- `machine stops running` -> `VIB_AUTO.MACHINE_OFF`, HA app operation 5.
+- `vibration becomes unusual/strange` -> `VIB_AUTO.WARNING`, HA app operation 3.
+- `vibration becomes abnormal/anomalous` -> `VIB_AUTO.ALARM`, HA app operation 4.
+- `via Telegram through HA` is HA-side delivery intent; firmware emits the HA event and does not implement Telegram itself.
+- `Every HALL1 pulse represents 1 liter. Accumulate the total consumption and display it in Home Assistant.` uses the dedicated Hall semantic-volume compiler family, persistent compiler-owned state[15], and retained semantic VOLUME publication.
+
+The dedicated production families `ha-transport-*`, `hall-semantic-volume*`, and `vib-auto-machine-ha-event` are resolved by the authoritative deterministic compiler before an external semantic agent is invoked. This prevents Semantic IR v1 from approximating persistent transport-role or host-provisioning behavior that it cannot represent exactly. External agents still receive the same knowledge base for interpretation/QA, but they never emit trusted VM bytecode.
 
 ## Semantic Safety Rule
 For composite prompts, success requires semantic coverage, not just a compiler exit code. If a prompt requests FALL + temperature + battery + LoRa + BLE, the lowered program must contain the FALL wait, both sensor reads, formatting, LoRa send and BLE advertise operations. `semantic_certified=true` alone is not sufficient if the certifier does not check every requested clause.

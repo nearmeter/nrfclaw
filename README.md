@@ -20,7 +20,9 @@ nRFClaw is an open embedded platform for building AI-programmable, ultra-low-pow
 - Persistent `BOOT` programs or manually started programs.
 - BLE programming through a physical-button protected NUS plane.
 - BLE Beacon/Broadcaster and dynamic advertising payloads.
-- Home Assistant-facing NDP application plane.
+- Home Assistant Direct BLE/NDP integration plus NinaLink LoRa Bridge/Node transport.
+- NinaLink low-power LoRa nodes with persistent Network ID isolation, automatic discovery and remote control.
+- Optional 256-bit Application/NDP owner key for Home Assistant access.
 - LoRa TX/RX with LLCC68.
 - DS18B20 temperature and battery telemetry.
 - LIS2DH12 motion, TAP, FALL, vibration and VIB_AUTO.
@@ -126,10 +128,13 @@ Typical qualitative classes:
 |---|---|
 | Minimum-power test | Lowest baseline |
 | Event-driven motion/Hall/VIB_AUTO | Excellent |
+| Home Assistant Direct BLE/NDP | Excellent/Good; passive advertisements/events between short NDP sessions |
+| NinaLink LoRa Node | Excellent/Good; Application/NDP is off and LLCC68 sleeps between contacts |
 | Tracking/OpenHaystack | Excellent |
 | Periodic LoRa TX | Excellent/Good depending on cadence and RF settings |
 | BLE Beacon | Good |
 | Low-power Serial RX policy | Good, but UART RX must remain active |
+| NinaLink Bridge / continuous LoRa RX | Higher consumption; intended as the always-listening gateway |
 | Continuous Serial RX | Higher consumption |
 | Continuous LoRa RX | Higher consumption |
 
@@ -519,9 +524,147 @@ python3 nrfclaw_cli.py --device 1BF1D0 vib-auto-start --relearn
 
 `vib-auto-baseline` prints every learned profile with confidence, observations, RMS, peak, peak-to-peak and zero-crossing values/tolerances.
 
-## Home Assistant and Telegram
+## Home Assistant: Direct BLE and NinaLink
 
-Home Assistant talks to the Application/NDP BLE plane. Discover boards with:
+nRFClaw can reach Home Assistant in two low-power ways: directly over BLE/NDP, or through **NinaLink**, where remote battery-powered nodes use LoRa and a bridge exposes them to Home Assistant over BLE/NDP.
+
+```text
+Direct BLE
+──────────
+NINASENSE ── BLE advertisements / short NDP sessions ──► Home Assistant
+
+NinaLink
+────────
+Battery Node ── duty-cycled LoRa ──► Bridge ── BLE/NDP ──► Home Assistant
+                  sleeps between        │
+                  contact windows       └─ continuous LoRa RX
+```
+
+The roles are persistent and mutually exclusive:
+
+| Role | Application/NDP on that board | LoRa behavior | Power intent |
+|---|---|---|---|
+| **Direct BLE** | Enabled | LoRa not required for HA | Low-power BLE advertising/events; NDP opens only when needed |
+| **NinaLink Node** | **Off** | Periodic/event-driven TX plus bounded receive windows | Battery node; LLCC68 sleeps between contacts |
+| **NinaLink Bridge** | Enabled | Continuous NinaLink RX | Gateway role; higher consumption than a node |
+
+The default NinaLink node contact/report period is **20 seconds**. It can be changed in the natural-language role prompt. Shorter intervals improve control/report latency but increase radio duty cycle.
+
+### Direct Home Assistant
+
+Enable the Direct BLE role as a persistent BOOT configuration:
+
+```bash
+python3 nrfclaw_cli.py --device 1BF1D0 \
+  prompt --standalone --upload --boot \
+  "At boot, enable Home Assistant."
+```
+
+The device advertises its Direct role and Home Assistant can create the corresponding NDP device/entities. Passive telemetry and events are advertisement-driven where possible, so the board does not need to maintain a continuous BLE connection.
+
+### Create a NinaLink bridge and network
+
+Press **P0.21** on the board that will become the bridge, then run:
+
+```bash
+python3 nrfclaw_cli.py --device C8BA09 \
+  prompt --standalone --upload --boot \
+  "Enable Home Assistant in bridge mode."
+```
+
+If the bridge has no NinaLink network yet, the CLI creates and persists a random non-zero 16-bit Network ID. If one already exists, it is reused. The upload prints it, for example:
+
+```text
+=== PROMPT NINALINK PROVISION B7.6f2l2 ===
+Role:             BRIDGE
+Network ID:       0x7A31
+Action:           created
+```
+
+Copy that Network ID. It can be checked again while P0.21/NUS is open:
+
+```bash
+python3 nrfclaw_cli.py --device C8BA09 ninalink-network-status
+```
+
+`0x0000` is the legacy/unprovisioned value. Prompt-based provisioning uses `0x0001..0xFFFF`.
+
+### Add a low-power NinaLink node to the same network
+
+Press **P0.21** on the node and use the Network ID copied from the bridge:
+
+```bash
+python3 nrfclaw_cli.py --device 1BF1D0 \
+  prompt --standalone --upload --boot \
+  "Enable Home Assistant in LoRa mode on network 0x7A31."
+```
+
+This first persists `0x7A31`, then stores the `NINALINK_NODE` BOOT program. After reset the node keeps Application/NDP BLE off, wakes for NinaLink contact/report windows, exchanges ACK/downlink traffic with the bridge, then returns the LLCC68 and MCU to the low-power path.
+
+Once a node already has the correct Network ID, the shorter form reuses it:
+
+```bash
+python3 nrfclaw_cli.py --device 1BF1D0 \
+  prompt --standalone --upload --boot \
+  "Enable Home Assistant in LoRa mode."
+```
+
+For an unprovisioned node this shorter form deliberately fails instead of silently creating a different network.
+
+Network provisioning is a **host-side action of `prompt --upload`**. A raw VM `.bin` contains the role bytecode but does not contain the Network ID provisioning transaction.
+
+### Protect Home Assistant NDP with an owner key
+
+NDP protection is optional. To enable it, press **P0.21** so the physical NUS owner plane is available, then generate a 256-bit key:
+
+```bash
+python3 nrfclaw_cli.py --device C8BA09 ndp-key-generate
+```
+
+Example output:
+
+```text
+NDP protection:   enabled
+NDP key:          hex:0123456789abcdef...64 hexadecimal digits total...
+Store this key securely; Application/HA now requires it.
+```
+
+Copy the complete `hex:<64-hex-digits>` value into **NDP access key** when adding the Direct device or NinaLink Bridge in Home Assistant. The key can be read again only through the physical P0.21/NUS owner path:
+
+```bash
+python3 nrfclaw_cli.py --device C8BA09 ndp-key-get
+```
+
+The **NDP key and NinaLink Network ID are different things**: the NDP key authenticates Home Assistant/Application access to the Direct device or bridge, while the Network ID isolates which LoRa nodes belong to a NinaLink network.
+
+### Natural-language Home Assistant behaviors
+
+These English forms are canonical examples used by the CLI/agent knowledge base:
+
+```text
+Every HALL1 pulse represents 1 liter. Accumulate the total consumption and display it in Home Assistant.
+
+At boot, enable Home Assistant and notify via Telegram through HA when the electric mixer starts running.
+
+At boot, enable Home Assistant and notify when the washing machine stops running.
+
+At boot, enable Home Assistant and notify when the pump vibration becomes unusual.
+
+At boot, enable Home Assistant and notify via Telegram through HA when the motor vibration becomes abnormal.
+```
+
+The vibration wording maps to semantic VIB_AUTO events:
+
+| Natural wording | Device event |
+|---|---|
+| machine starts running | `VIB_AUTO.MACHINE_ON` |
+| machine stops running | `VIB_AUTO.MACHINE_OFF` |
+| vibration becomes unusual/strange | `VIB_AUTO.WARNING` |
+| vibration becomes abnormal/anomalous | `VIB_AUTO.ALARM` |
+
+Telegram is an **HA-side action**. The nRF52832 does not run Telegram, Wi-Fi or TLS; it publishes the semantic event to Home Assistant, and a Home Assistant automation performs the notification.
+
+Discover visible Direct/Bridge devices with:
 
 ```bash
 python3 nrfclaw_cli.py ha scan
@@ -533,39 +676,6 @@ Inspect one:
 python3 nrfclaw_cli.py --device 1BF1D0 ha device-info
 python3 nrfclaw_cli.py --device 1BF1D0 ha sensors
 ```
-
-A typical architecture is:
-
-```text
-nRFClaw ── BLE/LoRa ──► Gateway / Home Assistant ──► Telegram
-```
-
-The nRF52832 does not need to run Telegram, Wi-Fi or TLS. Home Assistant can answer from the latest entity value or forward an event.
-
-Example conversation:
-
-```text
-You:      What is the current temperature?
-Telegram: Machine room temperature is 24.6 °C.
-```
-
-Motion automation:
-
-```text
-nRFClaw:  MOTION interrupt
-          ↓
-          Home Assistant event
-          ↓
-Telegram: ⚠ Motion detected in the equipment room.
-```
-
-VIB_AUTO automation:
-
-```text
-Telegram: ⚠ Pump vibration no longer matches the learned normal profiles.
-```
-
-FALL + telemetry can similarly result in a message containing the event, temperature and battery level.
 
 ## BLE Beacon: Name vs Dynamic Payload
 

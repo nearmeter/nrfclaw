@@ -85,5 +85,47 @@
       "time": "08:30",
       "timezone": "LOCAL"
     }
+  },
+  {
+    "text": "every hall1 pulse represents 1 liter; accumulate the total consumption and display it in home assistant",
+    "family": "hall-semantic-volume",
+    "canonical": "every hall1 pulse represents 1 liter; accumulate the total consumption and display it in home assistant",
+    "meaning": "persistent HALL1 pulse-to-volume accumulator; retained Home Assistant semantic VOLUME"
+  },
+  {
+    "text": "enable home assistant in bridge mode",
+    "family": "ha-transport-bridge",
+    "canonical": "enable home assistant in bridge mode",
+    "meaning": "persistent NinaLink bridge role; host provisioning ensures a non-zero Network ID; continuous LoRa RX"
+  },
+  {
+    "text": "enable home assistant in lora mode on network 0x1234",
+    "family": "ha-transport-lora-node",
+    "canonical": "enable home assistant in lora mode on network 0x1234",
+    "meaning": "persist Network ID 0x1234 before upload; persistent NinaLink node role; Application/NDP off; default report period 20 s"
+  },
+  {
+    "text": "at boot enable home assistant and notify via telegram through ha when the electric mixer starts running",
+    "family": "vib-auto-machine-ha-event",
+    "canonical": "at boot enable home assistant and notify via telegram through ha when the electric mixer starts running",
+    "meaning": "VIB_AUTO.MACHINE_ON -> Home Assistant event; Telegram is HA-side"
+  },
+  {
+    "text": "at boot enable home assistant and notify when the washing machine stops running",
+    "family": "vib-auto-machine-ha-event",
+    "canonical": "at boot enable home assistant and notify when the washing machine stops running",
+    "meaning": "VIB_AUTO.MACHINE_OFF -> Home Assistant event"
+  },
+  {
+    "text": "at boot enable home assistant and notify when the pump vibration becomes unusual",
+    "family": "vib-auto-machine-ha-event",
+    "canonical": "at boot enable home assistant and notify when the pump vibration becomes unusual",
+    "meaning": "VIB_AUTO.WARNING -> Home Assistant event"
+  },
+  {
+    "text": "at boot enable home assistant and notify via telegram through ha when the motor vibration becomes abnormal",
+    "family": "vib-auto-machine-ha-event",
+    "canonical": "at boot enable home assistant and notify via telegram through ha when the motor vibration becomes abnormal",
+    "meaning": "VIB_AUTO.ALARM -> Home Assistant event; Telegram is HA-side"
   }
 ]

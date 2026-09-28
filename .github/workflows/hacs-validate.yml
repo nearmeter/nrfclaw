@@ -1,0 +1,55 @@
+name: Home Assistant / HACS
+
+on:
+  push:
+    paths:
+      - "custom_components/nrfclaw/**"
+      - "integrations/home-assistant/custom_components/nrfclaw/**"
+      - "hacs.json"
+      - "tools/check_hacs_mirror.py"
+      - ".github/workflows/hacs-validate.yml"
+  pull_request:
+    paths:
+      - "custom_components/nrfclaw/**"
+      - "integrations/home-assistant/custom_components/nrfclaw/**"
+      - "hacs.json"
+      - "tools/check_hacs_mirror.py"
+      - ".github/workflows/hacs-validate.yml"
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify HACS mirror
+        run: python3 tools/check_hacs_mirror.py
+      - name: Validate JSON
+        run: |
+          python3 -m json.tool hacs.json >/dev/null
+          python3 -m json.tool custom_components/nrfclaw/manifest.json >/dev/null
+      - name: Compile Python sources
+        run: python3 -m compileall -q custom_components/nrfclaw
+
+  hacs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: HACS validation
+        uses: hacs/action@main
+        with:
+          category: integration
+          # The repository is already usable as a custom HACS repository.
+          # Remove this ignore after GitHub topics are configured for HACS
+          # default-store submission.
+          ignore: topics
+
+  hassfest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Hassfest validation
+        uses: home-assistant/actions/hassfest@master

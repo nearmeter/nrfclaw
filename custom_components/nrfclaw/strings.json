@@ -1,0 +1,21 @@
+{
+  "title": "nRFClaw",
+  "config": {
+    "step": {
+      "confirm": {
+        "title": "Add nRFClaw",
+        "description": "B7.6f1 automatically resolves the advertised Direct BLE or NinaLink Bridge role before showing this confirmation. The role selector is shown only when no explicit role can be obtained from a legacy advertisement. The access key remains optional.",
+        "data": {
+          "mode": "Connection role (legacy fallback)",
+          "access_key": "NDP access key (optional)",
+          "poll_interval": "Direct telemetry interval (legacy fallback only)"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "This nRFClaw device is already configured.",
+      "bluetooth_discovery_required": "Discover the device through Home Assistant Bluetooth first.",
+      "role_not_resolved": "A complete nRFClaw transport-role advertisement was not received. Wait for Bluetooth rediscovery and try again."
+    }
+  }
+}

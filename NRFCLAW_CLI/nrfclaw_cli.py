@@ -5336,6 +5336,7 @@ def _resolve_prompt_compilation(args, source):
     if local_result is not None and (
         str(getattr(local_result, "intent", "")).startswith("ha-transport-")
         or str(getattr(local_result, "intent", "")).startswith("hall-semantic-volume")
+        or str(getattr(local_result, "intent", "")) == "vib-auto-machine-ha-event"
     ):
         print(f"SEMANTIC: deterministic hybrid-v{SEMANTIC_ENGINE_VERSION} route={local_meta.get('route')} family={local_meta.get('family')}")
         pseudo=pseudo_from_result(local_result)

@@ -152,5 +152,31 @@
       "BOOT": "autonomous execution after boot/reset",
       "MANUAL": "no autonomous schedule"
     }
+  },
+  "transport_semantics": {
+    "home_assistant_roles": [
+      "DIRECT_BLE",
+      "NINALINK_NODE",
+      "BRIDGE"
+    ],
+    "direct_ble": "persistent HA role; Application/NDP enabled; passive BLE telemetry/events where possible",
+    "ninalink_node": "persistent HA role; Application/NDP off; default NinaLink report/contact period 20 s; LoRa duty-cycled between contacts",
+    "ninalink_bridge": "persistent HA role; Application/NDP enabled; continuous NinaLink LoRa RX",
+    "network_provisioning": "host-side prompt --upload action; bridge ensure/reuse non-zero ID, node set/reuse bridge ID; raw VM bytecode alone does not change the Network ID",
+    "network_id_range": "0x0001..0xFFFF for prompt provisioning; 0x0000 means legacy/unprovisioned"
+  },
+  "application_security": {
+    "ndp_owner_key_bits": 256,
+    "ndp_key_generate": "physical P0.21/NUS command ndp-key-generate",
+    "ndp_key_get": "physical P0.21/NUS command ndp-key-get",
+    "home_assistant_key_format": "hex:<64 hexadecimal digits>",
+    "network_id_is_not_authentication": true
+  },
+  "semantic_event_mapping": {
+    "machine_starts_running": "VIB_AUTO.MACHINE_ON / HA operation 1",
+    "machine_stops_running": "VIB_AUTO.MACHINE_OFF / HA operation 5",
+    "vibration_becomes_unusual": "VIB_AUTO.WARNING / HA operation 3",
+    "vibration_becomes_abnormal": "VIB_AUTO.ALARM / HA operation 4",
+    "telegram": "HA-side notification intent; firmware emits HA event only"
   }
 }

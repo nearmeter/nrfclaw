@@ -1,4 +1,5 @@
 #include "nrfclaw_inputs.h"
+#include "nrfclaw_sht.h"
 #include "nrfclaw_board.h"
 #include "nrf_drv_gpiote.h"
 #include "app_error.h"
@@ -103,6 +104,17 @@ void nrfclaw_hall_disable(void) {
 }
 
 bool nrfclaw_hall_configure(nrfclaw_hall_config_t const *cfg) {
+    /* B8.1k8c SHT pin ownership: Hall may not steal an active SHT pin. */
+    if(cfg && cfg->mode!=NRFCLAW_HALL_MODE_DISABLED){
+        if(cfg->mode==NRFCLAW_HALL_MODE_SINGLE){
+            uint8_t pin=(cfg->channel==2U)?P_HALL2:P_HALL1;
+            if(nrfclaw_sht_owns_pin(pin)) return false;
+        } else if(cfg->mode==NRFCLAW_HALL_MODE_QUADRATURE){
+            if(nrfclaw_sht_owns_pin(P_HALL1) ||
+               nrfclaw_sht_owns_pin(P_HALL2)) return false;
+        }
+    }
+
     if(!cfg || (cfg->mode!=NRFCLAW_HALL_MODE_SINGLE && cfg->mode!=NRFCLAW_HALL_MODE_QUADRATURE))
         return false;
     if(cfg->mode==NRFCLAW_HALL_MODE_SINGLE && cfg->channel!=1U && cfg->channel!=2U)

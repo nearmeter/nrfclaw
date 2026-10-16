@@ -235,6 +235,181 @@ _CAPABILITY_MAP: Dict[int, Dict[str, Any]] = {
         "native_unit": "m/s",
         "state_class": "measurement",
     },
+
+    # B8.0j2 generic RF virtual-node namespace.
+    0x0900: {
+        "name": "RF device ID",
+        "platform": "sensor",
+        "device_class": None,
+        "native_unit": None,
+        "state_class": None,
+        "entity_category": "diagnostic",
+    },
+    0x0901: {
+        "name": "RF channel",
+        "platform": "sensor",
+        "device_class": None,
+        "native_unit": None,
+        "state_class": None,
+        "entity_category": "diagnostic",
+    },
+    0x0902: {
+        "name": "Battery low",
+        "platform": "binary_sensor",
+        "device_class": "battery",
+    },
+    0x0910: {
+        "name": "Wind raw",
+        "platform": "sensor",
+        "device_class": None,
+        "native_unit": None,
+        "state_class": "measurement",
+    },
+    0x0911: {
+        "name": "Gust raw",
+        "platform": "sensor",
+        "device_class": None,
+        "native_unit": None,
+        "state_class": "measurement",
+    },
+    0x0912: {
+        "name": "Wind direction",
+        "platform": "sensor",
+        "device_class": None,
+        "native_unit": "°",
+        "state_class": "measurement",
+    },
+    0x0913: {
+        "name": "Rain raw",
+        "platform": "sensor",
+        "device_class": None,
+        "native_unit": None,
+        "state_class": "measurement",
+    },
+    0x0914: {
+        "name": "UV index",
+        "platform": "sensor",
+        "device_class": None,
+        "native_unit": None,
+        "state_class": "measurement",
+    },
+
+    # B8.1i WH51/WH52 production RF semantics.
+    0x0920: {
+        "name": "Battery voltage",
+        "platform": "sensor",
+        "device_class": "voltage",
+        "native_unit": "mV",
+        "state_class": "measurement",
+    },
+    0x0921: {
+        "name": "Soil moisture",
+        "platform": "sensor",
+        "device_class": None,
+        "native_unit": "%",
+        "state_class": "measurement",
+    },
+    0x0922: {
+        "name": "TX boost",
+        "platform": "sensor",
+        "device_class": None,
+        "native_unit": None,
+        "state_class": None,
+        "entity_category": "diagnostic",
+    },
+    0x0923: {
+        "name": "Soil AD raw",
+        "platform": "sensor",
+        "device_class": None,
+        "native_unit": None,
+        "state_class": None,
+        "entity_category": "diagnostic",
+    },
+    0x0924: {
+        "name": "Conductivity",
+        "platform": "sensor",
+        "device_class": None,
+        "native_unit": "µS/cm",
+        "state_class": "measurement",
+    },
+
+
+    # B8.1j scalable RF semantics used by rtl_433-derived profiles.
+    0x0930: {
+        "name": "Wind speed",
+        "platform": "sensor",
+        "device_class": "wind_speed",
+        "native_unit": "m/s",
+        "state_class": "measurement",
+    },
+    0x0931: {
+        "name": "Wind gust",
+        "platform": "sensor",
+        "device_class": "wind_speed",
+        "native_unit": "m/s",
+        "state_class": "measurement",
+    },
+    0x0932: {
+        "name": "Wind direction",
+        "platform": "sensor",
+        "device_class": None,
+        "native_unit": "°",
+        "state_class": "measurement",
+    },
+    0x0933: {
+        "name": "Rain total",
+        "platform": "sensor",
+        "device_class": "precipitation",
+        "native_unit": "mm",
+        "state_class": "total_increasing",
+    },
+    0x0934: {
+        "name": "Rain rate",
+        "platform": "sensor",
+        "device_class": "precipitation_intensity",
+        "native_unit": "mm/h",
+        "state_class": "measurement",
+    },
+    0x0936: {
+        "name": "Lightning count",
+        "platform": "sensor",
+        "device_class": None,
+        "native_unit": None,
+        "state_class": "total_increasing",
+    },
+    0x0937: {
+        "name": "Lightning distance",
+        "platform": "sensor",
+        "device_class": "distance",
+        "native_unit": "km",
+        "state_class": "measurement",
+    },
+    0x0938: {
+        "name": "PM2.5",
+        "platform": "sensor",
+        "device_class": "pm25",
+        "native_unit": "µg/m³",
+        "state_class": "measurement",
+    },
+    0x0939: {
+        "name": "PM10",
+        "platform": "sensor",
+        "device_class": "pm10",
+        "native_unit": "µg/m³",
+        "state_class": "measurement",
+    },
+
+
+    # B8.1k5 SRSmith retained diagnostic, not RF CAP_EVENT.
+    0x093A: {
+        "name": "Last button code",
+        "platform": "sensor",
+        "device_class": None,
+        "native_unit": None,
+        "state_class": None,
+        "entity_category": "diagnostic",
+    },
+
 }
 
 
@@ -303,6 +478,11 @@ def project_capability(
     name = override.pop("name", _fallback_name(cap))
     desc = cap.get("descriptor") or {}
 
+    # B8.0j2g: 0x0902 wire value is BATTERY_OK; HA binary battery means problem/low.
+    projected_value = cap.get("value")
+    if cap_id == 0x0902 and projected_value is not None:
+        projected_value = not bool(projected_value)
+
     out = {
         "unique_key": f"{node_id:08X}:{cap_id:04X}:{channel}",
         "platform": platform,
@@ -310,9 +490,9 @@ def project_capability(
         "capability_id": cap["capability_id"],
         "capability_id_raw": cap_id,
         "channel": channel,
-        "value": cap.get("value"),
+        "value": projected_value,
         "available": True,
-        "entity_category": None,
+        "entity_category": override.pop("entity_category", None),
         "device_class": override.pop("device_class", None),
         "native_unit": override.pop(
             "native_unit",

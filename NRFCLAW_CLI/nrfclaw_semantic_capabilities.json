@@ -178,5 +178,61 @@
     "vibration_becomes_unusual": "VIB_AUTO.WARNING / HA operation 3",
     "vibration_becomes_abnormal": "VIB_AUTO.ALARM / HA operation 4",
     "telegram": "HA-side notification intent; firmware emits HA event only"
+  },
+  "external_rf_ha_semantics": {
+    "family": "external-rf-ha-bridge",
+    "runtime_profiles": [
+      1,
+      2,
+      3,
+      4,
+      12,
+      13,
+      14,
+      18,
+      19,
+      23,
+      30,
+      33,
+      34,
+      35,
+      37
+    ],
+    "host_provision_kind": "external-rf-ha-bridge",
+    "persistent_radio_mode": "EXTERNAL_RF",
+    "persistent_ha_role": "BRIDGE",
+    "ha_projection": "RFVM -> virtual NinaLink -> Home Assistant",
+    "blocked_profiles": {
+      "24": "MIXED_WMBUS_FRAMING",
+      "25": "deferred/non-runtime",
+      "27": "retired/reserved",
+      "28": "MANCHESTER_BITSTREAM_FRAMING"
+    },
+    "requires_host_upload": true,
+    "raw_bytecode_only_sufficient": false,
+    "runtime_validation": "Per-profile hardware reception and HA projection require separate validation",
+    "rf_profile_registry_authoritative": true
+  },
+  "sht_sensor_semantics": {
+    "families": [
+      "SHT2x",
+      "SHT3x",
+      "SHT4x",
+      "SHTC3"
+    ],
+    "temperature_priority": [
+      "DS18B20",
+      "SHT",
+      "NRF52_INTERNAL"
+    ],
+    "humidity_capability": "0x0101",
+    "physical_hw_validation": "pending in supplied evidence",
+    "cli_diagnostics": [
+      "sht-info",
+      "sht-detect",
+      "sht-read",
+      "sht-release"
+    ],
+    "note": "SHT driver and HA capabilities are not a blanket promise that arbitrary natural-language SHT sensor control lowers into VM bytecode"
   }
 }

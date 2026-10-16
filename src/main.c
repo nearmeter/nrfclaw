@@ -42,6 +42,8 @@
 #include "nrfclaw_ninalink_event_router.h"
 #include "nrfclaw_ninalink_network.h"
 #include "nrfclaw_ninalink_telemetry.h"
+#include "nrfclaw_rf_receiver_boot.h" /* B8.0k2 */
+#include "nrfclaw_rf_ingest.h" /* B8.0k */
 
 #if NRFCLAW_BOARD_HAS_LORA
 static void lora_dio_handler(nrf_drv_gpiote_pin_t pin,
@@ -145,6 +147,12 @@ static void dispatch(nrfclaw_event_t const *p_evt)
     }
     else if (p_evt->type == NRFCLAW_EVT_LORA_DIO1) {
 #if NRFCLAW_BOARD_HAS_LORA
+        /* B8.0k automatic GFSK owns DIO1 while active. */
+        if (nrfclaw_rf_ingest_active()) {
+            (void)nrfclaw_rf_ingest_on_dio1();
+            return;
+        }
+
         if (nrfclaw_lora_on_dio1_event()) {
             nrfclaw_event_t tx_done = {
                 .type = NRFCLAW_EVT_LORA_TX_DONE,
@@ -225,6 +233,8 @@ int main(void)
     lora_irq_init();
     nrfclaw_lora_irq_ready();
 #endif
+
+    nrfclaw_rf_receiver_boot_init(); /* B8.0k2 */
 
     nrfclaw_vm_init();
     nrfclaw_scheduler_init();

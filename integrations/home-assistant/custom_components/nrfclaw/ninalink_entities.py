@@ -47,6 +47,10 @@ _SENSOR_CLASS_ALIASES = {
 }
 
 
+def _is_rf_virtual_node_id(node_id: int) -> bool:
+    return (int(node_id) & 0xFF000000) == 0xF8000000
+
+
 def _enum_or_none(enum_cls, value):
     if value is None:
         return None
@@ -815,6 +819,11 @@ def build_sensor_entities(
     data = coordinator.data or {}
 
     for device in data.get("ha", {}).get("devices", []):
+        # B8.0j2h: external RF virtual nodes do not have a NinaLink LoRa hop.
+        node_id = int(device.get("node_id_raw", -1))
+        if _is_rf_virtual_node_id(node_id):
+            continue
+
         entities.append(
             NinaLinkRadioDiagnosticSensor(
                 coordinator,

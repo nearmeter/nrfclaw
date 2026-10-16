@@ -1,8 +1,15 @@
 #include "nrfclaw_ndp.h"
+#include "nrfclaw_rf_profile_registry.h" /* B8.0m1 */
 #include "nrfclaw_rtc.h"
 #include "nrfclaw_native.h"
 #include "nrfclaw_battery.h"
 #include "nrfclaw_lora.h"
+#include "nrfclaw_llcc68_rl.h" /* B8.0f GFSK RAW RX */
+#include "nrfclaw_rfvm.h" /* B8.0h FIFO -> RFVM */
+#include "nrfclaw_rf_capability.h" /* B8.0i */
+#include "nrfclaw_rf_ninalink.h" /* B8.0j1 */
+#include "nrfclaw_rf_ingest.h" /* B8.0k */
+#include "nrfclaw_rf_receiver_boot.h" /* B8.0k2 */
 #include "nrfclaw_inputs.h"
 #include "nrfclaw_board_api.h"
 #include "nrfclaw_ndp_access.h"
@@ -34,6 +41,7 @@
 #include "nrfclaw_ninalink_network.h"
 #include "nrfclaw_ninalink_telemetry.h"
 #include "nrfclaw_ninalink_capability_discovery.h"
+#include "nrfclaw_sht.h"
 #include <string.h>
 
 #define NDP_INFO NRFCLAW_NDP_INFO
@@ -57,6 +65,8 @@
 #define NDP_DIRECT_HALL_CONTROL NRFCLAW_NDP_DIRECT_HALL_CONTROL
 #define NDP_DIRECT_SEMANTIC_STATE NRFCLAW_NDP_DIRECT_SEMANTIC_STATE
 #define NDP_NINALINK_NETWORK NRFCLAW_NDP_NINALINK_NETWORK
+#define NDP_GFSK_DIAG NRFCLAW_NDP_GFSK_DIAG /* B8.0f GFSK RAW RX */
+#define NDP_SHT_DIAG NRFCLAW_NDP_SHT_DIAG /* B8.1k8c1 SHT hardware diagnostic */
 
 
 #define NDP_HALL_CONFIG NRFCLAW_NDP_HALL_CONFIG
@@ -97,6 +107,44 @@
 #define NDP_SENSOR_DS18B20 NRFCLAW_NDP_SENSOR_DS18B20
 #define NDP_SENSOR_ACCEL_METRICS NRFCLAW_NDP_SENSOR_ACCEL_METRICS
 #define NDP_SENSOR_TEMPERATURE NRFCLAW_NDP_SENSOR_TEMPERATURE
+#define NDP_SENSOR_HUMIDITY NRFCLAW_NDP_SENSOR_HUMIDITY
+
+
+/* B8.0f GFSK RAW RX diagnostic state: RAM-only, physical NUS only. */
+static uint8_t b80f_gfsk_last[64];
+static uint8_t b80f_gfsk_last_len;
+static uint16_t b80f_gfsk_last_irq;
+static uint16_t b80f_gfsk_rx_done;
+static uint16_t b80f_gfsk_read_fail;
+static uint8_t b80f_gfsk_bw_code=NRFCLAW_LLCC68_GFSK_BW_117_3;
+static uint32_t b80f_gfsk_frequency_hz=915000000UL; /* B8.0f1 readback */
+
+
+/* B8.1k8c1: compact <=15-byte physical diagnostic payload.
+ * status:u8 active:u8 present:u8 family:u8 address:u8 scl:u8 sda:u8
+ * serial_valid:u8 serial:u32LE
+ */
+static uint8_t b81k8c1_sht_pack_info(uint8_t *r,uint8_t status)
+{
+    nrfclaw_sht_info_t info;
+
+    memset(&info,0,sizeof(info));
+    nrfclaw_sht_info(&info);
+
+    r[0]=status;
+    r[1]=nrfclaw_sht_active()?1U:0U;
+    r[2]=nrfclaw_sht_present()?1U:0U;
+    r[3]=(uint8_t)info.family;
+    r[4]=info.address;
+    r[5]=info.scl_pin;
+    r[6]=info.sda_pin;
+    r[7]=info.serial_valid?1U:0U;
+    r[8]=(uint8_t)info.serial;
+    r[9]=(uint8_t)(info.serial>>8);
+    r[10]=(uint8_t)(info.serial>>16);
+    r[11]=(uint8_t)(info.serial>>24);
+    return 12U;
+}
 
 bool nrfclaw_ndp_is_session_frame(uint8_t const*d,uint16_t len) {
     if(!d || len<4U) return false;
@@ -128,7 +176,9 @@ static bool nus_owner_key_opcode(uint8_t op)
            op == NDP_KEY_STATUS ||
            op == NDP_BLE_BOOT_CONTROL ||
            op == NDP_HA_ROLE_CONTROL ||
-           op == NDP_NINALINK_NETWORK;
+           op == NDP_NINALINK_NETWORK ||
+           op == NDP_GFSK_DIAG ||
+           op == NDP_SHT_DIAG;
 }
 
 bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
@@ -162,7 +212,7 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
       }
       case NDP_CAPS: {
         uint16_t mask=0;
-        for(uint8_t c=1;c<=NRFCLAW_CAP_TEMPERATURE;c++) if(nrfclaw_native_capability_supported(c)) mask|=(uint16_t)(1U<<(c-1U));
+        for(uint8_t c=1;c<=NRFCLAW_CAP_HUMIDITY;c++) if(nrfclaw_native_capability_supported(c)) mask|=(uint16_t)(1U<<(c-1U));
         r[0]=(uint8_t)mask; r[1]=(uint8_t)(mask>>8);
         return reply(op,seq,NDP_OK,r,2,out,ol);
       }
@@ -178,7 +228,7 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
         if (selector == 1U) {
             /* Runtime ACTIVE bitmap. NDP_CAPS is the SUPPORTED bitmap. */
             uint16_t mask=0;
-            for(uint8_t c=1;c<=NRFCLAW_CAP_TEMPERATURE;c++) if(nrfclaw_native_capability_active(c)) mask|=(uint16_t)(1U<<(c-1U));
+            for(uint8_t c=1;c<=NRFCLAW_CAP_HUMIDITY;c++) if(nrfclaw_native_capability_active(c)) mask|=(uint16_t)(1U<<(c-1U));
             r[0]=(uint8_t)mask; r[1]=(uint8_t)(mask>>8);
             return reply(op,seq,NDP_OK,r,2,out,ol);
         }
@@ -359,6 +409,15 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
             r[0]=(uint8_t)source;
             memcpy(&r[1],&mc,4);
             return reply(op,seq,NDP_OK,r,5,out,ol);
+        }
+        if(p[0]==NDP_SENSOR_HUMIDITY) {
+            uint32_t rh;
+            if(!nrfclaw_humidity_available()) return reply(op,seq,NDP_UNSUPPORTED,0,0,out,ol);
+            if(!nrfclaw_humidity_last_mpermille(&rh)) {
+                if(!nrfclaw_humidity_refresh() || !nrfclaw_humidity_last_mpermille(&rh))
+                    return reply(op,seq,NDP_BUSY,0,0,out,ol);
+            }
+            memcpy(r,&rh,4); return reply(op,seq,NDP_OK,r,4,out,ol);
         }
         if(p[0]==NDP_SENSOR_ACCEL_METRICS) {
             nrfclaw_accel_vibration_metrics_t m;if(!nrfclaw_lis2dh12_vibration_metrics(&m))return reply(op,seq,NDP_BUSY,0,0,out,ol);
@@ -1074,6 +1133,20 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
             return reply(op,seq,NDP_OK,r,15,out,ol);
         }
 
+        /* B8.0j2c physical NUS -> Application handoff.
+         * Stop authorizing further programming/NUS work but keep this
+         * connection alive long enough to deliver the NDP response.
+         * On disconnect, nrfclaw_ble.c restores Application/NDP advertising.
+         * This selector remains physical-NUS-only because selector 39 is not
+         * in the authenticated Application-plane allow-list above.
+         */
+        if(p[0]==39U) {
+            if(n!=1U)
+                return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            nrfclaw_ble_programming_release();
+            return reply(op,seq,NDP_OK,0,0,out,ol);
+        }
+
         if(p[0]==37U) {
             nrfclaw_ninalink_change_status_t xs55;
             if(n!=2U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
@@ -1214,6 +1287,7 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
         }
 
         /* B7.6f2m6c1 MTU-safe Application CAP_SET status: 15 bytes. */
+
         if(p[0]==55U) {
             nrfclaw_ninalink_app_dl_status_t app_status;
 
@@ -1235,6 +1309,686 @@ bool nrfclaw_ndp_handle_session_transport(uint8_t const*d,uint16_t len,
             r[14]=app_status.result;
             return reply(op,seq,NDP_OK,r,15,out,ol);
         }
+
+        return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+      }
+
+
+      /* B8.0f GFSK RAW RX: 0=status,1=start,2=poll,3=chunk,4=stop,5=clear. */
+
+      /* B8.1k8c1 SHT hardware diagnostic, physical NUS only.
+       * selector 0: info
+       * selector 1: detect [default] or detect,scl,sda
+       * selector 2: read
+       * selector 3: release
+       */
+      case NDP_SHT_DIAG: {
+        nrfclaw_sht_status_t st;
+
+        if(enforce_auth)
+            return reply(op,seq,NDP_FORBIDDEN,0,0,out,ol);
+        if(n<1U)
+            return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+
+        if(p[0]==0U) {
+            if(n!=1U)
+                return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            rn=b81k8c1_sht_pack_info(r,(uint8_t)NRFCLAW_SHT_OK);
+            return reply(op,seq,NDP_OK,r,rn,out,ol);
+        }
+
+        if(p[0]==1U) {
+            if(n==1U)
+                st=nrfclaw_sht_configure_default();
+            else if(n==3U)
+                st=nrfclaw_sht_configure(p[1],p[2]);
+            else
+                return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+
+            if(st==NRFCLAW_SHT_OK)
+                st=nrfclaw_sht_probe();
+
+            rn=b81k8c1_sht_pack_info(r,(uint8_t)st);
+            return reply(op,seq,NDP_OK,r,rn,out,ol);
+        }
+
+        if(p[0]==2U) {
+            nrfclaw_sht_sample_t sample;
+            uint32_t u;
+
+            if(n!=1U)
+                return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+
+            memset(&sample,0,sizeof(sample));
+            st=nrfclaw_sht_read(&sample);
+
+            r[0]=(uint8_t)st;
+            u=(uint32_t)sample.temperature_mC;
+            r[1]=(uint8_t)u;
+            r[2]=(uint8_t)(u>>8);
+            r[3]=(uint8_t)(u>>16);
+            r[4]=(uint8_t)(u>>24);
+            u=sample.humidity_mpermille;
+            r[5]=(uint8_t)u;
+            r[6]=(uint8_t)(u>>8);
+            r[7]=(uint8_t)(u>>16);
+            r[8]=(uint8_t)(u>>24);
+            return reply(op,seq,NDP_OK,r,9U,out,ol);
+        }
+
+        if(p[0]==3U) {
+            if(n!=1U)
+                return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            nrfclaw_sht_release();
+            rn=b81k8c1_sht_pack_info(r,(uint8_t)NRFCLAW_SHT_OK);
+            return reply(op,seq,NDP_OK,r,rn,out,ol);
+        }
+
+        return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+      }
+
+      case NDP_GFSK_DIAG: {
+        if(enforce_auth) return reply(op,seq,NDP_FORBIDDEN,0,0,out,ol);
+        if(n<1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+
+        if(p[0]==0U){
+            r[0]=nrfclaw_llcc68_rl_gfsk_active()?1U:0U;
+            r[1]=b80f_gfsk_last_len;
+            r[2]=(uint8_t)b80f_gfsk_last_irq; r[3]=(uint8_t)(b80f_gfsk_last_irq>>8);
+            r[4]=(uint8_t)b80f_gfsk_rx_done; r[5]=(uint8_t)(b80f_gfsk_rx_done>>8);
+            r[6]=(uint8_t)b80f_gfsk_read_fail; r[7]=(uint8_t)(b80f_gfsk_read_fail>>8);
+            r[8]=b80f_gfsk_bw_code; r[9]=21U;
+            memcpy(&r[10],&b80f_gfsk_frequency_hz,4);
+            return reply(op,seq,NDP_OK,r,14,out,ol);
+        }
+        if(p[0]==1U){
+            /* B8.0l-r3 exclusive-mode guard: LoRa bridge owns LLCC68 */
+            if(!nrfclaw_bridge_radio_mode_is_external())
+                return reply(op,seq,NDP_FORBIDDEN,0,0,out,ol);
+            uint32_t freq=915000000UL; uint8_t bw_sel=0U;
+            if(n!=1U&&n!=6U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            if(n==6U){ memcpy(&freq,&p[1],4); bw_sel=p[5]; }
+            if(freq<902000000UL||freq>928000000UL||bw_sel>1U)
+                return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+            if(!nrfclaw_lora_idle()) return reply(op,seq,NDP_BUSY,0,0,out,ol);
+            b80f_gfsk_bw_code=bw_sel?NRFCLAW_LLCC68_GFSK_BW_156_2:NRFCLAW_LLCC68_GFSK_BW_117_3;
+            b80f_gfsk_frequency_hz=freq;
+            b80f_gfsk_last_len=0U; b80f_gfsk_last_irq=0U;
+            if(!nrfclaw_llcc68_rl_gfsk_start_vevor(freq,b80f_gfsk_bw_code))
+                return reply(op,seq,NDP_BUSY,0,0,out,ol);
+            /* B8.0k2 remember runtime receiver config; persistence is explicit. */
+            nrfclaw_rf_receiver_boot_note_runtime(
+                NRFCLAW_RF_PROFILE_VEVOR_YT60234,
+                freq,b80f_gfsk_bw_code);
+            /* B8.0k auto-ingest starts with GFSK RX. */
+            if(!nrfclaw_rf_ingest_start(NRFCLAW_RF_PROFILE_VEVOR_YT60234)){
+                (void)nrfclaw_llcc68_rl_gfsk_stop_restore_lora();
+                return reply(op,seq,NDP_BUSY,0,0,out,ol);
+            }
+            return reply(op,seq,NDP_OK,0,0,out,ol);
+        }
+        if(p[0]==2U){
+            bool ready=false; uint8_t lr=0U; uint16_t irq=0U;
+            if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            if(!nrfclaw_llcc68_rl_gfsk_active()) return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+            if(!nrfclaw_llcc68_rl_gfsk_poll(&irq,b80f_gfsk_last,&lr,sizeof(b80f_gfsk_last),&ready)){
+                if(b80f_gfsk_read_fail!=UINT16_MAX) b80f_gfsk_read_fail++;
+                return reply(op,seq,NDP_BUSY,0,0,out,ol);
+            }
+            b80f_gfsk_last_irq=irq;
+            if(ready){ b80f_gfsk_last_len=lr; if(b80f_gfsk_rx_done!=UINT16_MAX) b80f_gfsk_rx_done++; }
+            r[0]=ready?1U:0U; r[1]=b80f_gfsk_last_len; r[2]=(uint8_t)irq; r[3]=(uint8_t)(irq>>8);
+            return reply(op,seq,NDP_OK,r,4,out,ol);
+        }
+        if(p[0]==3U){
+            if(n!=2U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            uint8_t off=p[1];
+            if(off>b80f_gfsk_last_len) return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+            uint8_t chunk=(uint8_t)(b80f_gfsk_last_len-off); if(chunk>12U) chunk=12U;
+            r[0]=b80f_gfsk_last_len; r[1]=off; r[2]=chunk;
+            if(chunk) memcpy(&r[3],&b80f_gfsk_last[off],chunk);
+            return reply(op,seq,NDP_OK,r,(uint8_t)(3U+chunk),out,ol);
+        }
+        if(p[0]==4U){
+            if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            /* B8.0k stop auto-ingest before restoring LoRa. */
+            nrfclaw_rf_ingest_stop();
+            if(!nrfclaw_llcc68_rl_gfsk_stop_restore_lora()) return reply(op,seq,NDP_BUSY,0,0,out,ol);
+            return reply(op,seq,NDP_OK,0,0,out,ol);
+        }
+        if(p[0]==5U){
+            if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            b80f_gfsk_last_len=0U; b80f_gfsk_last_irq=0U; b80f_gfsk_rx_done=0U; b80f_gfsk_read_fail=0U;
+            memset(b80f_gfsk_last,0,sizeof(b80f_gfsk_last));
+            return reply(op,seq,NDP_OK,0,0,out,ol);
+        }
+        /* B8.0g selector 6: one-shot synthetic VEVOR TX. */
+        if(p[0]==6U){
+            uint32_t freq;
+            int8_t power;
+            uint16_t irq=0U;
+            uint8_t variant=0U;
+
+            /* B8.0k1 optional synthetic vector selector. */
+            if(n!=6U && n!=7U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            memcpy(&freq,&p[1],4);
+            power=(int8_t)p[5];
+            if(n==7U) variant=p[6];
+            if(variant>1U) return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+
+            if(freq<902000000UL||freq>928000000UL||power<-9||power>14)
+                return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+            if(!nrfclaw_lora_idle() || nrfclaw_llcc68_rl_gfsk_active())
+                return reply(op,seq,NDP_BUSY,0,0,out,ol);
+
+            if(!nrfclaw_llcc68_rl_gfsk_tx_vevor_variant(freq,power,variant,&irq)){
+                r[0]=(uint8_t)irq;
+                r[1]=(uint8_t)(irq>>8);
+                return reply(op,seq,NDP_BUSY,r,2,out,ol);
+            }
+
+            r[0]=(uint8_t)irq;
+            r[1]=(uint8_t)(irq>>8);
+            return reply(op,seq,NDP_OK,r,2,out,ol);
+        }
+
+        /* B8.0h selector 7: cached FIFO -> production RFVM. */
+        if(p[0]==7U){
+            nrfclaw_rfvm_result_t decoded;
+            nrfclaw_rfvm_profile_t const *profile;
+            uint8_t page;
+
+            if(n!=2U)
+                return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+
+            if(b80f_gfsk_last_len==0U)
+                return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+
+            profile=nrfclaw_rfvm_profile(
+                NRFCLAW_RF_PROFILE_VEVOR_YT60234
+            );
+
+            if(!profile)
+                return reply(op,seq,NDP_UNSUPPORTED,0,0,out,ol);
+
+            if(!nrfclaw_rfvm_run(
+                    profile,
+                    b80f_gfsk_last,
+                    b80f_gfsk_last_len,
+                    &decoded))
+                return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+
+            page=p[1];
+
+            /* B8.0h2b MTU-safe summary. */
+            if(page==0U){
+                r[0]=1U;
+                r[1]=profile->profile_id;
+                r[2]=decoded.field_count;
+                r[3]=b80f_gfsk_last_len;
+                return reply(op,seq,NDP_OK,r,4,out,ol);
+            }
+
+            /* Two fields/page:
+             * each field = id:u8 + value:s32 = 5 bytes.
+             * RFVM payload = 1 + 2*5 = 11 bytes.
+             * Full NDP response = 4-byte header + status + 11 = 16 bytes.
+             */
+            {
+                uint8_t start_index=(uint8_t)((page-1U)*2U);
+                uint8_t count=0U;
+                uint8_t pos=1U;
+
+                if(start_index>=decoded.field_count)
+                    return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+
+                r[0]=0U;
+
+                for(uint8_t i=start_index;
+                    i<decoded.field_count && count<2U;
+                    ++i,++count){
+                    r[pos++]=decoded.field[i].field_id;
+                    memcpy(&r[pos],&decoded.field[i].value,4);
+                    pos=(uint8_t)(pos+4U);
+                }
+
+                r[0]=count;
+                return reply(op,seq,NDP_OK,r,pos,out,ol);
+            }
+        }
+        /* B8.0i selector 8: FIFO -> RFVM -> dynamic capabilities. */
+        if(p[0]==8U){
+            nrfclaw_rfvm_result_t decoded;
+            nrfclaw_rfvm_profile_t const *profile;
+
+            if(n!=1U)
+                return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            if(b80f_gfsk_last_len==0U)
+                return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+
+            profile=nrfclaw_rfvm_profile(
+                NRFCLAW_RF_PROFILE_VEVOR_YT60234
+            );
+            if(!profile)
+                return reply(op,seq,NDP_UNSUPPORTED,0,0,out,ol);
+
+            if(!nrfclaw_rfvm_run(
+                    profile,
+                    b80f_gfsk_last,
+                    b80f_gfsk_last_len,
+                    &decoded))
+                return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+
+            if(!nrfclaw_rf_capability_publish(
+                    profile->profile_id,
+                    &decoded))
+                return reply(op,seq,NDP_BUSY,0,0,out,ol);
+
+            r[0]=profile->profile_id;
+            r[1]=nrfclaw_rf_capability_count();
+            return reply(op,seq,NDP_OK,r,2,out,ol);
+        }
+
+        /* B8.0i selector 9,index: one descriptor/value.
+         * response payload=14, complete NDP frame=19 bytes.
+         */
+        if(p[0]==9U){
+            nrfclaw_rf_capability_entry_t e;
+            uint8_t index;
+            uint32_t raw=0U;
+
+            if(n!=2U)
+                return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+
+            index=p[1];
+            if(!nrfclaw_rf_capability_at(index,&e))
+                return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+
+            r[0]=nrfclaw_rf_capability_count();
+            r[1]=index;
+            r[2]=(uint8_t)e.desc.capability_id;
+            r[3]=(uint8_t)(e.desc.capability_id>>8);
+            r[4]=e.desc.channel;
+            r[5]=e.desc.kind;
+            r[6]=e.desc.value_type;
+            r[7]=(uint8_t)e.desc.scale10;
+            r[8]=e.desc.unit;
+            r[9]=e.desc.behavior_flags;
+
+            switch(e.value.type){
+            case NRFCLAW_CAP_VALUE_BOOL:
+                raw=e.value.v.boolean?1U:0U; break;
+            case NRFCLAW_CAP_VALUE_U8:
+            case NRFCLAW_CAP_VALUE_ENUM8:
+                raw=e.value.v.u8; break;
+            case NRFCLAW_CAP_VALUE_S8:
+                raw=(uint32_t)(int32_t)e.value.v.s8; break;
+            case NRFCLAW_CAP_VALUE_U16:
+                raw=e.value.v.u16; break;
+            case NRFCLAW_CAP_VALUE_S16:
+                raw=(uint32_t)(int32_t)e.value.v.s16; break;
+            case NRFCLAW_CAP_VALUE_U32:
+                raw=e.value.v.u32; break;
+            case NRFCLAW_CAP_VALUE_S32:
+                raw=(uint32_t)e.value.v.s32; break;
+            default:
+                return reply(op,seq,NDP_UNSUPPORTED,0,0,out,ol);
+            }
+
+            memcpy(&r[10],&raw,4);
+            return reply(op,seq,NDP_OK,r,14,out,ol);
+        }
+
+
+        /* B8.0j1 selector 10: project RF provider into NinaLink virtual node. */
+        if(p[0]==10U){
+            nrfclaw_rf_ninalink_status_t st;
+            uint32_t now_s=nrfclaw_rtc_now();
+
+            if(n!=1U)
+                return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+
+            if(!nrfclaw_rf_ninalink_publish(
+                    NRFCLAW_RF_PROFILE_VEVOR_YT60234,
+                    now_s))
+                return reply(op,seq,NDP_BUSY,0,0,out,ol);
+
+            if(!nrfclaw_rf_ninalink_status(&st))
+                return reply(op,seq,NDP_BUSY,0,0,out,ol);
+
+            r[0]=st.profile_id;
+            memcpy(&r[1],&st.node_id,4);
+            r[5]=st.capability_count;
+            r[6]=st.cached_value_count;
+            return reply(op,seq,NDP_OK,r,7,out,ol);
+        }
+
+        /* B8.0j1 selector 11,index:
+         * read back NinaLink inventory + cache for the virtual RF node.
+         * response payload 15 => complete NDP frame 20 bytes.
+         */
+        if(p[0]==11U){
+            nrfclaw_rf_ninalink_status_t st;
+            nrfclaw_ninalink_cap_inventory_status_t inv;
+            nrfclaw_ninalink_capability_descriptor_t dsc;
+            nrfclaw_ninalink_cached_value_t val;
+            uint8_t index;
+            uint32_t raw;
+
+            if(n!=2U)
+                return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            if(!nrfclaw_rf_ninalink_status(&st))
+                return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+
+            index=p[1];
+
+            if(!nrfclaw_ninalink_cap_inventory_get_status(st.node_id,&inv))
+                return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+            if(!nrfclaw_ninalink_cap_inventory_get_at(st.node_id,index,&dsc))
+                return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+            if(!nrfclaw_ninalink_state_cache_get_value_at(st.node_id,index,&val))
+                return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+
+            if(dsc.desc.capability_id!=val.capability_id ||
+               dsc.desc.channel!=val.channel)
+                return reply(op,seq,NDP_BUSY,0,0,out,ol);
+
+            raw=nrfclaw_ninalink_state_cache_value_raw(&val.value);
+
+            r[0]=inv.count;
+            r[1]=index;
+            r[2]=(uint8_t)dsc.desc.capability_id;
+            r[3]=(uint8_t)(dsc.desc.capability_id>>8);
+            r[4]=dsc.desc.channel;
+            r[5]=dsc.desc.value_type;
+            r[6]=(uint8_t)dsc.desc.scale10;
+            r[7]=dsc.desc.unit;
+            r[8]=dsc.runtime_state_flags;
+            r[9]=inv.complete?1U:0U;
+            r[10]=inv.overflow?1U:0U;
+            memcpy(&r[11],&raw,4);
+            return reply(op,seq,NDP_OK,r,15,out,ol);
+        }
+
+
+        /* B8.0k selector 12: automatic ingest status. */
+        if(p[0]==12U){
+            nrfclaw_rf_ingest_status_t st;
+            if(n!=1U)
+                return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            nrfclaw_rf_ingest_get_status(&st);
+            r[0]=st.active?1U:0U;
+            r[1]=st.profile_id;
+            r[2]=(uint8_t)st.dio1_events;
+            r[3]=(uint8_t)(st.dio1_events>>8);
+            r[4]=(uint8_t)st.packets;
+            r[5]=(uint8_t)(st.packets>>8);
+            r[6]=(uint8_t)st.decode_ok;
+            r[7]=(uint8_t)(st.decode_ok>>8);
+            r[8]=(uint8_t)st.publish_ok;
+            r[9]=(uint8_t)(st.publish_ok>>8);
+            r[10]=(uint8_t)st.failures;
+            r[11]=(uint8_t)(st.failures>>8);
+            r[12]=(uint8_t)st.last_irq;
+            r[13]=(uint8_t)(st.last_irq>>8);
+            r[14]=st.last_len;
+            return reply(op,seq,NDP_OK,r,15,out,ol);
+        }
+
+        /* B8.0k selector 13: enable automatic ownership on active GFSK RX. */
+        if(p[0]==13U){
+            /* B8.0l-r3 selector13 exclusive-mode guard */
+            if(!nrfclaw_bridge_radio_mode_is_external())
+                return reply(op,seq,NDP_FORBIDDEN,0,0,out,ol);
+            if(n!=1U)
+                return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            if(!nrfclaw_rf_ingest_start(NRFCLAW_RF_PROFILE_VEVOR_YT60234))
+                return reply(op,seq,NDP_BUSY,0,0,out,ol);
+            return reply(op,seq,NDP_OK,0,0,out,ol);
+        }
+
+        /* B8.0k selector 14: release DIO1 for legacy/manual gfsk-poll. */
+        if(p[0]==14U){
+            if(n!=1U)
+                return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            nrfclaw_rf_ingest_stop();
+            return reply(op,seq,NDP_OK,0,0,out,ol);
+        }
+
+        /* B8.0k selector 15: clear counters without changing ownership. */
+        if(p[0]==15U){
+            if(n!=1U)
+                return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            nrfclaw_rf_ingest_clear_stats();
+            return reply(op,seq,NDP_OK,0,0,out,ol);
+        }
+
+
+        /* B8.0k2 selector 16: persist current GFSK receiver for BRIDGE boot. */
+        if(p[0]==16U){
+            if(n!=1U)
+                return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            if(!nrfclaw_rf_receiver_boot_enable_persist())
+                return reply(op,seq,NDP_BUSY,0,0,out,ol);
+            return reply(op,seq,NDP_OK,0,0,out,ol);
+        }
+
+        /* B8.0k2 selector 17: persist boot-disabled; current RX untouched. */
+        if(p[0]==17U){
+            if(n!=1U)
+                return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            if(!nrfclaw_rf_receiver_boot_disable_persist())
+                return reply(op,seq,NDP_BUSY,0,0,out,ol);
+            return reply(op,seq,NDP_OK,0,0,out,ol);
+        }
+
+        /* B8.0k2 selector 18: persistent receiver status. */
+        if(p[0]==18U){
+            nrfclaw_rf_receiver_boot_status_t st;
+            if(n!=1U)
+                return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            nrfclaw_rf_receiver_boot_get_status(&st);
+            r[0]=st.persisted?1U:0U;
+            r[1]=st.enabled?1U:0U;
+            r[2]=st.runtime_active?1U:0U;
+            r[3]=st.profile_id;
+            r[4]=st.bw_code;
+            memcpy(&r[5],&st.frequency_hz,4);
+            r[9]=st.store_status;
+            return reply(op,seq,NDP_OK,r,10,out,ol);
+        }
+        /* B8.0m3 selector 26: generic synthetic OTA TX. */
+        if(p[0]==26U){
+            const nrfclaw_rf_profile_entry_t *e;
+            nrfclaw_llcc68_gfsk_profile_t cfg;
+            const uint8_t *frame=0;
+            uint8_t frame_len=0U;
+            int8_t power;
+            uint16_t irq=0U;
+static const uint8_t vevor[]={0xAA,0x00,0xF8,0xF7,0x9D,0x02,0xE3,0x32,0x01,0x0E,0x03,0x02,0x0B,0x01,0x38,0x02,0x39,0x7A,0x86,0xE0,0x87};
+            static const uint8_t wh31e[]={0x30,0xC3,0x81,0xD5,0x5C,0x2A,0xCF,0x08,0x35,0x44,0x2C};
+            static const uint8_t wh51[]={0x51,0x00,0x6B,0x58,0x6E,0x7F,0x24,0xF8,0xD2,0xFF,0xFF,0xFF,0x3C,0x28};
+            /* B8.1k6d W-MBus Format-B synthetic vector.
+             * L=0x0C; meter ID BCD=12345678; CRC=0x8CA2.
+             * TX is fixed-length so L remains on-air payload.
+             */
+            static const uint8_t wmbus_b[]={0x0C,0x44,0x2C,0x2D,0x78,0x56,0x34,0x12,0x01,0x02,0x78,0x8C,0xA2};
+            if(n!=3U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+e=nrfclaw_rf_profile_registry_get(p[1]);
+            if(!e || !nrfclaw_rf_profile_registry_runtime_ready(p[1])) return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+if(p[1]==NRFCLAW_RF_PROFILE_VEVOR_YT60234){ frame=vevor; frame_len=(uint8_t)sizeof(vevor); }
+            else if(p[1]==NRFCLAW_RF_PROFILE_AMBIENT_WH31E){ frame=wh31e; frame_len=(uint8_t)sizeof(wh31e); }
+            else if(p[1]==NRFCLAW_RF_PROFILE_ECOWITT_WH51){ frame=wh51; frame_len=(uint8_t)sizeof(wh51); }
+            else if(p[1]==37U){ frame=wmbus_b; frame_len=(uint8_t)sizeof(wmbus_b); }
+
+            else return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+            if((e->flags & NRFCLAW_RF_PROFILE_FLAG_VARIABLE_PACKET)==0U &&
+               frame_len!=e->expected_len)
+                return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+            memset(&cfg,0,sizeof(cfg));
+            cfg.frequency_hz=e->frequency_hz; cfg.bitrate_bps=e->bitrate_bps; cfg.deviation_hz=e->deviation_hz;
+            cfg.rx_bw_code=e->rx_bw_code; cfg.preamble_bits=e->preamble_bits;
+            memcpy(cfg.sync,e->sync,sizeof(cfg.sync)); cfg.sync_len=e->sync_len;
+            cfg.packet_mode=NRFCLAW_LLCC68_GFSK_PACKET_FIXED;
+            cfg.payload_len=frame_len;
+            power=(int8_t)p[2];
+            if(!nrfclaw_llcc68_rl_gfsk_tx_profile(&cfg,frame,frame_len,power,&irq)) return reply(op,seq,NDP_BUSY,0,0,out,ol);
+            r[0]=p[1]; r[1]=frame_len; r[2]=(uint8_t)power; r[3]=(uint8_t)irq; r[4]=(uint8_t)(irq>>8);
+            return reply(op,seq,NDP_OK,r,5,out,ol);
+        }
+        /* B8.0m3a selector 27: last ingest frame metadata. */
+        if(p[0]==27U){
+            uint8_t profile_id=0U,len=0U; bool rfvm_ok=false;
+            if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            if(!nrfclaw_rf_ingest_last_frame_meta(&profile_id,&len,&rfvm_ok)) return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+            r[0]=profile_id; r[1]=len; r[2]=rfvm_ok?1U:0U;
+            return reply(op,seq,NDP_OK,r,3,out,ol);
+        }
+
+        /* B8.0m3a selector 28: read last FIFO frame in 12-byte chunks. */
+        if(p[0]==28U){
+            uint8_t got;
+            if(n!=2U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            got=nrfclaw_rf_ingest_last_frame_read(p[1],&r[2],12U);
+            if(got==0U) return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+            r[0]=p[1]; r[1]=got;
+            return reply(op,seq,NDP_OK,r,(uint8_t)(2U+got),out,ol);
+        }
+
+
+
+
+        /* B8.1j1a selector 29: compact registry page.
+         * request:  [29][start_index]
+         * response: [total][start][count] + count*{profile_id,flags}
+         * count <= 6 => maximum response payload = 15 bytes.
+         */
+        if(p[0]==29U){
+            uint8_t total;
+            uint8_t start;
+            uint8_t count=0U;
+            uint8_t i;
+            uint8_t o=3U;
+
+            if(n!=2U)
+                return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+
+            total=nrfclaw_rf_profile_registry_count();
+            start=p[1];
+
+            if(start>=total)
+                return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+
+            r[0]=total;
+            r[1]=start;
+
+            for(i=start; i<total && count<6U; ++i){
+                const nrfclaw_rf_profile_entry_t *e =
+                    nrfclaw_rf_profile_registry_at(i);
+                if(!e)
+                    break;
+                r[o++]=e->profile_id;
+                r[o++]=e->flags;
+                ++count;
+            }
+
+            r[2]=count;
+            return reply(op,seq,NDP_OK,r,(uint8_t)(3U+2U*count),out,ol);
+        }
+
+        /* B8.1j1a selector 30: profile ID -> registry index. */
+        if(p[0]==30U){
+            uint8_t total;
+            uint8_t i;
+
+            if(n!=2U)
+                return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+
+            total=nrfclaw_rf_profile_registry_count();
+
+            for(i=0U; i<total; ++i){
+                const nrfclaw_rf_profile_entry_t *e =
+                    nrfclaw_rf_profile_registry_at(i);
+                if(e && e->profile_id==p[1]){
+                    r[0]=i;
+                    return reply(op,seq,NDP_OK,r,1U,out,ol);
+                }
+            }
+
+            return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+        }
+
+
+
+
+
+
+        /* B8.0m1 selector 22: registry count. */
+        if(p[0]==22U){
+            if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            r[0]=nrfclaw_rf_profile_registry_count();
+            return reply(op,seq,NDP_OK,r,1,out,ol);
+        }
+
+        /* B8.0m1 selector 23: compact summary by index. */
+        if(p[0]==23U){
+            const nrfclaw_rf_profile_entry_t *e;
+            if(n!=2U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            e=nrfclaw_rf_profile_registry_at(p[1]);
+            if(!e) return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+            r[0]=p[1]; r[1]=e->profile_id; r[2]=e->flags; r[3]=e->modulation;
+            r[4]=e->expected_len; r[5]=e->sync_len;
+            memcpy(&r[6],&e->frequency_hz,4); memcpy(&r[10],&e->bitrate_bps,4);
+            return reply(op,seq,NDP_OK,r,14,out,ol);
+        }
+
+        /* B8.0m1 selector 24: radio detail by index. */
+        if(p[0]==24U){
+            const nrfclaw_rf_profile_entry_t *e;
+            if(n!=2U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            e=nrfclaw_rf_profile_registry_at(p[1]);
+            if(!e) return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+            r[0]=e->profile_id; memcpy(&r[1],&e->deviation_hz,4);
+            memcpy(&r[5],&e->rx_bandwidth_hz,4); memcpy(&r[9],e->sync,4);
+            return reply(op,seq,NDP_OK,r,13,out,ol);
+        }
+
+        /* B8.0m1 selector 25: short name by index. */
+        if(p[0]==25U){
+            const nrfclaw_rf_profile_entry_t *e; size_t nl;
+            if(n!=2U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            e=nrfclaw_rf_profile_registry_at(p[1]);
+            if(!e) return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
+            nl=strlen(e->name); if(nl>14U) nl=14U;
+            r[0]=e->profile_id; memcpy(&r[1],e->name,nl);
+            return reply(op,seq,NDP_OK,r,(uint8_t)(1U+nl),out,ol);
+        }
+
+
+        /* B8.0l selector 19: exclusive bridge-radio status. */
+        if(p[0]==19U){
+            nrfclaw_rf_receiver_boot_status_t st;
+            if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            nrfclaw_rf_receiver_boot_get_status(&st);
+            r[0]=(uint8_t)nrfclaw_bridge_radio_mode_get(); r[1]=st.runtime_active?1U:0U; r[2]=st.profile_id; r[3]=st.bw_code;
+            memcpy(&r[4],&st.frequency_hz,4); r[8]=st.store_status;
+            return reply(op,seq,NDP_OK,r,9,out,ol);
+        }
+
+        if(p[0]==20U){
+            if(n!=1U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            if(!nrfclaw_bridge_radio_mode_set_lora_persist()) return reply(op,seq,NDP_BUSY,0,0,out,ol);
+            return reply(op,seq,NDP_OK,0,0,out,ol);
+        }
+
+        if(p[0]==21U){
+            uint8_t profile,bw; uint32_t freq;
+            if(n!=7U) return reply(op,seq,NDP_BAD_LENGTH,0,0,out,ol);
+            profile=p[1]; memcpy(&freq,&p[2],4); bw=p[6];
+            if(!nrfclaw_bridge_radio_mode_set_external_persist(profile,freq,bw)) return reply(op,seq,NDP_BUSY,0,0,out,ol);
+            return reply(op,seq,NDP_OK,0,0,out,ol);
+        }
+
 
         return reply(op,seq,NDP_BAD_ARG,0,0,out,ol);
       }

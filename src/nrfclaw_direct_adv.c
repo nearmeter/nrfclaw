@@ -4,6 +4,7 @@
 
 #include "nrfclaw_battery.h"
 #include "nrfclaw_ble_app.h"
+#include "nrfclaw_ha_role.h"
 #include "nrfclaw_temperature.h"
 #include "nrfclaw_inputs.h"
 #include "nrfclaw_native.h"
@@ -38,6 +39,7 @@
 #define DIRECT_ADV_PAGE_EVENT           1U
 #define DIRECT_ADV_PAGE_ACCEL           2U
 #define DIRECT_ADV_PAGE_SEMANTIC        3U
+#define DIRECT_ADV_PAGE_ENVIRONMENT     4U
 #define DIRECT_ADV_PAYLOAD_LEN         19U
 #define DIRECT_ADV_SAMPLE_INTERVAL_MS 60000UL
 #define DIRECT_ADV_BATTERY_EVERY        1U
@@ -50,6 +52,8 @@
 #define DIRECT_ADV_EVENT_HOLD_MS      6500UL
 #define DIRECT_ADV_ACCEL_HOLD_MS      6500UL
 #define DIRECT_ADV_SEMANTIC_HOLD_MS   6500UL
+#define DIRECT_ADV_ENVIRONMENT_HOLD_MS 6500UL
+#define DIRECT_ADV_FLAG_HUMIDITY_VALID 0x01U
 #define DIRECT_ADV_EVENT_QUEUE_DEPTH     4U
 
 #define DIRECT_NATIVE_CAP_ACCEL          4U
@@ -69,11 +73,13 @@ APP_TIMER_DEF(m_direct_adv_timer);
 APP_TIMER_DEF(m_direct_event_timer);
 APP_TIMER_DEF(m_direct_accel_timer);
 APP_TIMER_DEF(m_direct_semantic_timer);
+APP_TIMER_DEF(m_direct_environment_timer);
 
 static volatile bool m_sample_due;
 static volatile bool m_event_hold_done;
 static volatile bool m_accel_hold_done;
 static volatile bool m_semantic_hold_done;
+static volatile bool m_environment_hold_done;
 static bool m_wait_battery;
 static bool m_wait_temperature;
 static bool m_battery_valid;
@@ -88,6 +94,9 @@ static bool m_accel_valid;
 static bool m_semantic_timer_ready;
 static bool m_semantic_active;
 static uint16_t m_semantic_advertised_generation;
+static bool m_environment_timer_ready;
+static bool m_environment_pending;
+static bool m_environment_active;
 
 static uint8_t m_sequence;
 static uint8_t m_cycle;
@@ -134,7 +143,7 @@ static uint16_t active_mask(void)
     uint16_t mask = 0U;
     uint8_t cap;
 
-    for (cap = 1U; cap <= NRFCLAW_CAP_TEMPERATURE; cap++) {
+    for (cap = 1U; cap <= NRFCLAW_CAP_HUMIDITY; cap++) {
         if (nrfclaw_native_capability_active(cap))
             mask |= (uint16_t)(1U << (cap - 1U));
     }
@@ -236,6 +245,36 @@ static void cancel_semantic_cycle(void)
     m_semantic_active = false;
 }
 
+/* B8.1k8c2 Direct page 4 environmental telemetry; pages 0..3 unchanged. */
+static void publish_environment_force(void)
+{
+    uint8_t p[DIRECT_ADV_PAYLOAD_LEN]; uint8_t flags=0U; uint32_t rh=0U;
+    memset(p,0,sizeof(p));
+    p[0]=0x4EU;p[1]=0x43U;p[2]=DIRECT_ADV_VERSION;p[3]=++m_sequence;
+    p[4]=DIRECT_ADV_PAGE_ENVIRONMENT;p[5]=m_ha_role;
+    if(nrfclaw_humidity_last_mpermille(&rh)){
+        uint32_t centi=rh/10U; if(centi>10000U) centi=10000U;
+        flags|=DIRECT_ADV_FLAG_HUMIDITY_VALID; put_u16(&p[9],(uint16_t)centi);
+    }
+    p[6]=flags; put_u16(&p[7],active_mask());
+    (void)nrfclaw_ble_app_telemetry_set(p,sizeof(p));
+}
+static void environment_timer_handler(void *context){(void)context;m_environment_hold_done=true;}
+static void cancel_environment_cycle(void)
+{
+    if(m_environment_timer_ready)(void)app_timer_stop(m_direct_environment_timer);
+    m_environment_hold_done=false;m_environment_pending=false;m_environment_active=false;
+}
+static void schedule_environment_after_core(void)
+{
+    uint32_t rh;
+    if(!nrfclaw_humidity_available() || !nrfclaw_humidity_last_mpermille(&rh) ||
+       !m_environment_timer_ready || !nrfclaw_ble_app_telemetry_can_publish_now()) return;
+    m_environment_hold_done=false;m_environment_pending=true;m_environment_active=false;
+    if(app_timer_start(m_direct_environment_timer,APP_TIMER_TICKS(DIRECT_ADV_ENVIRONMENT_HOLD_MS),NULL)!=NRF_SUCCESS)
+        m_environment_pending=false;
+}
+
 static void cancel_accel_cycle(void)
 {
     if (m_accel_timer_ready)
@@ -265,10 +304,11 @@ static void schedule_accel_after_core(void)
 
 static void publish_sample_complete(void)
 {
-    if (m_event_active || m_event_count != 0U || m_restore_core_pending || m_semantic_active)
+    if (m_event_active || m_event_count != 0U || m_restore_core_pending || m_semantic_active || m_environment_active)
         return;
 
     publish_core_force();
+    schedule_environment_after_core();
     schedule_accel_after_core();
 }
 
@@ -494,6 +534,10 @@ void nrfclaw_direct_adv_init(void)
     m_semantic_timer_ready = false;
     m_semantic_active = false;
     m_semantic_advertised_generation = 0U;
+    m_environment_hold_done = false;
+    m_environment_timer_ready = false;
+    m_environment_pending = false;
+    m_environment_active = false;
     m_accel_x_mg = 0;
     m_accel_y_mg = 0;
     m_accel_z_mg = 0;
@@ -546,6 +590,9 @@ void nrfclaw_direct_adv_init(void)
             semantic_timer_handler) == NRF_SUCCESS) {
         m_semantic_timer_ready = true;
     }
+
+    if(app_timer_create(&m_direct_environment_timer,APP_TIMER_MODE_SINGLE_SHOT,environment_timer_handler)==NRF_SUCCESS)
+        m_environment_timer_ready=true;
 }
 
 void nrfclaw_direct_adv_on_event(nrfclaw_event_t const *evt)
@@ -553,6 +600,10 @@ void nrfclaw_direct_adv_on_event(nrfclaw_event_t const *evt)
     direct_adv_event_t event;
 
     if (!evt)
+        return;
+
+    /* B8.0j2e: BRIDGE/NONE/NINALINK_NODE do not own Direct telemetry. */
+    if (m_ha_role != (uint8_t)NRFCLAW_HA_ROLE_DIRECT_BLE)
         return;
 
     if (evt->type == NRFCLAW_EVT_BATTERY_DONE && m_wait_battery) {
@@ -591,6 +642,16 @@ void nrfclaw_direct_adv_process(void)
 {
     bool started = false;
 
+    /* B8.0j2e: Direct telemetry is DIRECT_BLE-only.
+     *
+     * BRIDGE also uses the Application/NDP peripheral, but its advertising
+     * payload is only an identity/discovery envelope.  It must not run the
+     * Direct battery/temperature/event publisher, because that publisher
+     * reconfigures the shared SoftDevice advertising set.
+     */
+    if (m_ha_role != (uint8_t)NRFCLAW_HA_ROLE_DIRECT_BLE)
+        return;
+
     /*
      * Never compete with P0.21/NUS, a live Application connection or another
      * Application role. Queued events stay in RAM until Direct advertising
@@ -600,6 +661,10 @@ void nrfclaw_direct_adv_process(void)
         nrfclaw_ble_app_connected() ||
         nrfclaw_ble_app_role() != NRFCLAW_BLE_APP_PERIPHERAL)
         return;
+
+    if (m_environment_active && m_environment_hold_done) {
+        m_environment_hold_done=false; m_environment_active=false; m_restore_core_pending=true;
+    }
 
     if (m_semantic_active && m_semantic_hold_done) {
         m_semantic_hold_done = false;
@@ -617,6 +682,7 @@ void nrfclaw_direct_adv_process(void)
         /* User events always outrank periodic acceleration telemetry. */
         cancel_accel_cycle();
         cancel_semantic_cycle();
+        cancel_environment_cycle();
         if (start_next_event())
             return;
     }
@@ -638,6 +704,7 @@ void nrfclaw_direct_adv_process(void)
         if (nrfclaw_vm_semantic_state_snapshot(&semantic) &&
             semantic.generation != m_semantic_advertised_generation) {
             cancel_accel_cycle();
+            cancel_environment_cycle();
             publish_semantic_force(&semantic);
             m_semantic_advertised_generation = semantic.generation;
             m_semantic_active = true;
@@ -654,6 +721,17 @@ void nrfclaw_direct_adv_process(void)
 
     if (m_semantic_active)
         return;
+
+    if (m_environment_pending && m_environment_hold_done &&
+        nrfclaw_ble_app_telemetry_can_publish_now()) {
+        m_environment_hold_done=false; m_environment_pending=false; m_environment_active=true;
+        publish_environment_force();
+        if(app_timer_start(m_direct_environment_timer,APP_TIMER_TICKS(DIRECT_ADV_ENVIRONMENT_HOLD_MS),NULL)!=NRF_SUCCESS){
+            m_environment_active=false; m_restore_core_pending=true;
+        }
+        return;
+    }
+    if(m_environment_pending || m_environment_active) return;
 
     if (m_accel_pending && m_accel_hold_done &&
         nrfclaw_ble_app_telemetry_can_publish_now()) {

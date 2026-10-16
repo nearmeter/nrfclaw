@@ -1,0 +1,52 @@
+{
+  "schema": "nrfclaw.rtl433_profile_ids.v1",
+  "policy": {
+    "reserved_builtin_ids": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "candidate_ids_start_at": 5,
+    "ids_are_stable_and_never_reused": true,
+    "key_is_exact_rf_variant": true,
+    "removed_runtime_ids_reserved": [
+      27
+    ]
+  },
+  "assignments": {
+    "rtl433:badger_orion@916450000": 5,
+    "rtl433:bresser_5in1@868300000": 6,
+    "rtl433:bresser_6in1@868000000": 7,
+    "rtl433:cavius_door@868700000": 8,
+    "rtl433:deltadore_x3d@868950000": 9,
+    "rtl433:ec3k@868336000": 10,
+    "rtl433:esic_emt7110@868280000": 11,
+    "rtl433:fineoffset_wh1080_fsk@868300000": 12,
+    "rtl433:fineoffset_wh1080_fsk@915000000": 13,
+    "rtl433:fineoffset_wh31l@915000000": 14,
+    "rtl433:geo_minim@868290000": 15,
+    "rtl433:govee_h5112@912000000": 16,
+    "rtl433:honeywell_cm921@868000000": 17,
+    "rtl433:lacrosse_breezepro@914938000": 18,
+    "rtl433:lacrosse_th3@915000000": 19,
+    "rtl433:lacrosse_tx22uit@915000000": 20,
+    "rtl433:lacrosse_tx31u@915000000": 21,
+    "rtl433:lacrosse_tx34@868300000": 22,
+    "rtl433:lacrosse_wr1@915000000": 23,
+    "rtl433:m_bus_mode_c_t@868950000": 24,
+    "rtl433:m_bus_mode_c_t_downlink@868300000": 25,
+    "rtl433:marlec_solar@868300000": 26,
+    "rtl433:netatmo_thw@868950000": 27,
+    "rtl433:oil_standard@915000000": 28,
+    "rtl433:rfm69_lowpowerlab_moteino@868000000": 29,
+    "rtl433:srsmith_pool_srs_2c_tx@915000000": 30,
+    "rtl433:tfa_30_390x@868025000": 31,
+    "rtl433:tfa_marbella@868000000": 32,
+    "rtl433:thermopro_tp211b@915000000": 33,
+    "rtl433:thermopro_tp28b@915000000": 34,
+    "rtl433:thermopro_tp86xb@915000000": 35,
+    "rtl433:watts_vision@868300000": 36,
+    "rtl433:m_bus_mode_c_t@868950000#format_b": 37
+  }
+}

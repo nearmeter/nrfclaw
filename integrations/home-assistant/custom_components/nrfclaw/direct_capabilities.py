@@ -4,6 +4,7 @@ from .const import (
     CAP_ACCEL, CAP_BATTERY, CAP_BLE_APP, CAP_DS18B20, CAP_GPIO, CAP_HALL,
     CAP_LORA, CAP_RTC, CAP_SERIAL, CAP_STATE, CAP_TRACKING, CAP_VIB_AUTO,
     CAP_VIB_HEALTH, CAP_TEMPERATURE,
+    CAP_HUMIDITY,
 )
 
 DIRECT_CAPABILITY_NAMES = {
@@ -21,4 +22,5 @@ DIRECT_CAPABILITY_NAMES = {
     CAP_VIB_HEALTH: "Vibration health available",
     CAP_VIB_AUTO: "Vibration auto active",
     CAP_TEMPERATURE: "Temperature available",
+    CAP_HUMIDITY: "Humidity available",
 }

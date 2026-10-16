@@ -26,6 +26,7 @@ from .direct_adv import (
     parse_direct_adv_acceleration,
     parse_direct_adv_semantic,
     parse_direct_adv_telemetry,
+    parse_direct_adv_environment,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -228,6 +229,18 @@ class DirectNdpCoordinator(DataUpdateCoordinator[NrfClawData]):
                 data.acceleration_x_mg = None
                 data.acceleration_y_mg = None
                 data.acceleration_z_mg = None
+            self.async_set_updated_data(data)
+            return
+
+        environment = parse_direct_adv_environment(packet)
+        if environment is not None:
+            if environment.role != 1: return
+            if environment.sequence == self._last_adv_sequence: return
+            self._last_adv_sequence = environment.sequence
+            if self.data is None: return
+            data = replace(self.data)
+            data.active_capabilities = environment.active_capabilities
+            data.humidity_pct = environment.humidity_pct
             self.async_set_updated_data(data)
             return
 

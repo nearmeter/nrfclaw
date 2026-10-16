@@ -51,6 +51,8 @@ from .const import (
     SENSOR_TEMPERATURE,
     SENSOR_HALL,
     TX_UUID,
+    CAP_HUMIDITY,
+    SENSOR_HUMIDITY,
 )
 from .protocol import NDPProtocolError, decode_access_key, decode_response, encode_request
 from .direct_adv import DirectAdvSemantic, parse_semantic_state_record
@@ -110,6 +112,7 @@ class NrfClawData:
     battery_v: float | None = None
     hall_value: int | None = None
     temperature_c: float | None = None
+    humidity_pct: float | None = None
     vibration_rms_mg: int | None = None
     vibration_peak_mg: int | None = None
     vibration_peak_to_peak_mg: int | None = None
@@ -501,6 +504,11 @@ class NrfClawClient:
                 data.temperature_c = int.from_bytes(
                     payload, "little", signed=True
                 ) / 1000.0
+
+        if data.has_capability(CAP_HUMIDITY):
+            status, payload = await self._sensor_read(SENSOR_HUMIDITY, retries=2, busy_delay=0.05)
+            if status == NDP_OK and len(payload) == 4:
+                data.humidity_pct = int.from_bytes(payload, "little") / 1000.0
 
         if data.has_capability(CAP_ACCEL):
             # B7.6f2m6c4: raw XYZ has no HA entity anymore. Do not spend one

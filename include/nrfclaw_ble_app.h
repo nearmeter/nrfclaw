@@ -29,6 +29,7 @@ void nrfclaw_ble_app_resume(void);
 bool nrfclaw_ble_app_is_suspended(void);
 bool nrfclaw_ble_app_connected(void);
 
+
 nrfclaw_ble_app_status_t nrfclaw_ble_app_set_role(nrfclaw_ble_app_role_t role);
 nrfclaw_ble_app_role_t nrfclaw_ble_app_role(void);
 

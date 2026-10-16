@@ -44,7 +44,10 @@
     "NinaLink low-power LoRa Node / BLE-NDP Bridge transport for Home Assistant",
     "Persistent 16-bit NinaLink Network ID isolation and automatic node discovery",
     "Optional 256-bit Application/NDP owner key for Home Assistant access",
-    "Remote NinaLink capability controls and behavioral commands through the bridge"
+    "Remote NinaLink capability controls and behavioral commands through the bridge",
+    "Optional SHT2x/SHT3x/SHT4x/SHTC3 external software-I2C temperature/humidity with DS18B20 priority and nRF52 internal fallback",
+    "LLCC68 external RF GFSK/FSK receiver with RFVM decoding and virtual NinaLink Home Assistant entities",
+    "External RF profile registry and persistent host provisioning for RF Bridge"
   ],
   "advantages": [
     "Designed around low-power event-driven operation",
@@ -64,7 +67,8 @@
     "Some pins are reserved by onboard peripherals and cannot be treated as free GPIO simultaneously",
     "HALFMOON has a known shared physical pin between LoRa DIO2 and DS18; NINASENSE Rev1.1 does not use that same mapping",
     "A NinaLink Bridge keeps LoRa RX active continuously and therefore is a higher-power gateway role than a NinaLink Node",
-    "The NinaLink Network ID isolates networks but is not a substitute for the optional Application/NDP owner key"
+    "The NinaLink Network ID isolates networks but is not a substitute for the optional Application/NDP owner key",
+    "External RF bridge requires host RF profile provisioning and reboot; raw VM bytecode alone is insufficient"
   ],
   "pins": {
     "P0.02": "LoRa SCK",
@@ -141,6 +145,11 @@
         "application_ndp": "enabled",
         "transport": "continuous NinaLink LoRa RX plus BLE/NDP to Home Assistant",
         "power": "higher-power gateway role because LoRa RX remains active"
+      },
+      "EXTERNAL_RF_BRIDGE": {
+        "application_ndp": "enabled",
+        "transport": "external RF via LLCC68/RFVM, projected as virtual NinaLink devices to BLE/NDP",
+        "power": "continuous RF receive is not a low-power Node role"
       }
     },
     "ndp_owner_key": {
@@ -176,5 +185,78 @@
       "remote behavioral commands",
       "RSSI/SNR link diagnostics"
     ]
+  },
+  "external_rf_ha_bridge": {
+    "semantic_family": "external-rf-ha-bridge",
+    "runtime_profile_ids": [
+      1,
+      2,
+      3,
+      4,
+      12,
+      13,
+      14,
+      18,
+      19,
+      23,
+      30,
+      33,
+      34,
+      35,
+      37
+    ],
+    "flow": "prompt --upload -> EXTERNAL_RF -> HA BRIDGE -> reboot -> RFVM -> virtual NinaLink -> HA",
+    "profile_27_policy": "retired/reserved; never reuse",
+    "wh1080_policy": "specify 868.3 or 915 MHz",
+    "architecture": "supported external wireless RF sensor -> LLCC68 receive -> RFVM decode -> virtual NinaLink device/capabilities -> BLE Application/NDP -> Home Assistant",
+    "not_a_ninalink_node": true,
+    "power_note": "External RF Bridge keeps radio reception available; not a low-power duty-cycled NinaLink Node",
+    "provisioning_note": "prompt --upload persists EXTERNAL_RF ownership, runtime RF profile and HA BRIDGE role; bytecode alone does not configure radio",
+    "runtime_profile_names": {
+      "1": "VEVOR YT60234",
+      "2": "Ambient Weather WH31E",
+      "3": "Ecowitt WH51",
+      "4": "Ecowitt WH52",
+      "12": "WH1080/WH3080 868.3 MHz",
+      "13": "WH1080/WH3080 915 MHz",
+      "14": "WH31L/WH57",
+      "18": "LaCrosse Breeze Pro",
+      "19": "LaCrosse LTV-TH",
+      "23": "LaCrosse LTV-WR1",
+      "30": "SRSmith SRS-2C-TX",
+      "33": "ThermoPro TP211B",
+      "34": "ThermoPro TP28B",
+      "35": "TempSpike XR",
+      "37": "W-MBus Mode C Format B"
+    },
+    "blocked_profile_ids": {
+      "24": "mixed W-MBus framing; catalog-only",
+      "25": "deferred/non-runtime",
+      "27": "retired/reserved NetAtmo",
+      "28": "Oil STANDARD Manchester framing blocker"
+    },
+    "validation_note": "Runtime prompt support and synthetic OTA tests do not prove every physical sensor or HA entity end-to-end"
+  },
+  "sht_external_i2c": {
+    "families": [
+      "SHT2x",
+      "SHT3x",
+      "SHT4x",
+      "SHTC3"
+    ],
+    "temperature_priority": [
+      "DS18B20",
+      "SHT",
+      "NRF52_INTERNAL"
+    ],
+    "humidity_semantic_id": "0x0101",
+    "commands": [
+      "sht-info",
+      "sht-detect",
+      "sht-read",
+      "sht-release"
+    ],
+    "physical_validation": "pending in supplied B8.1k8c2 evidence",
+    "ownership": "software I2C pins released when sensor absent"
   }
 }

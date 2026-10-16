@@ -10,6 +10,7 @@ Requires:
 """
 
 import argparse
+import re
 import base64
 import csv
 import json
@@ -184,6 +185,44 @@ def build_tracking_provision_url(
         }
     )
     return f"{base_url}#{fragment}"
+
+
+NDP_KEY_QR_PREFIX = "NINASENSE:NDP1"
+
+
+def normalize_ndp_qr_device_suffix(value: str) -> str:
+    # Return the canonical six-hex NINASENSE suffix used by NDP1 QR.
+    text = str(value).strip().upper().replace(":", "").replace("-", "")
+    match = re.search(r"([0-9A-F]{6})$", text)
+    if match is None:
+        raise ValueError(
+            "NDP QR requires a device identifier ending in six hexadecimal digits"
+        )
+    return match.group(1)
+
+
+def build_ndp_key_qr_payload(device: str, key: bytes) -> str:
+    # Build the versioned NINASENSE mobile NDP owner-key QR payload.
+    if len(key) != 32:
+        raise ValueError("NDP QR key must be exactly 32 bytes")
+    suffix = normalize_ndp_qr_device_suffix(device)
+    return f"{NDP_KEY_QR_PREFIX}:{suffix}:{key.hex().upper()}"
+
+
+def print_ndp_key_qr(device: str, key: bytes, show_key: bool = False) -> None:
+    # Render the owner credential QR without printing plaintext by default.
+    suffix = normalize_ndp_qr_device_suffix(device)
+    payload = build_ndp_key_qr_payload(suffix, key)
+    print("=== NINASENSE APP ACCESS QR B8.2a5 ===")
+    print(f"Device:           NINASENSE-{suffix}")
+    print("Format:           NINASENSE:NDP1")
+    print("Scan with NINASENSE App:")
+    print(render_tracking_provision_qr_unicode(payload))
+    if show_key:
+        print(f"NDP key:          hex:{key.hex()}")
+    else:
+        print("NDP key:          [hidden; use --show-key only for recovery]")
+    print("SECRET: this QR grants Application/NDP CONTROL access.")
 
 
 def build_tracking_provision_qr_matrix(url: str):
@@ -393,6 +432,8 @@ NDP_DIRECT_EVENT_SENSITIVITY = 0x5F  # B7.6f2k3 LOW/NORMAL/HIGH preset
 NDP_DIRECT_HALL_CONTROL = 0x60  # B7.6f2k3 persistent Hall behavior
 NDP_DIRECT_SEMANTIC_STATE = 0x61  # B7.6f2k4 current VM semantic state
 NDP_NINALINK_NETWORK = 0x62  # B7.6f2l1 physical-NUS persistent network ID
+NDP_GFSK_DIAG = 0x63  # B8.0f physical-NUS-only GFSK raw RX
+NDP_SHT_DIAG = 0x64  # B8.1k8c1 physical-NUS-only SHT diagnostic
 
 NDP_SENSOR_BATTERY       = 1
 NDP_SENSOR_HALL          = 2
@@ -402,6 +443,7 @@ NDP_SENSOR_ACCEL_METRICS = 5
 NDP_SENSOR_TEMPERATURE   = 6
 
 
+NDP_SENSOR_HUMIDITY      = 7
 NINALINK_MAGIC = 0x4E
 NINALINK_VERSION = 1
 NINALINK_TYPE_NAMES = {
@@ -627,7 +669,7 @@ FLASH_STATES = {
 }
 
 
-CAP_NAMES = {1:"GPIO",2:"BATTERY",3:"DS18B20",4:"ACCEL",5:"LORA",6:"BLE_APP",7:"RTC",8:"HALL",9:"STATE",10:"SERIAL",11:"TRACKING",12:"VIB_HEALTH",13:"VIB_AUTO",14:"TEMPERATURE"}
+CAP_NAMES = {1:"GPIO",2:"BATTERY",3:"DS18B20",4:"ACCEL",5:"LORA",6:"BLE_APP",7:"RTC",8:"HALL",9:"STATE",10:"SERIAL",11:"TRACKING",12:"VIB_HEALTH",13:"VIB_AUTO",14:"TEMPERATURE",15:"HUMIDITY"}
 
 VM_EVENT_FRAME   = 0xE0
 VM_NOTIFY_U32    = 0x01
@@ -1279,16 +1321,11 @@ async def print_bleak_scan(timeout: float, suffix: str = ""):
 
 
 async def find_app_device(suffix: str, timeout: float, verbose: bool = False):
-    """Find the normal Application/HA plane without relying on Bleak's
-    find_device_by_filter callback path.
-
-    Some BlueZ/Bleak combinations can expose a peripheral to bluetoothctl
-    while find_device_by_filter() never receives a matching callback.  For
-    the HA reference path we therefore perform an unfiltered discovery,
-    inspect the complete result set, and select by board name or address
-    suffix.  GATT discovery after connect remains the authoritative check
-    that the selected peripheral is the Application plane.
-    """
+    # B8.0j2b address-authoritative Application discovery.
+    # Exact BLE-address suffix match selects the target board. Advertising
+    # name/service UUIDs are advisory because BlueZ may expose stale/incomplete
+    # advertisement data. ApplicationNDPClient still performs the authoritative
+    # GATT validation for APP_SERVICE + APP_RX + APP_TX before any NDP traffic.
     suffix = suffix.replace(":", "").replace("-", "").upper()
     wanted = f"nRFClaw(NDP)-{suffix}"
 
@@ -1296,44 +1333,39 @@ async def find_app_device(suffix: str, timeout: float, verbose: bool = False):
 
     candidates = []
     visible = []
-    for dev, adv in rows:
 
+    for dev, adv in rows:
         address = (getattr(dev, "address", "") or "")
         address_compact = address.replace(":", "").replace("-", "").upper()
         adv_name = getattr(adv, "local_name", None) if adv is not None else None
         name = (adv_name or getattr(dev, "name", None) or "").strip()
         uuids = {
             u.lower()
-            for u in ((getattr(adv, "service_uuids", None) or []) if adv is not None else [])
+            for u in (
+                (getattr(adv, "service_uuids", None) or [])
+                if adv is not None else []
+            )
         }
 
         if name or address:
             visible.append((address, name, uuids))
 
-        identity_match = (
-            name.upper() == wanted.upper()
-            or address_compact.endswith(suffix)
-        )
-        if not identity_match:
-            continue
+        address_match = address_compact.endswith(suffix)
+        name_match = name.upper() == wanted.upper()
 
-        # Plane name is authoritative. BlueZ may expose stale/cached GATT
-        # service UUIDs from the other plane for the same BLE address.
-        if name.upper().startswith("NRFCLAW(NUS)-"):
-            continue
-
-        # UUID-only fallback: reject a clearly NUS-only advertisement.
-        # If both UUIDs are present, the explicit advertised name above wins.
-        if NUS_SERVICE.lower() in uuids and APP_SERVICE.lower() not in uuids:
+        if not address_match and not name_match:
             continue
 
         score = 0
-        if address_compact.endswith(suffix):
-            score += 4
-        if name.upper() == wanted.upper():
-            score += 4
+        if address_match:
+            score += 100
+        if name_match:
+            score += 20
         if APP_SERVICE.lower() in uuids:
-            score += 8
+            score += 10
+        if NUS_SERVICE.lower() in uuids:
+            score += 1
+
         candidates.append((score, dev, adv))
 
     if candidates:
@@ -1347,7 +1379,10 @@ async def find_app_device(suffix: str, timeout: float, verbose: bool = False):
         else:
             for address, name, uuids in visible:
                 uuids_txt = ",".join(sorted(uuids)) if uuids else "-"
-                print(f"  {address or '-':17} {name or '-':24} UUIDs={uuids_txt}")
+                print(
+                    f"  {address or '-':17} "
+                    f"{name or '-':24} UUIDs={uuids_txt}"
+                )
 
     raise RuntimeError(
         f"{wanted} Application BLE not found in Bleak discovery. "
@@ -1831,14 +1866,37 @@ class ApplicationNDPClient:
             result["accel"] = None
 
         caps = await self.capabilities(quiet=True)
+        result["temperature_source"] = None
         if caps["supported"].get(14, False):
-            status, p = await self.sensor_read_raw(NDP_SENSOR_TEMPERATURE, retries=3, delay=0.8)
-            result["temperature_mC"] = struct.unpack("<i", p[1:5])[0] if status == 0 and len(p) == 5 else None
+            status, p = await self.sensor_read_raw(
+                NDP_SENSOR_TEMPERATURE, retries=3, delay=0.8
+            )
+            if status == 0 and len(p) == 5:
+                result["temperature_source"] = p[0]
+                result["temperature_mC"] = struct.unpack("<i", p[1:5])[0]
+            else:
+                result["temperature_mC"] = None
         elif st["ds18b20_present"]:
-            status, p = await self.sensor_read_raw(NDP_SENSOR_DS18B20, retries=3, delay=0.8)
-            result["temperature_mC"] = struct.unpack("<i", p)[0] if status == 0 and len(p) == 4 else None
+            status, p = await self.sensor_read_raw(
+                NDP_SENSOR_DS18B20, retries=3, delay=0.8
+            )
+            result["temperature_source"] = 1
+            result["temperature_mC"] = (
+                struct.unpack("<i", p)[0]
+                if status == 0 and len(p) == 4 else None
+            )
         else:
             result["temperature_mC"] = None
+
+        result["humidity_mpermille"] = None
+        if caps["supported"].get(15, False):
+            status, p = await self.sensor_read_raw(
+                NDP_SENSOR_HUMIDITY, retries=3, delay=0.10
+            )
+            if status == 0 and len(p) == 4:
+                result["humidity_mpermille"] = int.from_bytes(
+                    p, "little", signed=False
+                )
 
         status, p = await self.sensor_read_raw(NDP_SENSOR_ACCEL_METRICS)
         result["vibration"] = (int.from_bytes(p[:2], "little"), int.from_bytes(p[2:4], "little")) if status == 0 and len(p) >= 4 else None
@@ -1860,10 +1918,25 @@ class ApplicationNDPClient:
             else:
                 x,y,z = result["accel"]
                 print(f"Accelerometer:   X={x} Y={y} Z={z} mg")
+            source_name = {
+                1: "DS18B20",
+                2: "NRF52_INTERNAL",
+                3: "SHT",
+            }.get(result["temperature_source"], "unknown")
             if result["temperature_mC"] is None:
-                print("DS18B20:         unavailable")
+                print("Temperature:     unavailable")
             else:
-                print(f"DS18B20:         {result['temperature_mC']/1000.0:.3f} C")
+                print(
+                    f"Temperature:     {result['temperature_mC']/1000.0:.3f} C "
+                    f"({source_name})"
+                )
+            if result["humidity_mpermille"] is None:
+                print("Humidity:        unavailable")
+            else:
+                print(
+                    f"Humidity:        "
+                    f"{result['humidity_mpermille']/1000.0:.3f} %RH"
+                )
             if result["vibration"] is None:
                 print("Vibration:       unavailable")
             else:
@@ -2295,7 +2368,8 @@ class NRFClawClient:
         status = p[0]
         if not quiet:
             names = {0: "unconfigured (NDP open)", 1: "ready (NDP protected)",
-                     2: "saving", 3: "flash error"}
+                     2: "saving", 3: "flash error"
+        }
             print(f"NDP key:          {names.get(status, status)}")
         return status
 
@@ -2314,7 +2388,7 @@ class NRFClawClient:
         if len(key) != 32:
             raise RuntimeError(f"Invalid stored NDP key length: {len(key)}")
         if not quiet:
-            print(f"NDP key:          hex:{key.hex()}")
+            print("NDP key:          [hidden; command output uses QR]")
         return key
 
     async def ndp_key_generate(self) -> bytes:
@@ -2333,8 +2407,8 @@ class NRFClawClient:
             await asyncio.sleep(0.20)
         key = await self.ndp_key_get(quiet=True)
         print("NDP protection:   enabled")
-        print(f"NDP key:          hex:{key.hex()}")
-        print("Store this key securely; Application/HA now requires it.")
+        print("NDP key:          [hidden; scan the access QR below]")
+        print("Application/HA now requires the generated owner credential.")
         return key
 
     async def ndp_info(self, quiet: bool = False):
@@ -2601,6 +2675,854 @@ class NRFClawClient:
         print(f"Store:           {('idle', 'saving', 'error')[store_status] if store_status < 3 else store_status}")
         return sensitivity, bool(has_persisted), store_status
 
+
+    # B8.0f GFSK RAW RX -------------------------------------------------
+    async def gfsk_vevor_start(self,frequency_hz:int=915000000,bandwidth:str="117.3"):
+        if not 902000000<=frequency_hz<=928000000: raise ValueError("frequency must be 902000000..928000000 Hz")
+        bw_sel={"117.3":0,"156.2":1}[bandwidth]
+        await self.ndp_command(NDP_GFSK_DIAG,bytes([1])+struct.pack("<I",frequency_hz)+bytes([bw_sel]))
+        print("=== B8.0f GFSK RAW RX START ===")
+        print("Profile:          VEVOR YT60234")
+        print(f"Frequency:        {frequency_hz/1e6:.6f} MHz")
+        print("Bitrate:          11.260 kbaud")
+        print("Deviation:        +/-37 kHz")
+        print(f"RX bandwidth:     {bandwidth} kHz")
+        print("Sync:             CA CA 54")
+        print("Payload length:   21 bytes")
+    async def gfsk_status(self):
+        p=await self.ndp_command(NDP_GFSK_DIAG,b"\x00")
+        if len(p) not in (10,14): raise RuntimeError(f"Invalid GFSK status: {p.hex()}")
+        irq=int.from_bytes(p[2:4],"little"); rx=int.from_bytes(p[4:6],"little"); fail=int.from_bytes(p[6:8],"little")
+        freq=int.from_bytes(p[10:14],"little") if len(p)>=14 else None
+        bw={0x0B:"117.3",0x1A:"156.2"}.get(p[8],f"0x{p[8]:02X}")
+        print("=== B8.0f GFSK RAW RX STATUS ===")
+        print(f"Active:           {'yes' if p[0] else 'no'}")
+        print(f"RX bandwidth:     {bw} kHz")
+        if freq is not None: print(f"Frequency:        {freq/1e6:.6f} MHz")
+        print(f"Expected length:  {p[9]}")
+        print(f"Last length:      {p[1]}")
+        print(f"Last IRQ:         0x{irq:04X}")
+        print(f"RX_DONE packets:  {rx}")
+        print(f"Read failures:    {fail}")
+    async def gfsk_poll(self):
+        p=await self.ndp_command(NDP_GFSK_DIAG,b"\x02")
+        if len(p)!=4: raise RuntimeError(f"Invalid GFSK poll: {p.hex()}")
+        ready=bool(p[0]); total=p[1]; irq=int.from_bytes(p[2:4],"little")
+        print("=== B8.0f GFSK RAW RX POLL ===")
+        print(f"IRQ:              0x{irq:04X}")
+        print(f"Packet ready:     {'yes' if ready else 'no'}")
+        if not ready: return None
+        raw=bytearray(); off=0
+        while off<total:
+            q=await self.ndp_command(NDP_GFSK_DIAG,bytes([3,off]))
+            if len(q)<3: raise RuntimeError(f"Short GFSK chunk: {q.hex()}")
+            qt,qo,qn=q[0],q[1],q[2]
+            if qt!=total or qo!=off or len(q)!=3+qn: raise RuntimeError(f"Invalid GFSK chunk: {q.hex()}")
+            raw.extend(q[3:]); off+=qn
+            if qn==0: break
+        print(f"Length:           {len(raw)}")
+        print("Payload:          "+" ".join(f"{b:02X}" for b in raw))
+        ref=bytes.fromhex("AA 00 F8 F7 9D 02 E3 32 01 0E 03 02 0B 01 38 02 39 7A 86 E0 87")
+        if bytes(raw)==ref: print("Reference vector: MATCH")
+        return bytes(raw)
+    async def gfsk_stop(self):
+        await self.ndp_command(NDP_GFSK_DIAG,b"\x04")
+        print("B8.0f GFSK stopped; validated LoRa profile restored.")
+
+    async def gfsk_rfvm(self):
+        names={1:"id",2:"channel",3:"battery_ok",4:"temperature_x10",5:"humidity",6:"wind_raw",7:"gust_raw",8:"wind_dir_deg",9:"rain_raw",10:"uv_index"}
+        head=await self.ndp_command(NDP_GFSK_DIAG,bytes([7,0]))
+        if len(head)!=4: raise RuntimeError(f"Invalid RFVM summary: {head.hex()}")
+        abi,profile,count,frame_len=head; values={}; page=1
+        while len(values)<count:
+            q=await self.ndp_command(NDP_GFSK_DIAG,bytes([7,page]))
+            if not q: raise RuntimeError("Empty RFVM page")
+            n=q[0]
+            if len(q)!=1+5*n: raise RuntimeError(f"Invalid RFVM page: {q.hex()}")
+            off=1
+            for _ in range(n):
+                fid=q[off]; values[fid]=int.from_bytes(q[off+1:off+5],"little",signed=True); off+=5
+            page+=1
+        print("=== B8.0h FIFO -> RFVM ===")
+        print(f"RFVM ABI:         {abi}")
+        print(f"Profile:          {profile} (VEVOR YT60234)")
+        print(f"FIFO length:      {frame_len}")
+        print(f"Fields:           {count}")
+        for fid in range(1,11):
+            if fid not in values: continue
+            name=names[fid]; value=values[fid]
+            if fid==4: print(f"{name:18s} {value}  ({value/10:.1f} C)")
+            elif fid==3: print(f"{name:18s} {value}  ({'OK' if value else 'LOW'})")
+            else: print(f"{name:18s} {value}")
+        expected={1:0xF8F7,2:0,3:0,4:239,5:50,6:13,7:3,8:266,9:55,10:1}
+        mismatch=[(names[k],values.get(k),v) for k,v in expected.items() if values.get(k)!=v]
+        if mismatch: raise RuntimeError(f"RFVM reference mismatch: {mismatch}")
+        print("Reference decode: MATCH")
+        return values
+
+
+    async def gfsk_cap_publish(self):
+        p=await self.ndp_command(NDP_GFSK_DIAG,bytes([8]))
+        if len(p)!=2:
+            raise RuntimeError(f"Invalid RF capability publish response: {p.hex()}")
+        print("=== B8.0i RFVM -> DYNAMIC CAPABILITIES ===")
+        print(f"Profile:          {p[0]} (VEVOR YT60234)")
+        print(f"Published:        {p[1]}")
+        return p[1]
+
+    async def gfsk_capabilities(self):
+        # B8.1k3a: profile-aware, value-agnostic RF capability introspection.
+        # Required capabilities must be present; optional capabilities may
+        # depend on the current RF message subtype.
+        profile_names={
+            1:"VEVOR YT60234",
+            2:"Ambient WH31E",
+            3:"Ecowitt WH51",
+            4:"Ecowitt WH52",
+            12:"FineOffset WHx080 868.3M",
+            13:"FineOffset WHx080 915M",
+            14:"Ambient WH31L",
+            18:"LaCrosse BreezePro",
+            19:"LaCrosse LTV-TH",
+            23:"LaCrosse LTV-WR1",
+
+            33:"ThermoPro TP211B",
+            34:"ThermoPro TP28B",
+            35:"ThermoPro TempSpike XR",
+            30:"SRSmith SRS-2C-TX",            37:"Wireless M-Bus Mode C Format B",
+
+}
+
+        expected_ids_by_profile={
+            1:{
+                0x0900,0x0901,0x0902,
+                0x0100,0x0101,
+                0x0910,0x0911,0x0912,0x0913,0x0914,
+            },
+            2:{0x0900,0x0901,0x0902,0x0100,0x0101},
+            3:{0x0900,0x0920,0x0921,0x0922,0x0923},
+            4:{0x0900,0x0100,0x0920,0x0921,0x0922,0x0924},
+            12:{0x0900},
+            13:{0x0900},
+            14:{0x0900,0x0002,0x0936},
+            18:{0x0900,0x0100,0x0101,0x0930,0x0932},
+            19:{0x0900,0x0902,0x0100,0x0101},
+            23:{0x0900,0x0930,0x0932},
+
+            33:{0x0900,0x0902,0x0100},
+            34:{0x0900,0x0100},
+            35:{0x0900,0x0100},
+            30:{0x0900,0x093A},            37:{0x0900},
+
+            37:{0x0900},}
+
+        optional_ids_by_profile={
+            12:{
+                0x0902,0x0100,0x0101,0x0102,
+                0x0914,0x0930,0x0931,0x0932,0x0933,
+            },
+            13:{
+                0x0902,0x0100,0x0101,0x0102,
+                0x0914,0x0930,0x0931,0x0932,0x0933,
+            },
+            14:{0x0937},
+
+            37:{0x0601,0x0100},}
+
+        names={
+            0x0002:"battery_percent",
+            0x0100:"temperature",
+            0x0101:"humidity",
+            0x0102:"illuminance",
+            0x0900:"rf_device_id",
+            0x0901:"rf_channel",
+            0x0902:"rf_battery_ok",
+            0x0910:"wind_raw",
+            0x0911:"gust_raw",
+            0x0912:"wind_direction",
+            0x0913:"rain_raw",
+            0x0914:"uv_index",
+            0x0920:"battery_mv",
+            0x0921:"soil_moisture",
+            0x0922:"tx_boost",
+            0x0923:"ad_raw",
+            0x0924:"conductivity_uS_cm",
+            0x0930:"wind_speed_m_s",
+            0x0931:"wind_gust_m_s",
+            0x0932:"wind_direction_deg",
+            0x0933:"rain_total_mm",
+            0x0936:"lightning_count",
+            0x0937:"lightning_distance_km",
+
+            0x093A:"last_button_code",
+            0x0601:"volume",}
+
+        types={
+            1:"BOOL",2:"U8",3:"S8",4:"U16",
+            5:"S16",6:"U32",7:"S32",8:"ENUM8",
+        }
+
+        st=await self.ndp_command(NDP_GFSK_DIAG,bytes([12]))
+        if len(st)!=15:
+            raise RuntimeError(
+                f"Invalid automatic-ingestion status: {st.hex()}"
+            )
+        active=bool(st[0])
+        profile=st[1]
+
+        entries=[]
+        index=0
+        total=None
+        while total is None or index<total:
+            p=await self.ndp_command(
+                NDP_GFSK_DIAG,bytes([9,index])
+            )
+            if len(p)!=14:
+                raise RuntimeError(
+                    f"Invalid RF capability entry: {p.hex()}"
+                )
+            total=p[0]
+            if p[1]!=index:
+                raise RuntimeError(
+                    f"RF capability index mismatch {p[1]}!={index}"
+                )
+
+            cap=int.from_bytes(p[2:4],"little")
+            ch=p[4]
+            kind=p[5]
+            typ=p[6]
+            scale=int.from_bytes(
+                p[7:8],"little",signed=True
+            )
+            unit=p[8]
+            behavior=p[9]
+            raw=int.from_bytes(
+                p[10:14],
+                "little",
+                signed=typ in (3,5,7),
+            )
+            entries.append(
+                (cap,ch,kind,typ,scale,unit,behavior,raw)
+            )
+            index+=1
+
+        profile_name=profile_names.get(
+            profile,f"RF profile {profile}"
+        )
+        print("=== B8.1k3 DYNAMIC RF CAPABILITY REGISTRY ===")
+        print(f"Active:           {'yes' if active else 'no'}")
+        print(f"Profile:          {profile} ({profile_name})")
+        print(f"Count:            {len(entries)}")
+
+        for cap,ch,kind,typ,scale,unit,behavior,raw in entries:
+            name=names.get(cap,f"cap_0x{cap:04X}")
+            suffix=""
+
+            if cap==0x0100:
+                suffix=f"  ({raw*(10**scale):.2f} C)"
+            elif cap==0x0601:
+                suffix=f"  ({raw*(10**scale):.3f} L)"
+            elif cap in (0x0002,0x0101,0x0921):
+                suffix=f"  ({raw*(10**scale):.2f} %)"
+            elif cap==0x0102:
+                suffix=f"  ({raw*(10**scale):.1f} lx)"
+            elif cap==0x0900:
+                suffix=f"  (0x{raw:X})"
+            elif cap==0x0920:
+                suffix=f"  ({raw} mV)"
+            elif cap==0x0924:
+                suffix=f"  ({raw*(10**scale):.0f} uS/cm)"
+            elif cap in (0x0930,0x0931):
+                suffix=f"  ({raw*(10**scale):.2f} m/s)"
+            elif cap==0x0932:
+                suffix=f"  ({raw*(10**scale):.0f} deg)"
+            elif cap==0x0933:
+                suffix=f"  ({raw*(10**scale):.1f} mm)"
+            elif cap==0x0937:
+                suffix=f"  ({raw*(10**scale):.0f} km)"
+
+            print(
+                f"0x{cap:04X} ch={ch} {name:22s} "
+                f"type={types.get(typ,str(typ)):5s} "
+                f"scale={scale:2d} raw={raw}{suffix}"
+            )
+        expected=expected_ids_by_profile.get(profile)
+        if expected is None:
+            print(
+                "Capability schema: UNKNOWN PROFILE "
+                "(enumeration only)"
+            )
+            return entries
+
+        optional=optional_ids_by_profile.get(profile,set())
+        actual={
+            cap for cap,_,_,_,_,_,_,_ in entries
+        }
+        missing=sorted(expected-actual)
+        extra=sorted(actual-(expected|optional))
+
+        if missing or extra:
+            fmt=lambda xs:[f"0x{x:04X}" for x in xs]
+            raise RuntimeError(
+                "Dynamic capability schema mismatch: "
+                f"profile={profile} "
+                f"missing={fmt(missing)} "
+                f"extra={fmt(extra)}"
+            )
+
+        print("Capability schema: MATCH")
+        return entries
+
+    async def _rf_profile_entry(self, index:int):
+        summary=await self.ndp_command(NDP_GFSK_DIAG,bytes([23,index]))
+        detail=await self.ndp_command(NDP_GFSK_DIAG,bytes([24,index]))
+        name_raw=await self.ndp_command(NDP_GFSK_DIAG,bytes([25,index]))
+        if len(summary)!=14 or len(detail)!=13 or len(name_raw)<1:
+            raise RuntimeError("Invalid B8.0m1 registry response")
+        flags=summary[2]
+        return {
+            "index":summary[0],"id":summary[1],"flags":flags,
+            "modulation":summary[3],"expected_len":summary[4],"sync_len":summary[5],
+            "frequency":int.from_bytes(summary[6:10],"little"),
+            "bitrate":int.from_bytes(summary[10:14],"little"),
+            "deviation":int.from_bytes(detail[1:5],"little"),
+            "bandwidth":int.from_bytes(detail[5:9],"little"),
+            "sync":bytes(detail[9:13])[:summary[5]],
+            "name":bytes(name_raw[1:]).decode("utf-8","replace"),
+            "rfvm":bool(flags&0x02),"radio":bool(flags&0x04),
+            "caps":bool(flags&0x08),"hw":bool(flags&0x10)}
+
+    async def _rf_profile_by_id(self, profile_id:int):
+        if not 0 <= profile_id <= 0xFF:
+            raise ValueError("RF profile ID must be 0..255")
+        p=await self.ndp_command(
+            NDP_GFSK_DIAG,bytes([30,profile_id])
+        )
+        if len(p)!=1:
+            raise RuntimeError(
+                f"Invalid B8.1j1a profile lookup response: {p.hex()}"
+            )
+        e=await self._rf_profile_entry(p[0])
+        if e["id"]!=profile_id:
+            raise RuntimeError(
+                f"RF profile lookup mismatch: requested={profile_id} "
+                f"returned={e['id']}"
+            )
+        return e
+
+    async def rf_profile_list(self):
+        # B8.1j1a: one NDP transaction returns up to six registry entries.
+        # Names are local/generated metadata; ID + flags remain firmware-authoritative.
+        names={
+            1: 'VEVOR YT60234',
+            2: 'Ambient WH31E',
+            3: 'Ecowitt WH51',
+            4: 'Ecowitt WH52',
+            5: 'badger orion',
+            6: 'bresser 5in1',
+            7: 'bresser 6in1',
+            8: 'cavius door',
+            9: 'deltadore x3d',
+            10: 'ec3k',
+            11: 'esic emt7110',
+            12: 'fineoffset wh1080 @868.3',
+            13: 'fineoffset wh1080 f @915',
+            14: 'fineoffset wh31l',
+            15: 'geo minim',
+            16: 'govee h5112',
+            17: 'honeywell cm921',
+            18: 'lacrosse breezepro',
+            19: 'lacrosse th3',
+            20: 'lacrosse tx22uit',
+            21: 'lacrosse tx31u',
+            22: 'lacrosse tx34',
+            23: 'lacrosse wr1',
+            24: 'm bus mode c t',
+            25: 'm bus mode c t downlink',
+            26: 'marlec solar',
+            28: 'oil standard',
+            29: 'rfm69 lowpowerlab motein',
+            30: 'srsmith pool srs 2c tx',
+            31: 'tfa 30 390x',
+            32: 'tfa marbella',
+            33: 'thermopro tp211b',
+            34: 'thermopro tp28b',
+            35: 'thermopro tp86xb',
+            36: 'watts vision'
+        }
+
+        rows=[]
+        start=0
+        total=None
+
+        while total is None or start<total:
+            p=await self.ndp_command(
+                NDP_GFSK_DIAG,bytes([29,start])
+            )
+            if len(p)<3:
+                raise RuntimeError(
+                    f"Invalid B8.1j1a registry page: {p.hex()}"
+                )
+
+            page_total=p[0]
+            page_start=p[1]
+            count=p[2]
+
+            if total is None:
+                total=page_total
+            elif page_total!=total:
+                raise RuntimeError(
+                    f"RF registry count changed during list: "
+                    f"{total} -> {page_total}"
+                )
+
+            if page_start!=start:
+                raise RuntimeError(
+                    f"RF registry page start mismatch: "
+                    f"{page_start} != {start}"
+                )
+            if count<1 or count>6:
+                raise RuntimeError(
+                    f"Invalid RF registry page count: {count}"
+                )
+            if len(p)!=(3+2*count):
+                raise RuntimeError(
+                    f"Invalid RF registry page length: "
+                    f"{len(p)} != {3+2*count}"
+                )
+
+            off=3
+            for _ in range(count):
+                profile_id=p[off]
+                flags=p[off+1]
+                off+=2
+                rows.append((profile_id,flags))
+            start+=count
+
+        print("=== B8.1j1a RF PROFILE REGISTRY ===")
+        print("ID  NAME             RFVM RADIO CAPS HW  RUNTIME")
+        for profile_id,flags in rows:
+            name=names.get(profile_id,f"profile {profile_id}")
+            rfvm=bool(flags&0x02)
+            radio=bool(flags&0x04)
+            caps=bool(flags&0x08)
+            hw=bool(flags&0x10)
+            runtime=rfvm and radio and caps
+            print(
+                f'{profile_id:<3} {name:<16.16} '
+                f'{"yes" if rfvm else "no":<4} '
+                f'{"yes" if radio else "no":<5} '
+                f'{"yes" if caps else "no":<4} '
+                f'{"yes" if hw else "no":<3} '
+                f'{"yes" if runtime else "no"}'
+            )
+
+        print(f"Count: {len(rows)}")
+        return rows
+
+    async def rf_profile_tx_test(self, profile_id:int, power:int=0):
+        if power < -9 or power > 14:
+            raise RuntimeError("GFSK TX power must be -9..14 dBm")
+        p=await self.ndp_command(NDP_GFSK_DIAG,bytes([26,profile_id,power & 0xFF]))
+        if len(p)!=5:
+            raise RuntimeError(f"Invalid RF profile TX response: {p.hex()}")
+        irq=p[3] | (p[4]<<8)
+        signed=p[2] if p[2]<128 else p[2]-256
+        print("=== SYNTHETIC OTA TX ===")
+        print(f"Profile:          {p[0]}")
+        print(f"Payload length:   {p[1]} bytes")
+        print(f"Power:            {signed} dBm")
+        print(f"Terminal IRQ:     0x{irq:04X}")
+        print(f"TX_DONE:          {'yes' if irq & 0x0001 else 'no'}")
+
+    async def rf_profile_show(self, profile_id:int):
+        e=await self._rf_profile_by_id(profile_id)
+        runtime=e["rfvm"] and e["radio"] and e["caps"]
+        sync=" ".join(f"{x:02X}" for x in e["sync"]) if e["sync"] else "-"
+        print("=== B8.0m1 RF PROFILE ===")
+        print(f'ID:               {e["id"]}')
+        print(f'Name:             {e["name"]}')
+        print(f'RFVM ready:       {"yes" if e["rfvm"] else "no"}')
+        print(f'Radio ready:      {"yes" if e["radio"] else "no"}')
+        print(f'Capabilities:     {"yes" if e["caps"] else "no"}')
+        print(f'Hardware valid.:  {"yes" if e["hw"] else "no"}')
+        print(f'Runtime ready:    {"yes" if runtime else "no"}')
+        print(f'Frequency:        {e["frequency"]/1e6:.6f} MHz')
+        print(f'Bitrate:          {e["bitrate"]} bps')
+        print(f'Deviation:        {e["deviation"]} Hz')
+        print(f'RX bandwidth:     {e["bandwidth"]} Hz')
+        print(f'Sync:             {sync}')
+        print(f'Expected length:  {e["expected_len"]} bytes')
+
+    async def bridge_radio_mode_status(self):
+        p=await self.ndp_command(NDP_GFSK_DIAG,bytes([19]))
+        if len(p)!=9: raise RuntimeError(f"Invalid B8.0l radio-mode status: {p.hex()}")
+        mode=p[0]; active=bool(p[1]); profile=p[2]; bw=p[3]; frequency=int.from_bytes(p[4:8],"little"); store=p[8]
+        name={0:"LORA",1:"EXTERNAL_RF"}.get(mode,f"UNKNOWN({mode})")
+        print("=== B8.0l EXCLUSIVE BRIDGE RADIO MODE ===")
+        print(f"Mode:             {name}")
+        print(f"External active:  {'yes' if active else 'no'}")
+        print(f"RF profile:       {profile}")
+        print(f"RF frequency:     {frequency/1e6:.6f} MHz")
+        print(f"RF BW code:       0x{bw:02X}")
+        print(f"State store:      {store} (0=IDLE)")
+
+    async def bridge_radio_mode_lora(self):
+        await self.ndp_command(NDP_GFSK_DIAG,bytes([20]))
+        print("Bridge radio mode persisted: LORA")
+        print("Reboot the bridge to apply exclusive LoRa ownership.")
+
+    async def bridge_radio_mode_external_rf(self, profile_id:int=1, frequency_hz=None):
+        e=await self._rf_profile_by_id(profile_id)
+        runtime=e["rfvm"] and e["radio"] and e["caps"]
+        if not runtime:
+            raise RuntimeError(f'RF profile {profile_id} ({e["name"]}) exists but is not runtime-ready (RFVM={e["rfvm"]}, RADIO={e["radio"]}, CAPS={e["caps"]})')
+        if frequency_hz is None: frequency_hz=e["frequency"]
+        bw_map={
+            4800:0x1F,5800:0x17,7300:0x0F,9700:0x1E,
+            11700:0x16,14600:0x0E,19500:0x1D,23400:0x15,
+            29300:0x0D,39000:0x1C,46900:0x14,58600:0x0C,
+            78200:0x1B,93800:0x13,117300:0x0B,156200:0x1A,
+            187200:0x12,234300:0x0A,312000:0x19,373600:0x11,
+            467000:0x09,
+        }
+        bw=bw_map.get(e["bandwidth"])
+        if bw is None:
+            raise RuntimeError(
+                f'RF profile {profile_id} has unsupported LLCC68 RX bandwidth '
+                f'{e["bandwidth"]} Hz')
+        payload=bytes([21,profile_id])+struct.pack("<I",frequency_hz)+bytes([bw])
+        await self.ndp_command(NDP_GFSK_DIAG,payload)
+        print("Bridge radio mode persisted: EXTERNAL_RF")
+        print(f'Profile:          {profile_id} ({e["name"]})')
+        print(f"Frequency:        {frequency_hz/1e6:.6f} MHz")
+        print("Reboot the bridge to apply exclusive external-RF ownership.")
+
+    async def gfsk_auto_boot_status(self):
+        p=await self.ndp_command(NDP_GFSK_DIAG,bytes([18]))
+        if len(p)!=10:
+            raise RuntimeError(f"Invalid B8.0k2 boot status response: {p.hex()}")
+        persisted=bool(p[0]); enabled=bool(p[1]); active=bool(p[2])
+        profile=p[3]; bw=p[4]
+        frequency=int.from_bytes(p[5:9],"little")
+        store=p[9]
+        print("=== B8.0k2 PERSISTENT / BOOT RF RECEIVER ===")
+        print(f"Persisted:        {'yes' if persisted else 'no'}")
+        print(f"Boot enabled:     {'yes' if enabled else 'no'}")
+        print(f"Runtime active:   {'yes' if active else 'no'}")
+        print(f"Profile:          {profile}")
+        print(f"Frequency:        {frequency/1e6:.6f} MHz")
+        print(f"RX BW code:       0x{bw:02X}")
+        print(f"State store:      {store} (0=IDLE)")
+        return {"persisted":persisted,"enabled":enabled,"active":active,
+                "profile":profile,"frequency":frequency,"bw":bw,"store":store}
+
+    async def gfsk_auto_boot_on(self):
+        await self.ndp_command(NDP_GFSK_DIAG,bytes([16]))
+        print("B8.0k2 boot receiver persistence requested.")
+        for _ in range(30):
+            await asyncio.sleep(0.1)
+            st=await self.gfsk_auto_boot_status()
+            if st["enabled"] and st["store"]==0:
+                print("Persistent external RF receiver committed.")
+                return
+        raise RuntimeError("Timed out waiting for persistent RF receiver commit")
+
+    async def gfsk_auto_boot_off(self):
+        await self.ndp_command(NDP_GFSK_DIAG,bytes([17]))
+        print("B8.0k2 boot receiver disable requested.")
+        for _ in range(30):
+            await asyncio.sleep(0.1)
+            st=await self.gfsk_auto_boot_status()
+            if (not st["enabled"]) and st["store"]==0:
+                print("Persistent external RF receiver disabled.")
+                return
+        raise RuntimeError("Timed out waiting for persistent RF receiver disable commit")
+
+    async def gfsk_auto_frame(self):
+        meta=await self.ndp_command(NDP_GFSK_DIAG,bytes([27]))
+        if len(meta)!=3: raise RuntimeError(f"Invalid B8.0m3a metadata: {meta.hex()}")
+        profile_id,length,rfvm_ok=meta
+        frame=bytearray()
+        offset=0
+        while offset < length:
+            p=await self.ndp_command(NDP_GFSK_DIAG,bytes([28,offset]))
+            if len(p)<3 or p[0]!=offset or p[1]!=(len(p)-2):
+                raise RuntimeError(f"Invalid B8.0m3a frame chunk: {p.hex()}")
+            frame.extend(p[2:]); offset += p[1]
+        expected={
+            1: bytes.fromhex("AA 00 F8 F7 9D 02 E3 32 01 0E 03 02 0B 01 38 02 39 7A 86 E0 87"),
+            2: bytes.fromhex("30 C3 81 D5 5C 2A CF 08 35 44 2C"),
+            3: bytes.fromhex("51 00 6B 58 6E 7F 24 F8 D2 FF FF FF 3C 28"),
+            4: bytes.fromhex("A2 12 34 56 62 7A 2A 80 A0 64 00 06 11 22 33 44 55 66 77 88 4B 99 0D 23"),
+        }.get(profile_id)
+        print("=== B8.0m3a FIFO / RFVM EXACT FRAME TRACE ===")
+        print(f"Profile:          {profile_id}")
+        print(f"Length:           {length}")
+        print(f"RFVM decode:      {'PASS' if rfvm_ok else 'FAIL'}")
+        print("FIFO:             "+" ".join(f"{b:02X}" for b in frame))
+        if expected is None:
+            print("Expected:         <no canonical vector>"); return
+        print("Expected:         "+" ".join(f"{b:02X}" for b in expected))
+        if bytes(frame)==expected:
+            print("Frame compare:    MATCH")
+        else:
+            print("Frame compare:    DIFFER")
+            n=max(len(frame),len(expected))
+            for i in range(n):
+                got=frame[i] if i<len(frame) else None
+                want=expected[i] if i<len(expected) else None
+                if got!=want:
+                    gs="--" if got is None else f"{got:02X}"
+                    ws="--" if want is None else f"{want:02X}"
+                    print(f"First diff:       offset {i}: got {gs}, expected {ws}")
+                    break
+
+    async def gfsk_auto_status(self):
+        p=await self.ndp_command(NDP_GFSK_DIAG,bytes([12]))
+        if len(p)!=15:
+            raise RuntimeError(f"Invalid B8.0k status response: {p.hex()}")
+        active=bool(p[0]); profile=p[1]
+        dio1=int.from_bytes(p[2:4],"little")
+        packets=int.from_bytes(p[4:6],"little")
+        decoded=int.from_bytes(p[6:8],"little")
+        published=int.from_bytes(p[8:10],"little")
+        failures=int.from_bytes(p[10:12],"little")
+        irq=int.from_bytes(p[12:14],"little")
+        last_len=p[14]
+        print("=== B8.0k AUTOMATIC GFSK INGESTION ===")
+        print(f"Active:           {'yes' if active else 'no'}")
+        print(f"Profile:          {profile}")
+        print(f"DIO1 events:      {dio1}")
+        print(f"Packets:          {packets}")
+        print(f"RFVM decoded:     {decoded}")
+        print(f"NinaLink publish: {published}")
+        print(f"Failures:         {failures}")
+        print(f"Last IRQ:         0x{irq:04X}")
+        print(f"Last length:      {last_len}")
+        return {"active":active,"profile":profile,"dio1":dio1,
+                "packets":packets,"decoded":decoded,"published":published,
+                "failures":failures,"last_irq":irq,"last_len":last_len}
+
+    async def gfsk_auto_start(self):
+        await self.ndp_command(NDP_GFSK_DIAG,bytes([13]))
+        print("B8.0k automatic GFSK ingestion enabled.")
+
+    async def gfsk_auto_stop(self):
+        await self.ndp_command(NDP_GFSK_DIAG,bytes([14]))
+        print("B8.0k automatic ingestion disabled; legacy gfsk-poll owns RX diagnostics.")
+
+    async def gfsk_auto_clear(self):
+        await self.ndp_command(NDP_GFSK_DIAG,bytes([15]))
+        print("B8.0k automatic ingestion counters cleared.")
+
+    async def gfsk_ninalink_publish(self):
+        p=await self.ndp_command(NDP_GFSK_DIAG,bytes([10]))
+        if len(p)!=7:
+            raise RuntimeError(f"Invalid B8.0j1 publish response: {p.hex()}")
+        profile=p[0]
+        node=int.from_bytes(p[1:5],"little")
+        caps=p[5]
+        cached=p[6]
+        print("=== B8.0j1 RF -> NINALINK VIRTUAL NODE ===")
+        print(f"Profile:          {profile}")
+        print(f"Virtual node:     0x{node:08X}")
+        print(f"Inventory caps:   {caps}")
+        print(f"Cached values:    {cached}")
+        return node
+
+    async def gfsk_ninalink_status(self):
+        names={0x0100:"temperature",0x0101:"humidity",0x0900:"rf_device_id",
+               0x0901:"rf_channel",0x0902:"rf_battery_ok",0x0910:"wind_raw",
+               0x0911:"gust_raw",0x0912:"wind_direction",0x0913:"rain_raw",
+               0x0914:"uv_index"}
+        rows=[]
+        index=0
+        total=None
+        while total is None or index<total:
+            p=await self.ndp_command(NDP_GFSK_DIAG,bytes([11,index]))
+            if len(p)!=15:
+                raise RuntimeError(f"Invalid B8.0j1 row: {p.hex()}")
+            total=p[0]
+            cap=int.from_bytes(p[2:4],"little")
+            ch=p[4]
+            typ=p[5]
+            scale=int.from_bytes(p[6:7],"little",signed=True)
+            unit=p[7]
+            state=p[8]
+            complete=p[9]
+            overflow=p[10]
+            raw=int.from_bytes(p[11:15],"little",signed=typ in (3,5,7))
+            rows.append((cap,ch,typ,scale,unit,state,complete,overflow,raw))
+            index+=1
+
+        print("=== B8.0j1 NINALINK INVENTORY / CACHE READBACK ===")
+        print(f"Count:            {len(rows)}")
+        for cap,ch,typ,scale,unit,state,complete,overflow,raw in rows:
+            print(f"0x{cap:04X} ch={ch} {names.get(cap,'unknown'):18s} "
+                  f"type={typ} scale={scale} state=0x{state:02X} raw={raw}")
+        expected={0x0900:0xF8F7,0x0901:0,0x0902:0,0x0100:2390,0x0101:5000,
+                  0x0910:13,0x0911:3,0x0912:266,0x0913:55,0x0914:1}
+        actual={cap:raw for cap,_,_,_,_,_,_,_,raw in rows}
+        mismatch=[(hex(k),actual.get(k),v) for k,v in expected.items()
+                  if actual.get(k)!=v]
+        if mismatch:
+            raise RuntimeError(f"NinaLink projection mismatch: {mismatch}")
+        if len(rows)!=10:
+            raise RuntimeError(f"Expected 10 NinaLink caps, got {len(rows)}")
+        if any(not complete or overflow for *_,complete,overflow,_ in rows):
+            raise RuntimeError("Inventory incomplete or overflowed")
+        print("NinaLink projection: MATCH")
+        return rows
+
+    async def gfsk_vevor_tx(self,frequency_hz:int=915000000,power_dbm:int=0,variant_name="reference"):
+        if not 902000000<=frequency_hz<=928000000:
+            raise ValueError("frequency must be 902000000..928000000 Hz")
+        if not -9<=power_dbm<=14:
+            raise ValueError("power must be -9..14 dBm")
+        variants={"reference":0,"live":1}
+        if variant_name not in variants:
+            raise ValueError("variant must be reference or live")
+        variant=variants[variant_name]
+        payload=bytes([6])+struct.pack("<I",frequency_hz)+struct.pack("<b",power_dbm)+bytes([variant])
+        status,body=await self.ndp_command_raw(NDP_GFSK_DIAG,payload,timeout=5.0)
+        irq=int.from_bytes(body[:2],"little") if len(body)>=2 else 0
+        if status!=0:
+            raise RuntimeError(
+                f"GFSK VEVOR TX failed: {NDP_STATUS_NAMES.get(status,status)} "
+                f"terminal_irq=0x{irq:04X}"
+            )
+        print("=== B8.0k1 SYNTHETIC VEVOR TX ===")
+        print(f"Variant:          {variant_name}")
+        print(f"Frequency:        {frequency_hz/1e6:.6f} MHz")
+        print("Bitrate:          11.260 kbaud")
+        print("Deviation:        +/-37 kHz")
+        print(f"Power:            {power_dbm} dBm")
+        print("Sync:             CA CA 54")
+        if variant==0:
+            print("Payload:          AA 00 F8 F7 9D 02 E3 32 01 0E 03 02 0B 01 38 02 39 7A 86 E0 87")
+            print("Decoded target:   23.9C 50% wind=13 gust=3 dir=266 rain=55 UV=1")
+        else:
+            print("Payload:          AA 00 F8 F7 9D 03 13 3F 01 16 08 02 37 01 4E 05 39 7A 86 70 87")
+            print("Decoded target:   28.7C 63% wind=21 gust=8 dir=310 rain=77 UV=4")
+        print(f"Terminal IRQ:     0x{irq:04X}")
+        if irq & 0x0001:
+            print("TX result:        TX_DONE")
+        else:
+            print("TX result:        unexpected terminal state")
+        return irq
+
+
+    # B8.1k8c1 SHT family physical diagnostic ---------------------------
+    def _sht_decode_info(self, p, heading):
+        if len(p) != 12:
+            raise RuntimeError(
+                f"Invalid B8.1k8c1 SHT info response length: {len(p)} "
+                f"payload={p.hex()}"
+            )
+
+        status_names = {
+            0: "OK",
+            1: "BAD_ARG",
+            2: "BUSY",
+            3: "NOT_FOUND",
+            4: "IO_ERROR",
+        }
+        family_names = {
+            0: "NONE",
+            1: "SHT2x",
+            2: "SHT3x",
+            3: "SHT4x",
+            4: "SHTC3",
+        }
+
+        serial = int.from_bytes(p[8:12], "little")
+        info = {
+            "status": p[0],
+            "active": bool(p[1]),
+            "present": bool(p[2]),
+            "family": p[3],
+            "address": p[4],
+            "scl": p[5],
+            "sda": p[6],
+            "serial_valid": bool(p[7]),
+            "serial": serial,
+        }
+
+        print(heading)
+        print(f"Status:           {status_names.get(info['status'], info['status'])}")
+        print(f"Active:           {'yes' if info['active'] else 'no'}")
+        print(f"Present:          {'yes' if info['present'] else 'no'}")
+        print(f"Family:           {family_names.get(info['family'], info['family'])}")
+        print(
+            f"I2C address:      0x{info['address']:02X}"
+            if info["address"]
+            else "I2C address:      -"
+        )
+        print(f"SCL / SDA:        D{info['scl']} / D{info['sda']}")
+        if info["serial_valid"]:
+            print(f"Serial:           0x{info['serial']:08X}")
+        else:
+            print("Serial:           unavailable")
+        return info
+
+    async def sht_info(self):
+        p = await self.ndp_command(NDP_SHT_DIAG, bytes([0]))
+        return self._sht_decode_info(p, "=== B8.1k8c1 SHT INFO ===")
+
+    async def sht_detect(self, scl=None, sda=None):
+        if (scl is None) != (sda is None):
+            raise ValueError("--scl and --sda must be supplied together")
+
+        if scl is None:
+            payload = bytes([1])
+        else:
+            if not 0 <= scl <= 31 or not 0 <= sda <= 31:
+                raise ValueError("SCL/SDA must be GPIO numbers 0..31")
+            payload = bytes([1, scl, sda])
+
+        p = await self.ndp_command(NDP_SHT_DIAG, payload)
+        info = self._sht_decode_info(p, "=== B8.1k8c1 SHT DETECT ===")
+        if info["status"] == 0 and info["present"]:
+            print("Detection:        PASS")
+        else:
+            print("Detection:        no supported SHT detected / resource conflict")
+        return info
+
+    async def sht_read(self):
+        p = await self.ndp_command(NDP_SHT_DIAG, bytes([2]))
+        if len(p) != 9:
+            raise RuntimeError(
+                f"Invalid B8.1k8c1 SHT read response length: {len(p)} "
+                f"payload={p.hex()}"
+            )
+
+        status_names = {
+            0: "OK",
+            1: "BAD_ARG",
+            2: "BUSY",
+            3: "NOT_FOUND",
+            4: "IO_ERROR",
+        }
+        status = p[0]
+        temperature_mc = int.from_bytes(p[1:5], "little", signed=True)
+        humidity_mpermille = int.from_bytes(p[5:9], "little")
+
+        print("=== B8.1k8c1 SHT READ ===")
+        print(f"Status:           {status_names.get(status, status)}")
+        if status == 0:
+            print(f"Temperature:      {temperature_mc / 1000.0:.3f} C")
+            print(f"Humidity:         {humidity_mpermille / 1000.0:.3f} %RH")
+        return status, temperature_mc, humidity_mpermille
+
+    async def sht_release(self):
+        p = await self.ndp_command(NDP_SHT_DIAG, bytes([3]))
+        info = self._sht_decode_info(p, "=== B8.1k8c1 SHT RELEASE ===")
+        if info["active"] or info["present"]:
+            raise RuntimeError("SHT release did not clear driver ownership")
+        print("GPIO ownership:   released")
+        return info
+
     async def ninalink_network(self, network_id=None, quiet=False):
         """Read or persist the NinaLink v1 16-bit network ID."""
         if network_id is not None:
@@ -2811,7 +3733,7 @@ class NRFClawClient:
             if last_status != 0 or len(p) != 4:
                 raise RuntimeError("Legacy DS18B20 conversion unavailable")
             source, milli_c = 1, struct.unpack("<i", p)[0]
-        source_name = {1:"DS18B20", 2:"NRF52_INTERNAL"}.get(source, str(source))
+        source_name = {1:"DS18B20", 2:"NRF52_INTERNAL", 3:"SHT"}.get(source, str(source))
         print("=== TEMPERATURE ===")
         print(f"Source:          {source_name}")
         print(f"Temperature:     {milli_c / 1000.0:.3f} C")
@@ -2825,7 +3747,7 @@ class NRFClawClient:
                 raise RuntimeError(
                     f"DS18B20 absent and TEMPERATURE fallback unavailable: {NDP_STATUS_NAMES.get(source, source)}"
                 )
-            source_name = {1:"DS18B20", 2:"NRF52_INTERNAL"}.get(source, str(source))
+            source_name = {1:"DS18B20", 2:"NRF52_INTERNAL", 3:"SHT"}.get(source, str(source))
             print("=== DS18B20 ===")
             print("Present:         no")
             print(f"Source:          {source_name}")
@@ -5084,7 +6006,7 @@ def format_capability(name: str, supported: bool, active: bool) -> str:
 
 async def run_ha_mode(args):
     if args.ha_action == "scan":
-        await print_bleak_scan(args.scan_timeout, args.device)
+        await print_bleak_scan(args.scan_timeout, args.device or "")
         return
 
     if args.ha_action == "reconnect":
@@ -5268,6 +6190,38 @@ async def _apply_prompt_network_provisioning(nrf, result):
     or discovery behavior is changed by l2.
     """
     spec = getattr(result, "provision", None)
+    # B8.1k8d external-RF prompt provisioning.
+    if isinstance(spec, dict) and spec.get("kind") == "external-rf-ha-bridge":
+        profile_id = int(spec.get("profile_id", -1))
+        profile_name = str(spec.get("profile_name", f"RF Profile {profile_id}"))
+        frequency_hz = spec.get("frequency_hz")
+        await nrf.bridge_radio_mode_external_rf(profile_id, frequency_hz)
+
+        # Wait until the profile selection is committed before prompt upload
+        # starts another Flash write.
+        committed = False
+        for _ in range(40):
+            await asyncio.sleep(0.10)
+            p = await nrf.ndp_command(NDP_GFSK_DIAG, bytes([19]))
+            if len(p) != 9:
+                raise RuntimeError(
+                    f"invalid bridge radio-mode status for profile {profile_id}: {p.hex()}")
+            if p[8] == 0 and p[2] == profile_id:
+                committed = True
+                break
+        if not committed:
+            raise RuntimeError(
+                f"timed out waiting for EXTERNAL_RF profile {profile_id} persistence")
+
+        print("=== PROMPT EXTERNAL RF / HA PROVISION B8.1k8d ===")
+        print(f"Profile:          {profile_id} ({profile_name})")
+        print("Radio mode:       EXTERNAL_RF")
+        print("Auto ingestion:   boot")
+        print("HA projection:    virtual NinaLink node")
+        print("Action:           persisted")
+        print("Apply:            reboot bridge after prompt upload")
+        return profile_id
+
     if not isinstance(spec, dict) or spec.get("kind") != "ninalink-network":
         return None
 
@@ -5337,6 +6291,7 @@ def _resolve_prompt_compilation(args, source):
         str(getattr(local_result, "intent", "")).startswith("ha-transport-")
         or str(getattr(local_result, "intent", "")).startswith("hall-semantic-volume")
         or str(getattr(local_result, "intent", "")) == "vib-auto-machine-ha-event"
+        or str(getattr(local_result, "intent", "")) == "external-rf-ha-bridge"
     ):
         print(f"SEMANTIC: deterministic hybrid-v{SEMANTIC_ENGINE_VERSION} route={local_meta.get('route')} family={local_meta.get('family')}")
         pseudo=pseudo_from_result(local_result)
@@ -6276,6 +7231,11 @@ async def main_async(args):
         await firmware_upgrade(args)
         return
 
+    # B8.1k8c2a: global HA discovery does not target one board.
+    if args.action == "ha" and args.ha_action == "scan":
+        await run_ha_mode(args)
+        return
+
     if not args.device:
         raise RuntimeError("--device is required for commands that access BLE hardware")
 
@@ -6345,6 +7305,18 @@ async def main_async(args):
 
         elif args.action == "semantic-state":
             await nrf.semantic_state()
+
+        elif args.action == "sht-detect":
+            await nrf.sht_detect(args.scl, args.sda)
+
+        elif args.action == "sht-info":
+            await nrf.sht_info()
+
+        elif args.action == "sht-read":
+            await nrf.sht_read()
+
+        elif args.action == "sht-release":
+            await nrf.sht_release()
 
         elif args.action == "ds18b20":
             await nrf.ds18b20_read()
@@ -6420,10 +7392,12 @@ async def main_async(args):
             await nrf.ndp_key_status()
 
         elif args.action == "ndp-key-get":
-            await nrf.ndp_key_get()
+            key = await nrf.ndp_key_get(quiet=True)
+            print_ndp_key_qr(args.device, key, show_key=args.show_key)
 
         elif args.action == "ndp-key-generate":
-            await nrf.ndp_key_generate()
+            key = await nrf.ndp_key_generate()
+            print_ndp_key_qr(args.device, key, show_key=args.show_key)
 
         elif args.action == "hall-status":
             await nrf.hall_status()
@@ -6459,6 +7433,53 @@ async def main_async(args):
 
         elif args.action == "lora-info":
             await nrf.lora_info()
+
+        elif args.action == "gfsk-vevor-start":
+            await nrf.gfsk_vevor_start(args.frequency,args.bandwidth)
+        elif args.action == "gfsk-status":
+            await nrf.gfsk_status()
+        elif args.action == "gfsk-poll":
+            await nrf.gfsk_poll()
+        elif args.action == "gfsk-stop":
+            await nrf.gfsk_stop()
+        elif args.action == "gfsk-rfvm":
+            await nrf.gfsk_rfvm()
+        elif args.action == "gfsk-cap-publish":
+            await nrf.gfsk_cap_publish()
+        elif args.action == "gfsk-capabilities":
+            await nrf.gfsk_capabilities()
+        elif args.action == "rf-profile":
+            if args.rf_profile_action == "list":
+                await nrf.rf_profile_list()
+            elif args.rf_profile_action == "show":
+                await nrf.rf_profile_show(args.profile)
+            elif args.rf_profile_action == "tx-test":
+                await nrf.rf_profile_tx_test(args.profile,args.power)
+        elif args.action == "bridge-radio-mode":
+            if args.bridge_radio_mode_action == "status": await nrf.bridge_radio_mode_status()
+            elif args.bridge_radio_mode_action == "lora": await nrf.bridge_radio_mode_lora()
+            else: await nrf.bridge_radio_mode_external_rf(args.profile,args.frequency)
+        elif args.action == "gfsk-auto-boot-status":
+            await nrf.gfsk_auto_boot_status()
+        elif args.action == "gfsk-auto-boot-on":
+            await nrf.gfsk_auto_boot_on()
+        elif args.action == "gfsk-auto-boot-off":
+            await nrf.gfsk_auto_boot_off()
+        elif args.action == "gfsk-auto-frame": await nrf.gfsk_auto_frame()
+        elif args.action == "gfsk-auto-status":
+            await nrf.gfsk_auto_status()
+        elif args.action == "gfsk-auto-start":
+            await nrf.gfsk_auto_start()
+        elif args.action == "gfsk-auto-stop":
+            await nrf.gfsk_auto_stop()
+        elif args.action == "gfsk-auto-clear":
+            await nrf.gfsk_auto_clear()
+        elif args.action == "gfsk-ninalink-publish":
+            await nrf.gfsk_ninalink_publish()
+        elif args.action == "gfsk-ninalink-status":
+            await nrf.gfsk_ninalink_status()
+        elif args.action == "gfsk-vevor-tx":
+            await nrf.gfsk_vevor_tx(args.frequency,args.power,args.variant)
 
         elif args.action == "ninalink-telemetry-boot":
             code = ninalink_telemetry_boot_program(
@@ -6601,6 +7622,7 @@ async def main_async(args):
 
         elif args.action == "status":
             await nrf.status()
+
 
         elif args.action == "ping":
             await nrf.ping()
@@ -6886,6 +7908,26 @@ def build_parser():
         help="Direct Hall behavior preset or reset action",
     )
 
+    shtd = sub.add_parser(
+        "sht-detect",
+        help="B8.1k8c1 probe SHT2x/SHT3x/SHT4x/SHTC3 on default or explicit pins",
+    )
+    shtd.add_argument(
+        "--scl",
+        type=lambda x: int(x, 0),
+        default=None,
+        help="alternate SCL GPIO number; requires --sda",
+    )
+    shtd.add_argument(
+        "--sda",
+        type=lambda x: int(x, 0),
+        default=None,
+        help="alternate SDA GPIO number; requires --scl",
+    )
+    sub.add_parser("sht-info", help="B8.1k8c1 show active SHT diagnostic state")
+    sub.add_parser("sht-read", help="B8.1k8c1 read physical SHT temperature/humidity")
+    sub.add_parser("sht-release", help="B8.1k8c1 release SHT software-I2C GPIO ownership")
+
     sub.add_parser(
         "ds18b20",
         help="Legacy temperature command: DS18B20 when present, nRF52 internal fallback",
@@ -6893,7 +7935,7 @@ def build_parser():
 
     sub.add_parser(
         "temp",
-        help="Read logical temperature (DS18B20 preferred, nRF52 internal fallback)",
+        help="Read logical temperature (DS18B20 > SHT > nRF52 internal fallback)",
     )
 
     ac = sub.add_parser(
@@ -7002,8 +8044,24 @@ def build_parser():
     )
 
     sub.add_parser("ndp-key-status", help="Show optional NDP protection state (physical NUS only)")
-    sub.add_parser("ndp-key-get", help="Read the stored 256-bit NDP key (physical NUS only)")
-    sub.add_parser("ndp-key-generate", help="Generate/replace and persist a 256-bit NDP key (physical NUS only)")
+    nkget = sub.add_parser(
+        "ndp-key-get",
+        help="Show the stored NDP owner credential as a NINASENSE App QR (physical NUS only)",
+    )
+    nkget.add_argument(
+        "--show-key",
+        action="store_true",
+        help="also print the plaintext hex key for explicit recovery",
+    )
+    nkgen = sub.add_parser(
+        "ndp-key-generate",
+        help="Generate/replace NDP protection and show the NINASENSE App access QR",
+    )
+    nkgen.add_argument(
+        "--show-key",
+        action="store_true",
+        help="also print the plaintext hex key for explicit recovery",
+    )
 
     bb = sub.add_parser("ble-boot", help="legacy alias for HA Direct/NONE boot role; NUS remains on P0.21")
     bb.add_argument("ble_boot_action", choices=["status","disable","enable"])
@@ -7029,6 +8087,46 @@ def build_parser():
 
     sub.add_parser("lora-get", help="Show current LLCC68 LoRa profile")
     sub.add_parser("lora-info", help="Show LLCC68 profile for direct RF diagnostics")
+
+    gfs=sub.add_parser("gfsk-vevor-start",help="B8.0f start VEVOR YT60234 GFSK raw RX")
+    gfs.add_argument("--frequency",type=lambda x:int(x,0),default=915000000,help="center frequency Hz (default 915000000)")
+    gfs.add_argument("--bandwidth",choices=("117.3","156.2"),default="117.3",help="LLCC68 RX bandwidth kHz")
+    sub.add_parser("gfsk-status",help="B8.0f show GFSK status")
+    sub.add_parser("gfsk-poll",help="B8.0f poll IRQ and dump received frame")
+    sub.add_parser("gfsk-stop",help="B8.0f stop GFSK and restore LoRa")
+    sub.add_parser("gfsk-rfvm",help="B8.0h decode cached FIFO frame with production RFVM")
+    sub.add_parser("gfsk-cap-publish",help="B8.0i project RFVM to dynamic capabilities")
+    sub.add_parser("gfsk-capabilities",help="B8.0i enumerate dynamic RF capabilities")
+    rfp=sub.add_parser("rf-profile",help="B8.0m1 RF Profile Registry")
+    rfps=rfp.add_subparsers(dest="rf_profile_action",required=True)
+    rfps.add_parser("list",help="list registered RF profiles")
+    rfpshow=rfps.add_parser("show",help="show one RF profile")
+    rfpshow.add_argument("profile",type=int,help="profile ID")
+    rfptx=rfps.add_parser("tx-test",help="B8.0m3 synthetic OTA TX")
+    rfptx.add_argument("profile",type=int,help="profile ID")
+    rfptx.add_argument("--power",type=int,default=0,help="TX power dBm")
+
+    brm=sub.add_parser("bridge-radio-mode",help="B8.0l exclusive bridge radio ownership")
+    brms=brm.add_subparsers(dest="bridge_radio_mode_action",required=True)
+    brms.add_parser("status")
+    brms.add_parser("lora")
+    brme=brms.add_parser("external-rf")
+    brme.add_argument("--profile",type=int,default=1,help="RF registry profile ID")
+    brme.add_argument("--frequency",type=int,default=None,help="override profile center frequency Hz")
+    sub.add_parser("gfsk-auto-boot-status",help="B8.0k2 persistent external RF receiver status")
+    sub.add_parser("gfsk-auto-boot-on",help="B8.0k2 persist current GFSK receiver for BRIDGE boot")
+    sub.add_parser("gfsk-auto-boot-off",help="B8.0k2 disable persistent GFSK receiver boot")
+    sub.add_parser("gfsk-auto-frame",help="B8.0m3a last FIFO/RFVM frame trace")
+    sub.add_parser("gfsk-auto-status",help="B8.0k automatic GFSK ingestion status")
+    sub.add_parser("gfsk-auto-start",help="B8.0k enable automatic ingestion on active GFSK RX")
+    sub.add_parser("gfsk-auto-stop",help="B8.0k disable automatic ingestion; allow manual gfsk-poll")
+    sub.add_parser("gfsk-auto-clear",help="B8.0k clear automatic ingestion counters")
+    sub.add_parser("gfsk-ninalink-publish",help="B8.0j1 publish RF caps as virtual NinaLink node")
+    sub.add_parser("gfsk-ninalink-status",help="B8.0j1 read NinaLink inventory/cache for RF node")
+    gft=sub.add_parser("gfsk-vevor-tx",help="B8.0g transmit one synthetic VEVOR YT60234 frame")
+    gft.add_argument("--frequency",type=lambda x:int(x,0),default=915000000,help="center frequency Hz")
+    gft.add_argument("--power",type=int,default=0,help="TX power -9..14 dBm (default 0)")
+    gft.add_argument("--variant",choices=("reference","live"),default="reference",help="synthetic payload vector for B8.0k1 live HA gate")
     ntboot = sub.add_parser(
         "ninalink-telemetry-boot",
         help="B4.12 persist fixed-phase TEMPERATURE telemetry over reliable NinaLink",

@@ -78,7 +78,11 @@ typedef enum {
     /* B7.6f2k4 read-only current VM semantic state. */
     NRFCLAW_NDP_DIRECT_SEMANTIC_STATE = 97,
     /* B7.6f2l1 physical-NUS-only persistent NinaLink network ID. */
-    NRFCLAW_NDP_NINALINK_NETWORK = 98
+    NRFCLAW_NDP_NINALINK_NETWORK = 98,
+    /* B8.0f physical-NUS-only LLCC68 GFSK raw RX gate. */
+    NRFCLAW_NDP_GFSK_DIAG = 99,
+    /* B8.1k8c1 physical-NUS-only SHT family hardware diagnostic. */
+    NRFCLAW_NDP_SHT_DIAG = 100
 } nrfclaw_ndp_opcode_t;
 
 /* Stable NDP v1 status values. */
@@ -100,7 +104,8 @@ typedef enum {
     NRFCLAW_NDP_SENSOR_ACCEL_XYZ    = 3,
     NRFCLAW_NDP_SENSOR_DS18B20      = 4,
     NRFCLAW_NDP_SENSOR_ACCEL_METRICS= 5,
-    NRFCLAW_NDP_SENSOR_TEMPERATURE  = 6
+    NRFCLAW_NDP_SENSOR_TEMPERATURE = 6,
+    NRFCLAW_NDP_SENSOR_HUMIDITY = 7 /* B8.1k8c2 SHT humidity */
 } nrfclaw_ndp_sensor_t;
 
 bool nrfclaw_ndp_is_session_frame(uint8_t const *data,uint16_t len);

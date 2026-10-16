@@ -12,6 +12,7 @@ PAGE_CORE = 0
 PAGE_EVENT = 1
 PAGE_ACCEL = 2
 PAGE_SEMANTIC = 3
+PAGE_ENVIRONMENT = 4
 PAYLOAD_LEN_V1 = 18
 PAYLOAD_LEN_V2 = 19
 
@@ -217,3 +218,24 @@ def parse_semantic_state_record(payload: bytes) -> DirectAdvSemantic | None:
         return None
     packet = bytes((0x4E,0x43,VERSION_V2,0,PAGE_SEMANTIC,HA_ROLE_DIRECT_BLE)) + payload
     return parse_direct_adv_semantic(packet)
+
+@dataclass(slots=True, frozen=True)
+class DirectAdvEnvironment:
+    sequence: int
+    page: int
+    role: int
+    active_capabilities: int
+    humidity_pct: float | None
+
+
+def parse_direct_adv_environment(payload: bytes) -> DirectAdvEnvironment | None:
+    if (len(payload) != PAYLOAD_LEN_V2 or payload[:2] != MAGIC or
+        payload[2] != VERSION_V2 or payload[4] != PAGE_ENVIRONMENT):
+        return None
+    flags = payload[6]
+    return DirectAdvEnvironment(
+        sequence=payload[3], page=payload[4], role=payload[5],
+        active_capabilities=int.from_bytes(payload[7:9], "little"),
+        humidity_pct=(int.from_bytes(payload[9:11], "little") / 100.0)
+        if flags & 0x01 else None,
+    )

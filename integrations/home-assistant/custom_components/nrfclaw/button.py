@@ -2,13 +2,48 @@
 
 from __future__ import annotations
 
-from .const import MODE_BRIDGE, MODE_DIRECT
+from homeassistant.helpers import entity_registry as er
+
+from .const import DOMAIN, MODE_BRIDGE, MODE_DIRECT
 from .direct_sensor_controls import build_direct_sensor_control_buttons
 from .ninalink_buttons import build_ninalink_control_buttons
 
 
+
+def _cleanup_rf_virtual_command_buttons(hass, entry) -> None:
+    # Remove stale command buttons belonging to RF virtual nodes.
+    registry = er.async_get(hass)
+
+    for reg_entry in er.async_entries_for_config_entry(
+        registry,
+        entry.entry_id,
+    ):
+        if reg_entry.platform != DOMAIN:
+            continue
+        if not reg_entry.entity_id.startswith("button."):
+            continue
+
+        unique_id = str(reg_entry.unique_id or "")
+        parts = unique_id.split(":")
+        if (
+            len(parts) != 4
+            or parts[0] != "ninalink"
+            or parts[2] != "command"
+        ):
+            continue
+
+        try:
+            node_id = int(parts[1], 16)
+        except ValueError:
+            continue
+
+        if (node_id & 0xFF000000) == 0xF8000000:
+            registry.async_remove(reg_entry.entity_id)
+
+
 async def async_setup_entry(hass, entry, async_add_entities) -> None:
     runtime = entry.runtime_data
+    _cleanup_rf_virtual_command_buttons(hass, entry)
     coordinator = runtime.coordinator
     known: set[str] = set()
 

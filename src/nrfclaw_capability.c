@@ -356,6 +356,11 @@ bool nrfclaw_capability_state(uint16_t capability_id,
                 s |= NRFCLAW_CAP_STATE_ENABLED;
             break;
 
+        case NRFCLAW_SEMCAP_HUMIDITY:
+            if(nrfclaw_humidity_available())
+                s=NRFCLAW_CAP_STATE_SUPPORTED|NRFCLAW_CAP_STATE_PRESENT|NRFCLAW_CAP_STATE_ENABLED;
+            break;
+
         default: {
             nrfclaw_vm_semantic_state_t vm_state;
             if (nrfclaw_vm_semantic_state_get(capability_id, channel, &vm_state))
@@ -548,7 +553,14 @@ bool nrfclaw_capability_read_current(uint16_t capability_id,
                 case NRFCLAW_CAP_VALUE_U32: out->v.u32 = vm_state.raw_value; break;
                 case NRFCLAW_CAP_VALUE_S32: out->v.s32 = (int32_t)vm_state.raw_value; break;
                 case NRFCLAW_CAP_VALUE_ENUM8: out->v.u8 = (uint8_t)vm_state.raw_value; break;
-                default: return false;
+                case NRFCLAW_SEMCAP_HUMIDITY: {
+            uint32_t rh;
+            if(!nrfclaw_humidity_last_mpermille(&rh)) return false;
+            value_clear(out,NRFCLAW_CAP_VALUE_U16);
+            out->v.u16=(uint16_t)(rh/10U); return true;
+        }
+
+        default: return false;
             }
             return true;
         }

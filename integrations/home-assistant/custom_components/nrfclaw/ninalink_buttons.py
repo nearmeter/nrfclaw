@@ -32,6 +32,15 @@ VOLUME_CAPABILITY = 0x0601
 VOLUME_US_GALLON_CAPABILITY = 0x0606
 
 
+RF_VIRTUAL_NODE_MASK = 0xFF000000
+RF_VIRTUAL_NODE_PREFIX = 0xF8000000
+
+
+def _is_rf_virtual_node(node_id: int) -> bool:
+    # Generic RF virtual nodes use 0xF8ppssss.
+    return (int(node_id) & RF_VIRTUAL_NODE_MASK) == RF_VIRTUAL_NODE_PREFIX
+
+
 def _inventory_supported(
     data: dict[str, Any] | None,
     node_id: int,
@@ -226,6 +235,12 @@ def build_ninalink_control_buttons(
 
     for device in data.get("ha", {}).get("devices", []):
         node_id = int(device.get("node_id_raw", -1))
+
+        # B8.1k6k3: RF virtual nodes are read-only external devices.
+        # They publish state through the bridge but do not implement
+        # NinaLink remote COMMAND actions.
+        if _is_rf_virtual_node(node_id):
+            continue
 
         # Hall button mirrors Direct: entity exists when Hall control exists,
         # but becomes unavailable while Hall mode is Off.

@@ -801,7 +801,7 @@ static void handle_binary_command(uint8_t const *d, uint16_t len)
                 uint32_t supported = 0U;
                 uint32_t active = 0U;
 
-                for (uint8_t cap = 1U; cap <= NRFCLAW_CAP_TEMPERATURE; cap++) {
+                for (uint8_t cap = 1U; cap <= NRFCLAW_CAP_HUMIDITY; cap++) {
                     if (nrfclaw_native_capability_supported(cap))
                         supported |= (1UL << cap);
                     if (nrfclaw_native_capability_available(cap))

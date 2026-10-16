@@ -20,11 +20,12 @@ nRFClaw is an open embedded platform for building AI-programmable, ultra-low-pow
 - Persistent `BOOT` programs or manually started programs.
 - BLE programming through a physical-button protected NUS plane.
 - BLE Beacon/Broadcaster and dynamic advertising payloads.
-- Home Assistant Direct BLE/NDP integration plus NinaLink LoRa Bridge/Node transport.
+- Home Assistant Direct BLE/NDP, NinaLink LoRa Node/Bridge, and external GFSK/FSK RF sensor bridges.
 - NinaLink low-power LoRa nodes with persistent Network ID isolation, automatic discovery and remote control.
 - Optional 256-bit Application/NDP owner key for Home Assistant access.
 - LoRa TX/RX with LLCC68.
-- DS18B20 temperature and battery telemetry.
+- LLCC68 external-RF profiles, RFVM frame decoding, automatic ingestion and virtual NinaLink entities in Home Assistant.
+- DS18B20/SHT-family temperature (and SHT humidity where supported), plus battery telemetry.
 - LIS2DH12 motion, TAP, FALL, vibration and VIB_AUTO.
 - Hall/reed/digital inputs and counting.
 - Serial TX/RX, including a low-power Serial RX policy.
@@ -33,6 +34,78 @@ nRFClaw is an open embedded platform for building AI-programmable, ultra-low-pow
 - BLE firmware upgrade through a compact DFU bootloader.
 - Deterministic standalone compiler plus optional Gemini/OpenRouter/Ollama semantic agents.
 - Designed around event-driven operation and microamp-class sleep currents.
+
+## Current Transport Modes and External RF Sensors
+
+The installed CLI supports three distinct Home Assistant topologies:
+
+| Mode | Radio and Home Assistant path | Intended use |
+|---|---|---|
+| **Direct** | NINASENSE → BLE advertisements / Application NDP → Home Assistant | A single locally reachable, battery-powered device |
+| **NinaLink Node** | NINASENSE → LoRa NinaLink → separate NINASENSE Bridge → BLE/NDP → Home Assistant | Low-power remote nodes sharing a provisioned 16-bit Network ID |
+| **External RF Bridge** | Supported third-party RF sensor → LLCC68 GFSK/FSK/profile PHY → RFVM → virtual NinaLink device → BLE/NDP → Home Assistant | Receiving compatible wireless sensors without reprogramming the sensors |
+
+The External RF Bridge is **not** a NinaLink LoRa Node. It is an always-listening receiver and has a higher power requirement than a sleeping node. The Bridge uses the nRF52832 Bluetooth interface to connect to Home Assistant.
+
+### CLI examples: Direct, NinaLink and external RF
+
+Use the physical P0.21/NUS programming connection for upload; replace `F07138` with your device identifier.
+
+```bash
+# Direct Home Assistant, without a LoRa bridge
+python3 nrfclaw_cli.py --device F07138 prompt --standalone --upload \
+  "At boot, enable Home Assistant."
+
+# Low-power NinaLink node in an existing network
+python3 nrfclaw_cli.py --device F07138 prompt --standalone --upload \
+  "At boot, enable Home Assistant in LoRa mode on network 0x1234."
+
+# External-RF Bridge: Ecowitt WH51 (runtime profile 3)
+python3 nrfclaw_cli.py --device F07138 prompt --standalone --upload \
+  "At boot, use this NINASENSE as a Home Assistant RF bridge for Ecowitt WH51 sensors."
+```
+
+**Host provisioning is essential:** the NinaLink Network ID and the External RF radio profile are written by host-side operations during `prompt --upload`. The generated VM bytecode alone does **not** configure either value. Reboot after provisioning so the persistent Bridge radio owner and automatic ingest mode become effective. A profile present in the catalogue is not necessarily runtime-ready or validated with physical sensors.
+
+### External RF runtime prompt profiles
+
+The deterministic `external-rf-ha-bridge` lowerer currently recognizes these prompt profile IDs:
+
+| IDs | Sensor families |
+|---|---|
+| 1, 2, 3, 4 | VEVOR YT60234; Ambient WH31E; Ecowitt WH51; Ecowitt WH52 |
+| 12, 13, 14 | Fine Offset WH1080/WH3080 (868.3 or 915 MHz); WH31L/WH57 |
+| 18, 19, 23 | La Crosse Breeze Pro, LTV-TH, LTV-WR1 |
+| 30 | SRSmith SRS-2C-TX |
+| 33, 34, 35 | ThermoPro TP211B, TP28B, TempSpike XR |
+| 37 | Wireless M-Bus Mode C Format B |
+
+Profiles **24** (mixed Wireless M-Bus framing), **25** (deferred), **27** (retired/reserved NetAtmo), and **28** (Oil STANDARD Manchester framing blocker) are not valid runtime prompt targets. WH1080/WH3080 must specify **868.3 MHz or 915 MHz**, because the compiler cannot assume a band. The RF profile registry and runtime gates remain authoritative for radio/decoder readiness.
+
+```bash
+python3 nrfclaw_cli.py --device F07138 rf-profile list
+python3 nrfclaw_cli.py --device F07138 rf-profile show 3
+python3 nrfclaw_cli.py --device F07138 bridge-radio-mode status
+python3 nrfclaw_cli.py --device F07138 gfsk-auto-boot-status
+```
+
+Use `docs/rf/` and `docs/validation/` for per-profile evidence, synthetic OTA gates, and hardware status. Synthetic-frame or compiler success must not be described as end-to-end RF reception validation.
+
+### SHT temperature and humidity
+
+SHT2x, SHT3x, SHT4x and SHTC3 support is implemented as an optional external software-I²C sensor path. The temperature priority is **DS18B20 → SHT → nRF52 internal die temperature**. Where present and exposed by the installed firmware/integration, an SHT can provide Home Assistant humidity (semantic capability `0x0101`). On boards without an SHT sensor, the I²C pins are released after an unsuccessful probe.
+
+```bash
+python3 nrfclaw_cli.py --device F07138 sht-info
+python3 nrfclaw_cli.py --device F07138 sht-detect
+python3 nrfclaw_cli.py --device F07138 sht-read
+```
+
+SHT physical hardware validation is distinct from the host/compiler and no-SHT fallback tests described in `docs/validation/`.
+
+### Programming and security boundaries
+
+The optional 256-bit NDP owner key is **not** the NinaLink Network ID. When NDP protection is enabled, a factory reset of the user program should not be assumed to erase the owner credential. Use the physical NUS channel and `ndp-key-status` / `ndp-key-get` to inspect or recover access. Do not place access keys in prompts, source code, examples, logs or issue reports.
 
 ## How It Works
 

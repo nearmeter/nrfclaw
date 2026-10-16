@@ -1736,6 +1736,131 @@ def _compile_hall_semantic_volume(source: str, t: str, schedule: int, cfg: dict[
     return CompileResult(source, intent, SCHED_BOOT, ir, a.finish(), warnings)
 
 
+
+# B8.1k8d — deterministic external-RF sensor -> HA bridge semantics.
+_EXTERNAL_RF_HA_PROFILES = {
+    1: "VEVOR YT60234",
+    2: "Ambient Weather WH31E",
+    3: "Ecowitt WH51",
+    4: "Ecowitt WH52",
+    12: "Fine Offset WH1080/WH3080 868.3 MHz",
+    13: "Fine Offset WH1080/WH3080 915 MHz",
+    14: "Ambient/Fine Offset WH31L/WH57",
+    18: "LaCrosse Breeze Pro",
+    19: "LaCrosse LTV-TH",
+    23: "LaCrosse LTV-WR1",
+    30: "SRSmith SRS-2C-TX",
+    33: "ThermoPro TP211B",
+    34: "ThermoPro TP28B",
+    35: "ThermoPro TempSpike XR TP862B/TP863B",
+    37: "Wireless M-Bus Mode C Format B",
+}
+
+_EXTERNAL_RF_HA_BLOCKED_IDS = {
+    24: "Wireless M-Bus mixed framing is catalog-only (MIXED_WMBUS_FRAMING)",
+    25: "Wireless M-Bus profile 25 is deferred/non-runtime",
+    27: "profile 27 is retired/reserved and must never be reused",
+    28: "Oil STANDARD is catalog-only (MANCHESTER_BITSTREAM_FRAMING)",
+}
+
+
+def _external_rf_ha_action_requested(t: str) -> bool:
+    return bool(re.search(
+        r"\b(?:receive|receba|receber|listen|escute|use|usar|utilize|"
+        r"configure|configurar|bridge|gateway|ponte|integre|integrar|"
+        r"integration|integracao|monitor|monitore|home\s+assistant|ha)\b", t))
+
+
+def _external_rf_ha_profile(t: str) -> tuple[int, str] | None:
+    if not _external_rf_ha_action_requested(t):
+        return None
+
+    m = re.search(
+        r"\b(?:external\s*rf\s*)?(?:rf\s*)?(?:profile|perfil)\s*(?:id\s*)?"
+        r"[:=#-]?\s*(\d{1,3})\b", t)
+    if m:
+        pid = int(m.group(1))
+        if pid in _EXTERNAL_RF_HA_BLOCKED_IDS:
+            raise UnsupportedSemantics(
+                f"external RF profile {pid} cannot be provisioned: "
+                f"{_EXTERNAL_RF_HA_BLOCKED_IDS[pid]}")
+        if pid not in _EXTERNAL_RF_HA_PROFILES:
+            raise UnsupportedSemantics(
+                f"external RF profile {pid} is not in the B8.1k8d runtime-ready prompt set")
+        return pid, _EXTERNAL_RF_HA_PROFILES[pid]
+
+    if re.search(r"\bnetatmo\b", t):
+        raise UnsupportedSemantics(
+            "NetAtmo external-RF profile 27 was retired and is permanently reserved")
+    if re.search(r"\boil(?:\s+standard)?\b", t) or (
+        "ultrasonic" in t and ("tank" in t or "tanque" in t)):
+        raise UnsupportedSemantics(
+            "Oil STANDARD is catalog-only: MANCHESTER_BITSTREAM_FRAMING")
+
+    if re.search(r"\b(?:wh1080|wh3080|whx080)\b", t):
+        f868 = bool(re.search(r"\b868(?:[.,]3)?(?:\s*mhz)?\b|868300000\b", t))
+        f915 = bool(re.search(r"\b915(?:[.,]0+)?(?:\s*mhz)?\b|915000000\b", t))
+        if f868 and f915:
+            raise UnsupportedSemantics(
+                "WH1080/WH3080 prompt names both 868.3 and 915 MHz; choose one")
+        if f868: return 12, _EXTERNAL_RF_HA_PROFILES[12]
+        if f915: return 13, _EXTERNAL_RF_HA_PROFILES[13]
+        raise UnsupportedSemantics(
+            "WH1080/WH3080 has runtime profiles at 868.3 and 915 MHz; specify the frequency")
+
+    aliases = (
+        (35, r"\b(?:tempspike\s*xr|tp862b?|tp863b?)\b"),
+        (34, r"\b(?:tp28b?|thermopro\s+tp28b?)\b"),
+        (33, r"\b(?:tp211b?|thermopro\s+tp211b?)\b"),
+        (30, r"\b(?:srsmith|srs[-\s]?2c[-\s]?tx)\b"),
+        (23, r"\b(?:ltv[-\s]?wr1|lacrosse\s+ltv[-\s]?wr1)\b"),
+        (19, r"\b(?:ltv[-\s]?th|lacrosse\s+ltv[-\s]?th)\b"),
+        (18, r"\b(?:breeze\s*pro|breezepro|ltv[-\s]?wsdth01)\b"),
+        (14, r"\b(?:wh31l|wh57)\b"),
+        (4, r"\bwh52\b"),
+        (3, r"\bwh51\b"),
+        (2, r"\bwh31e\b"),
+        (1, r"\b(?:yt60234|vevor(?:\s+wireless)?\s+weather)\b"),
+        (37, r"\b(?:wireless\s+m[-\s]?bus|w[-\s]?mbus|wmbus)\b"),
+    )
+    for pid, pattern in aliases:
+        if re.search(pattern, t):
+            return pid, _EXTERNAL_RF_HA_PROFILES[pid]
+
+    if ("lightning" in t or "raios" in t or "raio" in t) and (
+        "ambient" in t or "fine offset" in t):
+        return 14, _EXTERNAL_RF_HA_PROFILES[14]
+    return None
+
+
+def _compile_external_rf_ha_bridge(source: str, t: str, schedule: int,
+                                   cfg: dict[str, Any]) -> CompileResult | None:
+    resolved = _external_rf_ha_profile(t)
+    if resolved is None: return None
+    profile_id, profile_name = resolved
+    provision = {
+        "kind": "external-rf-ha-bridge",
+        "profile_id": profile_id,
+        "profile_name": profile_name,
+        "frequency_hz": None,
+    }
+    a = Assembler()
+    ir = [
+        f"HOST BRIDGE RADIO EXTERNAL_RF profile={profile_id} ({profile_name}) PERSIST",
+        f"HOST RF AUTO INGEST BOOT profile={profile_id}",
+    ]
+    a.emit(OP_HA_ROLE_CONFIG, 3); ir.append("HA ROLE BRIDGE PERSIST")
+    ir.append(f"RF PROFILE {profile_id} -> RFVM -> NINALINK VIRTUAL NODE -> HOME ASSISTANT")
+    a.emit(OP_END); ir.append("END")
+    return CompileResult(
+        source, "external-rf-ha-bridge", SCHED_BOOT, ir, a.finish(), [
+            "External-RF selection is a host action of `prompt --upload`; raw VM bytecode alone does not select an RF profile.",
+            "The RF profile registry remains authoritative for the PHY and decoder.",
+            "Reboot the bridge after upload so persisted EXTERNAL_RF ownership is applied from boot.",
+            "Decoded RF capabilities use the existing virtual NinaLink node and Home Assistant projection.",
+        ], provision=provision)
+
+
 def _compile_ha_transport_role(source: str, t: str, schedule: int, cfg: dict[str, Any]) -> CompileResult | None:
     # B7.6f2o1b: HA transport-role lowerer is role-only.
     #
@@ -3121,6 +3246,44 @@ def compile_hybrid(source: str, force_boot: bool = False) -> tuple[CompileResult
             relay_result.source=source
             meta["route"]="semantic-goal"; meta["language_route"]="counter-rssi-relay"; meta["family"]=relay_result.intent
             return _certify_standalone_result(source,relay_result,meta)
+
+    # B8.1k8d exact external-RF profile resolution before generic routing.
+
+    _b81k8d_t = _fold(source)
+
+    _b81k8d_result = _compile_external_rf_ha_bridge(
+
+        source, _b81k8d_t,
+
+        SCHED_BOOT if (force_boot or _is_boot(_b81k8d_t)) else SCHED_MANUAL,
+
+        cfg,
+
+    )
+
+    if _b81k8d_result is not None:
+
+        meta["route"] = "semantic-goal"
+
+        meta["language_route"] = "external-rf-profile"
+
+        meta["family"] = _b81k8d_result.intent
+
+        meta["semantic_certified"] = True
+
+        meta["semantic_certificate"] = {
+
+            "kind": "b81k8d-external-rf-runtime-profile",
+
+            "profile_id": _b81k8d_result.provision["profile_id"],
+
+            "host_provision": True,
+
+            "vm_abi_changed": False,
+
+        }
+
+        return _b81k8d_result, meta
 
     action_plan=parse_action_plan(canonical_source)
     meta["action_plan"]=action_plan.to_dict()

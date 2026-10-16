@@ -9,7 +9,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .battery import battery_percentage_from_voltage
 from .client import NrfClawData
-from .const import CAP_BATTERY, CAP_DS18B20, CAP_HALL, CAP_TEMPERATURE, DOMAIN, SEMCAP_VOLUME, SEMCAP_VOLUME_US_GALLON
+from .const import CAP_BATTERY, CAP_DS18B20, CAP_HALL, CAP_TEMPERATURE, DOMAIN, SEMCAP_VOLUME, SEMCAP_VOLUME_US_GALLON, CAP_HUMIDITY
 from .direct_coordinator import DirectNdpCoordinator
 from .direct_semantic_profile import family_supported
 from .device_identity import direct_device_name
@@ -24,6 +24,8 @@ def build_direct_sensor_entities(coordinator, entry) -> list[SensorEntity]:
                          BatteryVoltageSensor(coordinator, entry)))
     if data.has_capability(CAP_TEMPERATURE) or family_supported(data, CAP_DS18B20):
         entities.append(TemperatureSensor(coordinator, entry))
+    if data.has_capability(CAP_HUMIDITY):
+        entities.append(HumiditySensor(coordinator, entry))
     # B7.6f2m3: Hall has one user-facing scalar. SINGLE counts upward;
     # QUADRATURE uses the same Counter entity with a signed value so reverse
     # movement decrements it. If a CLI/VM semantic volume is present, prefer
@@ -135,3 +137,13 @@ class TotalVolumeUsGallonSensor(DirectNdpSensor):
     def native_value(self):
         state = self.coordinator.data.semantic_values.get((SEMCAP_VOLUME_US_GALLON, 0))
         return None if state is None else state.value
+
+class HumiditySensor(DirectNdpSensor):
+    _attr_name = "Humidity"
+    _attr_device_class = SensorDeviceClass.HUMIDITY
+    _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_suggested_display_precision = 2
+    def __init__(self, coordinator, entry): super().__init__(coordinator, entry, "humidity")
+    @property
+    def native_value(self): return self.coordinator.data.humidity_pct

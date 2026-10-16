@@ -7,3 +7,6 @@ __pycache__/
 .DS_Store
 NRFCLAW_CLI/.venv/
 tests/
+
+/.patch-backups/
+/dist/

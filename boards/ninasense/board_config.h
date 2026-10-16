@@ -19,6 +19,10 @@
 #define P_HALL1          11
 #define P_LIS_SCL        13
 #define P_HALL2          14
+
+/* B8.1k8b1 external SHT I2C defaults; user may override. */
+#define P_SHT_SCL_DEFAULT P_HALL1 /* D11 / P0.11 */
+#define P_SHT_SDA_DEFAULT P_HALL2 /* D14 / P0.14 */
 #define P_FREE_D15       15
 #define P_FREE_D16       16
 #define P_LIS_CS         17

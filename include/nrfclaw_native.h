@@ -20,7 +20,8 @@ typedef enum {
     NRFCLAW_CAP_TRACKING = 11,
     NRFCLAW_CAP_VIB_HEALTH = 12, /* EXPERIMENTAL */
     NRFCLAW_CAP_VIB_AUTO = 13,   /* EXPERIMENTAL */
-    NRFCLAW_CAP_TEMPERATURE = 14 /* logical temperature provider */
+    NRFCLAW_CAP_TEMPERATURE = 14,/* logical temperature provider */
+    NRFCLAW_CAP_HUMIDITY = 15 /* B8.1k8c2 SHT humidity */
 } nrfclaw_capability_id_t;
 
 typedef enum {

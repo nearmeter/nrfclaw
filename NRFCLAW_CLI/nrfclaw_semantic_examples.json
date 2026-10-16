@@ -127,5 +127,161 @@
     "family": "vib-auto-machine-ha-event",
     "canonical": "at boot enable home assistant and notify via telegram through ha when the motor vibration becomes abnormal",
     "meaning": "VIB_AUTO.ALARM -> Home Assistant event; Telegram is HA-side"
+  },
+  {
+    "text": "at boot receive vevor yt60234 weather sensors and expose their measurements in home assistant",
+    "family": "external-rf-ha-bridge",
+    "canonical": "at boot receive vevor yt60234 weather sensors and expose their measurements in home assistant",
+    "meaning": "runtime RF profile 1; persist EXTERNAL_RF + HA BRIDGE; project RFVM capabilities to HA"
+  },
+  {
+    "text": "at boot use this ninasense as a home assistant rf bridge for ambient wh31e sensors",
+    "family": "external-rf-ha-bridge",
+    "canonical": "at boot use this ninasense as a home assistant rf bridge for ambient wh31e sensors",
+    "meaning": "runtime RF profile 2; persist EXTERNAL_RF + HA BRIDGE; project RFVM capabilities to HA"
+  },
+  {
+    "text": "at boot receive ecowitt wh51 soil moisture sensors and publish their readings to home assistant",
+    "family": "external-rf-ha-bridge",
+    "canonical": "at boot receive ecowitt wh51 soil moisture sensors and publish their readings to home assistant",
+    "meaning": "runtime RF profile 3; persist EXTERNAL_RF + HA BRIDGE; project RFVM capabilities to HA"
+  },
+  {
+    "text": "at boot receive ecowitt wh52 soil sensors and expose them in home assistant",
+    "family": "external-rf-ha-bridge",
+    "canonical": "at boot receive ecowitt wh52 soil sensors and expose them in home assistant",
+    "meaning": "runtime RF profile 4; persist EXTERNAL_RF + HA BRIDGE; project RFVM capabilities to HA"
+  },
+  {
+    "text": "at boot receive fine offset wh1080 sensors on 868.3 mhz and expose them in home assistant",
+    "family": "external-rf-ha-bridge",
+    "canonical": "at boot receive fine offset wh1080 sensors on 868.3 mhz and expose them in home assistant",
+    "meaning": "runtime RF profile 12; persist EXTERNAL_RF + HA BRIDGE; project RFVM capabilities to HA"
+  },
+  {
+    "text": "at boot receive fine offset wh1080 sensors on 915 mhz and expose them in home assistant",
+    "family": "external-rf-ha-bridge",
+    "canonical": "at boot receive fine offset wh1080 sensors on 915 mhz and expose them in home assistant",
+    "meaning": "runtime RF profile 13; persist EXTERNAL_RF + HA BRIDGE; project RFVM capabilities to HA"
+  },
+  {
+    "text": "at boot receive wh31l lightning sensors and show them in home assistant",
+    "family": "external-rf-ha-bridge",
+    "canonical": "at boot receive wh31l lightning sensors and show them in home assistant",
+    "meaning": "runtime RF profile 14; persist EXTERNAL_RF + HA BRIDGE; project RFVM capabilities to HA"
+  },
+  {
+    "text": "at boot receive lacrosse breeze pro sensors and publish them to home assistant",
+    "family": "external-rf-ha-bridge",
+    "canonical": "at boot receive lacrosse breeze pro sensors and publish them to home assistant",
+    "meaning": "runtime RF profile 18; persist EXTERNAL_RF + HA BRIDGE; project RFVM capabilities to HA"
+  },
+  {
+    "text": "at boot receive lacrosse ltv-th sensors and expose them in home assistant",
+    "family": "external-rf-ha-bridge",
+    "canonical": "at boot receive lacrosse ltv-th sensors and expose them in home assistant",
+    "meaning": "runtime RF profile 19; persist EXTERNAL_RF + HA BRIDGE; project RFVM capabilities to HA"
+  },
+  {
+    "text": "at boot receive lacrosse ltv-wr1 wind sensors and expose them in home assistant",
+    "family": "external-rf-ha-bridge",
+    "canonical": "at boot receive lacrosse ltv-wr1 wind sensors and expose them in home assistant",
+    "meaning": "runtime RF profile 23; persist EXTERNAL_RF + HA BRIDGE; project RFVM capabilities to HA"
+  },
+  {
+    "text": "at boot receive srsmith srs-2c-tx devices and expose their status in home assistant",
+    "family": "external-rf-ha-bridge",
+    "canonical": "at boot receive srsmith srs-2c-tx devices and expose their status in home assistant",
+    "meaning": "runtime RF profile 30; persist EXTERNAL_RF + HA BRIDGE; project RFVM capabilities to HA"
+  },
+  {
+    "text": "at boot receive thermopro tp211b thermometers and expose them in home assistant",
+    "family": "external-rf-ha-bridge",
+    "canonical": "at boot receive thermopro tp211b thermometers and expose them in home assistant",
+    "meaning": "runtime RF profile 33; persist EXTERNAL_RF + HA BRIDGE; project RFVM capabilities to HA"
+  },
+  {
+    "text": "at boot receive thermopro tp28b dual-probe thermometers and expose both probes in home assistant",
+    "family": "external-rf-ha-bridge",
+    "canonical": "at boot receive thermopro tp28b dual-probe thermometers and expose both probes in home assistant",
+    "meaning": "runtime RF profile 34; persist EXTERNAL_RF + HA BRIDGE; project RFVM capabilities to HA"
+  },
+  {
+    "text": "at boot receive thermopro tempspike xr thermometers and expose both temperature channels in home assistant",
+    "family": "external-rf-ha-bridge",
+    "canonical": "at boot receive thermopro tempspike xr thermometers and expose both temperature channels in home assistant",
+    "meaning": "runtime RF profile 35; persist EXTERNAL_RF + HA BRIDGE; project RFVM capabilities to HA"
+  },
+  {
+    "text": "at boot receive wireless m-bus mode c format b meters and expose decoded data in home assistant",
+    "family": "external-rf-ha-bridge",
+    "canonical": "at boot receive wireless m-bus mode c format b meters and expose decoded data in home assistant",
+    "meaning": "runtime RF profile 37; persist EXTERNAL_RF + HA BRIDGE; project RFVM capabilities to HA"
+  },
+  {
+    "text": "configure este ninasense para receber sensores wh31e e mostrar no home assistant",
+    "family": "external-rf-ha-bridge",
+    "canonical": "configure este ninasense para receber sensores wh31e e mostrar no home assistant",
+    "meaning": "runtime RF profile 2; persist EXTERNAL_RF + HA BRIDGE; project RFVM capabilities to HA"
+  },
+  {
+    "text": "use meu wh51 como sensor externo e publique no home assistant",
+    "family": "external-rf-ha-bridge",
+    "canonical": "use meu wh51 como sensor externo e publique no home assistant",
+    "meaning": "runtime RF profile 3; persist EXTERNAL_RF + HA BRIDGE; project RFVM capabilities to HA"
+  },
+  {
+    "text": "receba o sensor de raios wh31l e mostre no home assistant",
+    "family": "external-rf-ha-bridge",
+    "canonical": "receba o sensor de raios wh31l e mostre no home assistant",
+    "meaning": "runtime RF profile 14; persist EXTERNAL_RF + HA BRIDGE; project RFVM capabilities to HA"
+  },
+  {
+    "text": "use o tp28b e mostre as duas sondas no home assistant",
+    "family": "external-rf-ha-bridge",
+    "canonical": "use o tp28b e mostre as duas sondas no home assistant",
+    "meaning": "runtime RF profile 34; persist EXTERNAL_RF + HA BRIDGE; project RFVM capabilities to HA"
+  },
+  {
+    "text": "configure como gateway para medidores wireless m-bus mode c format b",
+    "family": "external-rf-ha-bridge",
+    "canonical": "configure como gateway para medidores wireless m-bus mode c format b",
+    "meaning": "runtime RF profile 37; persist EXTERNAL_RF + HA BRIDGE; project RFVM capabilities to HA"
+  },
+  {
+    "text": "At boot, enable Home Assistant.",
+    "family": "ha-transport-direct",
+    "canonical": "At boot, enable Home Assistant.",
+    "meaning": "DIRECT_BLE role; BLE/NDP to Home Assistant"
+  },
+  {
+    "text": "At boot, enable Home Assistant in LoRa mode on network 0x1234.",
+    "family": "ha-transport-lora-node",
+    "canonical": "At boot, enable Home Assistant in LoRa mode on network 0x1234.",
+    "meaning": "NinaLink NODE; host sets nonzero Network ID before VM upload"
+  },
+  {
+    "text": "At boot, enable Home Assistant in bridge mode.",
+    "family": "ha-transport-bridge",
+    "canonical": "At boot, enable Home Assistant in bridge mode.",
+    "meaning": "NinaLink LoRa BRIDGE; persistent Network ID provisioning"
+  },
+  {
+    "text": "At boot, use this NINASENSE as a Home Assistant RF bridge for Ecowitt WH51 sensors.",
+    "family": "external-rf-ha-bridge",
+    "canonical": "At boot, use this NINASENSE as a Home Assistant RF bridge for Ecowitt WH51 sensors.",
+    "meaning": "runtime RF profile 3; host provision EXTERNAL_RF + HA BRIDGE; RFVM -> virtual NinaLink -> HA"
+  },
+  {
+    "text": "At boot, receive Fine Offset WH1080 sensors on 915 MHz and expose them in Home Assistant.",
+    "family": "external-rf-ha-bridge",
+    "canonical": "At boot, receive Fine Offset WH1080 sensors on 915 MHz and expose them in Home Assistant.",
+    "meaning": "runtime RF profile 13; frequency explicitly selected; host provision required"
+  },
+  {
+    "text": "At boot, receive Wireless M-Bus Mode C Format B meters and expose decoded data in Home Assistant.",
+    "family": "external-rf-ha-bridge",
+    "canonical": "At boot, receive Wireless M-Bus Mode C Format B meters and expose decoded data in Home Assistant.",
+    "meaning": "runtime RF profile 37; requires supported physical meters and HA mapping"
   }
 ]

@@ -1,4 +1,5 @@
 #include "nrfclaw_native.h"
+#include "nrfclaw_sht.h"
 #include "nrfclaw_lis2dh12.h"
 #include "nrfclaw_inputs.h"
 #include "nrfclaw_board.h"
@@ -69,6 +70,9 @@ static void gpio_release_to_default(uint8_t pin)
 
 static bool gpio_allowed(uint8_t pin)
 {
+    /* B8.1k8c: active SHT owns its GPIO pair. */
+    if (nrfclaw_sht_owns_pin(pin)) return false;
+
     if (nrfclaw_serial_owns_pin(pin)) return false;
     switch (pin) {
         case P_HALL1:
@@ -163,6 +167,8 @@ bool nrfclaw_native_capability_supported(uint8_t capability)
                    nrfclaw_vib_auto_supported();
         case NRFCLAW_CAP_TEMPERATURE:
             return nrfclaw_temperature_available();
+        case NRFCLAW_CAP_HUMIDITY:
+            return nrfclaw_humidity_available();
         default:
             return false;
     }
@@ -192,6 +198,8 @@ bool nrfclaw_native_capability_active(uint8_t capability)
         }
         case NRFCLAW_CAP_TEMPERATURE:
             return nrfclaw_temperature_available();
+        case NRFCLAW_CAP_HUMIDITY:
+            return nrfclaw_humidity_available();
         default:
             return false;
     }
@@ -286,8 +294,16 @@ nrfclaw_native_status_t nrfclaw_native_accel_configure(const nrfclaw_accel_confi
 }
 
 static bool serial_pin_claimable(uint8_t pin){switch(pin){case P_HALL1:case P_HALL2:return !nrfclaw_hall_active();case P_DS18:return !nrfclaw_ds18b20_present();case P_FREE_D15:case P_FREE_D16:case P_FREE_A29:case P_FREE_A30:case P_FREE_A31:return true;case P_LIS_SDA:return !nrfclaw_lis2dh12_present();default:return false;}}
-nrfclaw_native_status_t nrfclaw_native_serial_enable(uint8_t tx,uint8_t rx,uint32_t baud){if(tx==rx)return NRFCLAW_NATIVE_BAD_ARG;nrfclaw_serial_disable();if(!serial_pin_claimable(tx)||!serial_pin_claimable(rx))return NRFCLAW_NATIVE_BUSY;return nrfclaw_serial_enable(tx,rx,baud)?NRFCLAW_NATIVE_OK:NRFCLAW_NATIVE_BAD_ARG;}
-nrfclaw_native_status_t nrfclaw_native_serial_enable_economy(uint8_t tx,uint8_t rx,uint32_t baud){if(tx==rx)return NRFCLAW_NATIVE_BAD_ARG;nrfclaw_serial_disable();if(!serial_pin_claimable(tx)||!serial_pin_claimable(rx))return NRFCLAW_NATIVE_BUSY;return nrfclaw_serial_enable_economy(tx,rx,baud)?NRFCLAW_NATIVE_OK:NRFCLAW_NATIVE_BAD_ARG;}
+nrfclaw_native_status_t nrfclaw_native_serial_enable(uint8_t tx,uint8_t rx,uint32_t baud){
+    /* B8.1k8c nrfclaw_native_serial_enable SHT ownership. */
+    if(nrfclaw_sht_owns_pin(tx)||nrfclaw_sht_owns_pin(rx))
+        return NRFCLAW_NATIVE_BUSY;
+if(tx==rx)return NRFCLAW_NATIVE_BAD_ARG;nrfclaw_serial_disable();if(!serial_pin_claimable(tx)||!serial_pin_claimable(rx))return NRFCLAW_NATIVE_BUSY;return nrfclaw_serial_enable(tx,rx,baud)?NRFCLAW_NATIVE_OK:NRFCLAW_NATIVE_BAD_ARG;}
+nrfclaw_native_status_t nrfclaw_native_serial_enable_economy(uint8_t tx,uint8_t rx,uint32_t baud){
+    /* B8.1k8c nrfclaw_native_serial_enable_economy SHT ownership. */
+    if(nrfclaw_sht_owns_pin(tx)||nrfclaw_sht_owns_pin(rx))
+        return NRFCLAW_NATIVE_BUSY;
+if(tx==rx)return NRFCLAW_NATIVE_BAD_ARG;nrfclaw_serial_disable();if(!serial_pin_claimable(tx)||!serial_pin_claimable(rx))return NRFCLAW_NATIVE_BUSY;return nrfclaw_serial_enable_economy(tx,rx,baud)?NRFCLAW_NATIVE_OK:NRFCLAW_NATIVE_BAD_ARG;}
 void nrfclaw_native_serial_disable(void){nrfclaw_serial_disable();}
 nrfclaw_native_status_t nrfclaw_native_serial_write(uint8_t const*d,uint16_t n){if(!nrfclaw_serial_active())return NRFCLAW_NATIVE_UNAVAILABLE;return nrfclaw_serial_write(d,n)?NRFCLAW_NATIVE_OK:NRFCLAW_NATIVE_ERROR;}
 nrfclaw_native_status_t nrfclaw_native_serial_read(uint32_t*v){uint8_t b;if(!v)return NRFCLAW_NATIVE_BAD_ARG;if(!nrfclaw_serial_active())return NRFCLAW_NATIVE_UNAVAILABLE;if(!nrfclaw_serial_read_byte(&b))return NRFCLAW_NATIVE_BUSY;*v=b;return NRFCLAW_NATIVE_OK;}

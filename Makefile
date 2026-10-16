@@ -49,6 +49,12 @@ CORE_SRC := \
   src/nrfclaw_inputs.c \
   src/nrfclaw_lora.c \
   src/nrfclaw_llcc68_rl.c \
+  src/nrfclaw_rfvm.c \
+  src/nrfclaw_rf_profile_registry.c \
+  src/nrfclaw_rf_capability.c \
+  src/nrfclaw_rf_ninalink.c \
+  src/nrfclaw_rf_ingest.c \
+  src/nrfclaw_rf_receiver_boot.c \
   src/nrfclaw_lora_profile.c \
   src/nrfclaw_lora_profile_store.c \
   src/nrfclaw_rtc.c \
@@ -58,6 +64,8 @@ CORE_SRC := \
   src/nrfclaw_schedule.c \
   src/nrfclaw_scheduler.c \
   src/nrfclaw_native.c \
+  src/nrfclaw_ext_i2c.c \
+  src/nrfclaw_sht.c \
   src/nrfclaw_capability.c \
   src/nrfclaw_ninalink.c \
   src/nrfclaw_ninalink_msg.c \

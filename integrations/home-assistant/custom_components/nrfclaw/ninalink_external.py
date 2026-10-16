@@ -443,6 +443,13 @@ class NinaLinkExternalModelBuilder:
             node["capabilities"].sort(
                 key=lambda x: (x["capability_id_raw"], x["channel"])
             )
+            # B8.1k6g: restore B7.2 inventory attachment.
+            inventory = await self.read_inventory(node_id)
+            node["inventory_valid"] = inventory["valid"]
+            node["inventory_complete"] = inventory["complete"]
+            node["inventory_overflow"] = inventory["overflow"]
+            node["inventory_registry_version"] = inventory["registry_version"]
+            node["inventory"] = inventory["capabilities"]
             nodes.append(node)
 
         nodes.sort(key=lambda x: x["node_id_raw"])

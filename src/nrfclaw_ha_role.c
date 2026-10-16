@@ -9,6 +9,7 @@
 #include "nrfclaw_ninalink_bridge.h"
 #include "nrfclaw_ninalink_telemetry.h"
 #include "nrfclaw_ha_ninalink_node.h"
+#include "nrfclaw_rf_receiver_boot.h" /* B8.0k2 */
 
 #include <stddef.h>
 
@@ -214,8 +215,15 @@ bool nrfclaw_ha_role_apply_runtime(nrfclaw_ha_role_t role)
         return false;
 
     if (role == NRFCLAW_HA_ROLE_BRIDGE) {
-        if (!nrfclaw_ninalink_bridge_start())
-            return false;
+        /* B8.0l exclusive radio ownership: one BRIDGE is either native
+         * NinaLink LoRa or external RF. Never time-slice them. */
+        if (nrfclaw_bridge_radio_mode_is_external()) {
+            if (!nrfclaw_rf_receiver_boot_start_saved())
+                return false;
+        } else {
+            if (!nrfclaw_ninalink_bridge_start())
+                return false;
+        }
         ((void)0);
     } else {
         ((void)0);

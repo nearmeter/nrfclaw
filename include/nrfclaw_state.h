@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 #define NRFCLAW_STATE_USER_COUNT 16U
-#define NRFCLAW_STATE_COUNT 22U /* + HA role, Direct controls and NinaLink network ID */
+#define NRFCLAW_STATE_COUNT 23U /* + B8.0k2 persistent external RF receiver */
 #define NRFCLAW_STATE_PAGE0_ADDR 0x00072000UL
 #define NRFCLAW_STATE_PAGE1_ADDR 0x00073000UL
 

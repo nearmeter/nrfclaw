@@ -314,6 +314,7 @@ bool nrfclaw_ble_app_next_disconnect_low_power(void)
 
 bool nrfclaw_ble_app_connected(void){return m_conn_handle!=BLE_CONN_HANDLE_INVALID;}
 
+
 nrfclaw_ble_app_status_t nrfclaw_ble_app_set_role(nrfclaw_ble_app_role_t role)
 {
     if(role>NRFCLAW_BLE_APP_SCANNER)return NRFCLAW_BLE_APP_BAD_ARG;

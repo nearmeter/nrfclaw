@@ -62,11 +62,32 @@ def _cleanup_deprecated_sensor_registry(hass, entry, runtime) -> None:
         if not unique_id.startswith("ninalink:"):
             continue
         parts = unique_id.split(":")
+
+        # B8.0j2h: remove legacy synthetic LoRa diagnostics for RF virtual nodes.
+        if len(parts) == 3 and parts[2] in ("lora_rssi", "lora_snr"):
+            try:
+                diag_node_id = int(parts[1], 16)
+            except ValueError:
+                diag_node_id = -1
+            if (diag_node_id & 0xFF000000) == 0xF8000000:
+                registry.async_remove(reg_entry.entity_id)
+                continue
+
         if len(parts) != 4:
             continue
         try:
             cap_id = int(parts[2], 16)
         except ValueError:
+            continue
+
+        # B8.0j2h stale RF battery sensor migration:
+        # 0x0902 is now the canonical binary_sensor Battery low.
+        try:
+            rf_node_id = int(parts[1], 16)
+        except ValueError:
+            rf_node_id = -1
+        if (rf_node_id & 0xFF000000) == 0xF8000000 and cap_id == 0x0902:
+            registry.async_remove(reg_entry.entity_id)
             continue
         if cap_id in _NINALINK_HIDDEN_SENSOR_CAPS:
             registry.async_remove(reg_entry.entity_id)
